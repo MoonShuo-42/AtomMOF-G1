@@ -1,0 +1,19 @@
+_target_: lightning.pytorch.trainer.Trainer
+
+default_root_dir: ${paths.output_dir}
+
+min_epochs: 1 # prevents early stopping
+max_epochs: -1
+
+accelerator: cpu
+devices: 1
+
+# mixed precision for extra speed-up
+# precision: 16
+
+check_val_every_n_epoch: 1
+
+deterministic: False
+log_every_n_steps: 10 # default is 50
+accumulate_grad_batches: 1
+gradient_clip_val: 10.0

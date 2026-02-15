@@ -1,0 +1,5 @@
+_target_: lightning.pytorch.profilers.PyTorchProfiler
+
+# Save logs to a subdirectory within your main log directory
+dirpath: "${paths.output_dir}/profiler"
+filename: "trace"

@@ -1,0 +1,34 @@
+defaults:
+  - _self_
+  - paths: default
+  - hydra: default
+
+task_name: "preprocess"
+
+preprocess:
+  task: csp # [gen, csp]
+  lmdb_dir: ${paths.data_dir}/lmdb
+  filter_and_split:
+    split_dir: ${paths.data_dir}/splits
+    num_cpus: 16
+    max_bbs: 20
+    max_atoms: 200
+    max_cps: 20
+    prop_list: 
+    - working_capacity_vacuum_swing [mmol/g]
+    - working_capacity_temperature_swing [mmol/g]
+    input_lmdb_suffix: MetalOxo
+    output_lmdb_suffix: MetalOxo_filtered
+  mof_validity:
+    num_cpus: 60
+    input_lmdb_suffix: MetalOxo_filtered
+    output_lmdb_suffix: MetalOxo_valid
+  extract_feats:
+    num_cpus: 60
+    input_lmdb_suffix: MetalOxo_valid
+    output_lmdb_suffix: MetalOxo_feats
+  metal_library:
+    num_cpus: 60
+    metal_dir: ${paths.data_dir}/metal
+    input_lmdb_suffix: MetalOxo_feats
+    output_lmdb_suffix: bwdb

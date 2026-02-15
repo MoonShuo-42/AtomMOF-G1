@@ -1,0 +1,44 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - data: odac25
+  - model: simple
+  - logger: null
+  - trainer: ddp
+  - paths: default
+  - extras: default
+  - hydra: default
+
+task_name: "predict"
+
+tags: ["dev"]
+
+# passing checkpoint path is necessary for evaluation
+ckpt_path: ???
+seed: 42
+
+# Sampling parameters
+predict_args:
+  measure_time: false
+  num_samples: 1
+  sampling_steps: 10
+  sampling_center_coords: true
+  refine_final: false
+  use_sde_coords: false
+  steering_args:
+    fk_steering: false
+    fk_lambda: 2.0
+    fk_resampling_interval: 5
+    fk_start_time: 0.80
+    energy_fn: "mlip" # ["atomic_overlap", "mlip"]
+    potential_mode: "immediate" # ["immediate", "difference", "max", "sum"]
+    num_particles: 8
+    tolerance: 0.8
+
+# Data configuration
+data:
+  predict_split: test
+  max_num_atoms: null
+  sample_limit_dict:
+    predict: null

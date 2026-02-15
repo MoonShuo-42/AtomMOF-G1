@@ -1,0 +1,81 @@
+_target_: src.models.simplemof_module.SimpleMOFModule
+
+atom_s: 256
+atom_z: 128
+token_s: 512
+token_z: 256
+atom_feature_dim: 10
+ema: false
+ema_decay: 0.999
+use_kernels: false
+
+##### Model arguments #####
+
+# Flow model
+flow_model_args:
+  atom_encoder_depth: 3
+  atom_encoder_heads: 4
+  atom_encoder_positional_encoding: false
+  token_transformer_depth: 24
+  token_transformer_heads: 8
+  atom_decoder_depth: 3
+  atom_decoder_heads: 4
+  attention_impl: pytorch  # ["pytorch (default)", "manual", "xformers"]
+  activation_checkpointing: false
+
+##### Training arguments #####
+
+flow_process_args:
+  prior_sampler: ${data.prior_sampler}
+  num_sampling_steps: 50
+  coordinate_augmentation: false
+  synchronize_timesteps: false
+  compile_model: false
+
+training_args:
+  train_multiplicity: 1
+
+  # Loss type
+  loss_type: l1  # ["l2 (default)", "l1"]
+
+  # Loss weights
+  coord_loss_weight: 1.0
+  lengths_loss_weight: 1.0
+  angle_loss_weight: 0.01
+
+  # Auxiliary loss
+  use_dist_loss: false
+  use_dist_schedule: true
+  dist_loss_weight: 1.0
+  dist_cutoff: 15.0
+
+  # Optimizer
+  lr: 1e-4
+  weight_decay: 0.0
+
+  # Learning rate scheduler
+  lr_scheduler: null # ["null (default)", "af3"]
+  base_lr: 0.0
+  max_lr: 1e-4
+  lr_warmup_no_steps: 10000
+  lr_start_decay_after_n_steps: 1e7
+  lr_decay_every_n_steps: 50000
+  lr_decay_factor: 0.95
+
+validation_args:
+  # Sampling arguments
+  sample_every_n_epochs: 10
+  flow_samples: 1
+  sampling_steps: 10
+  sampling_center_coords: true
+
+  # Metrics computation
+  num_workers: 16
+  timeout: 10 # in seconds
+
+  # StructureMatcher arguments
+  match_mode: 'framework' # ['all', 'framework']
+  structure_matcher_args:
+    ltol: 0.3       # default ltol: 0.2
+    stol: 0.5       # default stol: 0.3
+    angle_tol: 10   # default angle_tol: 5

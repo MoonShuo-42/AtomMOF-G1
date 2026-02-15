@@ -1,0 +1,37 @@
+defaults:
+  - prior_sampler: base
+  - _self_
+
+_target_: src.data.bwdb_datamodule.BWDBDataModule
+
+##### Dataset arguments #####
+lmdb_dir: ${paths.data_dir}/odac25
+lmdb_suffix: odac25
+featurizer:
+  _target_: src.data.feature.featurizer.Featurizer
+sample_limit_dict:
+  train: null
+  val: 1000
+max_num_atoms: null
+optimal_transport: false
+
+##### DataLoader arguments #####
+batch_size:
+  train: 1
+  val: 1
+
+num_workers: 8
+prefetch_factor: 2
+pin_memory: true
+
+##### Sampler arguments #####
+sampler: dynamic # ["dynamic", "overfit", null]
+dynamic:
+  scaling: square  # ["linear", "square", "cubic"]
+  max_num_atoms: 300
+  max_num_atoms_square: 500000
+  max_num_atoms_cubic: 81000000
+  max_batch_size: 64
+  num_buckets: 100
+  shuffle_batches: true
+  skip_too_big: false

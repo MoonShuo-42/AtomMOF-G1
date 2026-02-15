@@ -1,0 +1,11 @@
+_target_: src.data.prior.prior_sampler.PriorSampler
+_convert_: object
+samplers:
+  - _target_: src.data.prior.prior_sampler.CartCoordsSampler
+    variance: 3.0
+    center: true
+
+  - _target_: src.data.prior.prior_sampler.LatticeSampler
+    length_loc: [2.55, 2.75, 2.96]
+    length_scale: [0.37, 0.30, 0.31]
+    angle_range: [60.0, 120.0]
