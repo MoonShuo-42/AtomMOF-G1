@@ -10,7 +10,6 @@ from einops import rearrange
 from lightning import Callback, LightningModule
 from lightning.pytorch.utilities import rank_zero_info
 from torch import Tensor, nn
-from torchmetrics import MeanMetric
 from pebble import ProcessPool
 from concurrent.futures import TimeoutError as PebbleTimeoutError
 from pymatgen.analysis.structure_matcher import StructureMatcher
@@ -56,8 +55,6 @@ class SimpleMOFModule(LightningModule):
 
         # Validation metrics
         self.matcher_kwargs = StructureMatcher(**self.validation_args['structure_matcher_args']).as_dict()
-        self.val_match_rate = MeanMetric(sync_on_compute=False)
-        self.val_rmsd = MeanMetric(sync_on_compute=False)
         self.validation_step_outputs = []
 
         # Flow matching module
@@ -231,36 +228,34 @@ class SimpleMOFModule(LightningModule):
             "atom_mask": batch['atom_pad_mask'],
             "block_type": batch['block_type'],
         }
-        self.validation_step_outputs.append(return_dict)
+        # Keep epoch-long validation caches off the GPU on every rank.
+        self.validation_step_outputs.append(
+            {key: value.detach().cpu() for key, value in return_dict.items()}
+        )
 
     def on_validation_epoch_end(self) -> None:
-        # This hook only runs on rank 0 when using DDP
-        # The 'outputs' argument is a list of dictionaries from every validation_step
-        if self.global_rank == 0:
-            # Filter out None
-            valid_outputs = [out for out in self.validation_step_outputs if out is not None]
-            if not valid_outputs:
-                return
-
-            n_samples = self.validation_args['flow_samples']
-            match_mode = self.validation_args.get('match_mode', 'all')
+        """Compute local structure matches and reduce sample totals across all ranks."""
+        try:
+            n_samples = self.validation_args["flow_samples"]
+            match_mode = self.validation_args.get("match_mode", "all")
             tasks = []
 
-            # Collate results from all batches
-            for batch_output in valid_outputs:
-                # Reshape and move to cpu
-                sampled_coords = rearrange(batch_output['sampled_coords'], '(b m) n c -> b m n c', m=n_samples).cpu().numpy()
-                sampled_lattices = rearrange(batch_output['sampled_lattices'], '(b m) c -> b m c', m=n_samples).cpu().numpy()
-                
-                true_coords = batch_output['true_coords'].cpu().numpy()
-                true_lattices = batch_output['true_lattices'].cpu().numpy()
-                atom_types = batch_output['atom_types'].cpu().numpy()
-                atom_mask = batch_output['atom_mask'].cpu().numpy().astype(bool)
-                block_type = batch_output['block_type'].cpu().numpy()
+            for batch_output in self.validation_step_outputs:
+                if batch_output is None:
+                    continue
+                sampled_coords = rearrange(
+                    batch_output["sampled_coords"], "(b m) n c -> b m n c", m=n_samples
+                ).cpu().numpy()
+                sampled_lattices = rearrange(
+                    batch_output["sampled_lattices"], "(b m) c -> b m c", m=n_samples
+                ).cpu().numpy()
+                true_coords = batch_output["true_coords"].cpu().numpy()
+                true_lattices = batch_output["true_lattices"].cpu().numpy()
+                atom_types = batch_output["atom_types"].cpu().numpy()
+                atom_mask = batch_output["atom_mask"].cpu().numpy().astype(bool)
+                block_type = batch_output["block_type"].cpu().numpy()
 
-                # Prepare tasks for each item in the batch
-                batch_size = sampled_coords.shape[0]
-                for i in range(batch_size):
+                for i in range(sampled_coords.shape[0]):
                     tasks.append(
                         (
                             sampled_coords[i],
@@ -275,48 +270,63 @@ class SimpleMOFModule(LightningModule):
                         )
                     )
 
-            # Settings for parallel processing
-            timeout_seconds = self.validation_args['timeout']
-            num_workers = self.validation_args['num_workers']
-
-            # Execute in parallel
             results_per_item = []
-            with ProcessPool(max_workers=num_workers, context=mp.get_context("spawn")) as pool:
-                future_map = {pool.schedule(find_best_match_rmsd, args=(task,)): task for task in tasks}
+            if tasks:
+                timeout_seconds = self.validation_args["timeout"]
+                num_workers = self.validation_args["num_workers"]
+                with ProcessPool(
+                    max_workers=num_workers, context=mp.get_context("spawn")
+                ) as pool:
+                    futures = [
+                        pool.schedule(
+                            find_best_match_rmsd, args=(task,), timeout=timeout_seconds
+                        )
+                        for task in tasks
+                    ]
+                    for future in futures:
+                        try:
+                            results_per_item.append(future.result())
+                        except PebbleTimeoutError:
+                            future.cancel()
+                            rank_zero_info("| WARNING: A structure matching task timed out.")
+                            results_per_item.append([None] * n_samples)
+                        except Exception as error:
+                            future.cancel()
+                            rank_zero_info(f"| WARNING: A structure matching task failed: {error}")
+                            results_per_item.append([None] * n_samples)
 
-                for future in future_map:
-                    try:
-                        result = future.result(timeout=timeout_seconds)
-                        results_per_item.append(result)
-                    except PebbleTimeoutError:
-                        future.cancel()
-                        rank_zero_info(f"| WARNING: A structure matching task timed out. Skipping.")
-                        results_per_item.append([None] * n_samples)
-                    except Exception as e:
-                        future.cancel()
-                        rank_zero_info(f"| WARNING: A task failed with an exception: {e}")
-                        results_per_item.append([None] * n_samples)
-            
-            # Compute match rate and RMSD
+            matched = 0
+            rmsd_sum = 0.0
             for result_list in results_per_item:
                 valid_rmsds = [r for r in result_list if r is not None]
                 if valid_rmsds:
-                    self.val_match_rate.update(1.0)
-                    self.val_rmsd.update(min(valid_rmsds))
-                else:
-                    self.val_match_rate.update(0.0)
-            
-            # Log aggregated metrics
-            self.log('val/match_rate', self.val_match_rate.compute(), rank_zero_only=True)
-            if self.val_rmsd.update_count > 0:
-                self.log('val/avg_rmsd', self.val_rmsd.compute(), rank_zero_only=True)
-            else:
-                self.log('val/avg_rmsd', float('nan'), rank_zero_only=True)
+                    matched += 1
+                    rmsd_sum += min(valid_rmsds)
 
-            # Reset metrics for next epoch
-            self.val_match_rate.reset()
-            self.val_rmsd.reset()
-            self.validation_step_outputs.clear() # free memory
+            # Reduce counts/sums, not rank averages: dynamic batches can have
+            # different sizes, and a rank may have no successful sampling batches.
+            # All ranks must participate, including ranks with an empty cache.
+            totals = torch.tensor(
+                [len(results_per_item), matched, rmsd_sum],
+                dtype=torch.float64,
+                device=self.device,
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+            sample_count, match_count, rmsd_sum = totals.tolist()
+            if sample_count == 0:
+                return
+
+            # Every rank already has the same global values; do not reduce again.
+            self.log("val/match_rate", match_count / sample_count, sync_dist=False)
+            self.log(
+                "val/avg_rmsd",
+                rmsd_sum / match_count if match_count else float("nan"),
+                sync_dist=False,
+            )
+        finally:
+            # Runs on every rank, also on empty epochs and when matching fails.
+            self.validation_step_outputs.clear()
 
     def predict_step(self, batch: dict[str, Tensor], batch_idx: int) -> dict[str, Any]:
         num_samples = self.predict_args.get('num_samples', 1)

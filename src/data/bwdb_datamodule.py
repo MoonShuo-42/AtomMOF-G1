@@ -192,6 +192,7 @@ class BWDBDataModule(LightningDataModule):
             max_batch_size=max_batch_size,
             shuffle=is_train,
             shuffle_batches=shuffle_batches,
+            skip_too_big=self.dynamic.get("skip_too_big", False),
             sort_key=sort_key,
             num_buckets=num_buckets,
             sync_ddp=is_train,
