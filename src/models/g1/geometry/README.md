@@ -160,13 +160,19 @@ E 中 v、Q 在共同旋转下分别按向量、二阶张量变换；ρ 在共�
 
 ## 内存、复用与配置
 
-默认按 4096 个有效原子对分块，不一次展开全部 N²×125 位移。
-activation_checkpointing=True 时，若输入需要梯度，会按块重算，
-避免反向阶段保存所有候选像的中间张量。可以按需要关闭。
+默认按全批最多 4096 个有效原子对分块，不一次展开全部 BN²×125 位移。
+先在 planning.py 中批量求逆、计算原子对边界、验证整样本覆盖，再压紧全部有效原子对。
+各块复用已算边界；候选槽宽度采用本批有效候选数的最大值，不再固定填满 125 个槽。
+离散搜索仍不求导，活跃位移和矩保持梯度。逐样本 Python 循环和标量同步已移除；
+批级 nonzero 和最大候选数读取仍有动态同步，不能声称完全无同步。
+
+activation_checkpointing 默认 false，与本次 small 训练配置对齐。
+显式开启时，仅在输入需要梯度的情况下按块重算，用额外计算换取候选激活内存。
 
 最终仍返回 dense E，内存为 O(BN²×16)。
 N=1356 时，单份 FP32 E 约 112 MiB，尚不含其他张量及反向内存。
-分块不等于消除了 N² 存储，也不代表已经完成 GPU 性能优化。
+批量搜索边界同样有 O(BN²) 临时存储；分块限制的是候选镜像展开，不消除 N² 存储。
+几何定义不变：超限样本整条回退；合法无邻居样本仍返回 geometry_ok=True。
 
 同次网络调用的多座桥可共享一次计算的 E、ρ；外层更新 x_t/l_t 后需重新计算。
 模块不维护隐式缓存，不与 ConditionEncoder 的参考条件混用。
@@ -183,7 +189,7 @@ min_cell_singular_value: 1.0e-6
 max_cell_condition: 1.0e6
 length_unit: nm
 angle_unit: radian
-activation_checkpointing: true
+activation_checkpointing: false
 ~~~
 
 ## 验证
@@ -210,4 +216,4 @@ python -m pytest tests -q
 六模块统一封装与调用方式见 [G1Module](../README.md)。
 
 
-当前主干接入、开关、checkpoint 兼容性与 263 项全仓库测试记录见 [G1 总文档第 8 节](../README.md#8-atommof-主干接入与开关)。
+主干接入见第 8 节；最新批量几何优化与验证见 [G1 总文档第 10 节](../README.md#10-共享条件批量几何与关闭重算2026-10-16)。

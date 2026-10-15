@@ -112,7 +112,9 @@ c_cond = encoder.encode(c, p, atom_pad_mask, block_index)
 | 输出 Identity | 0 |
 | **合计** | **374,016** |
 
-之前每个编码器为 2,715,776 参数。本次只修改 G1 条件编码器，四桥参数仍独立。
+之前三层编码器每个为 2,715,776 参数，精简后每个为 374,016。
+当前多桥配置 share_condition=true：四桥共享同一个编码器实例及一次前向输出，总共只训练 374,016 个条件参数。
+独立 G1Module() 仍各自创建自己的编码器；多桥共享由 G1Bridges 管理。
 
 ```bash
 python -m pytest tests/test_condition_encoder.py -q
@@ -126,4 +128,4 @@ manual/PyTorch 后端一致性、入口降维的形状和梯度、可配置宽�
 
 
 主干接入与开关见 [G1 总文档第 8 节](../README.md#8-atommof-主干接入与开关)，
-本次精简及验证记录见 [第 9 节](../README.md#9-条件编码器精简2026-10-16)。
+精简记录见第 9 节；最新共享、参数量和阶段一命令见 [G1 总文档第 10 节](../README.md#10-共享条件批量几何与关闭重算2026-10-16)。

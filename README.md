@@ -493,3 +493,9 @@ augmented with random bridges for prediction.
 
 See [G1 integration and switches](src/models/g1/README.md#8-atommof-主干接入与开关)
 for configuration, checkpoint initialization/resume, context reuse, and validation details.
+
+For the shared-condition G1 small stage-1 setup, use `experiment=g1_small_stage1`.
+It aligns the per-GPU batch cap (32), accumulation (2), and FP32 settings with small,
+shares one condition encoder across four bridges, and disables all activation
+checkpointing. See the [G1 performance/configuration notes](src/models/g1/README.md#10-共享条件批量几何与关闭重算2026-10-16)
+for the full server command, checkpoint compatibility, and validation limits.

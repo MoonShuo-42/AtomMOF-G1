@@ -1,4 +1,4 @@
-"""Independent G1 bridges scheduled after selected one-based trunk layers."""
+"""Layer-specific G1 updates with optional shared static condition encoding."""
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
@@ -16,11 +16,13 @@ from .validation import validate_mask
 
 
 class G1Bridges(nn.Module):
-    """One configuration, separately instantiated learned weights at every site.
+    """Separate updates per site, optionally sharing one condition encoder.
 
-    Contexts live only in the caller's current Flow forward, never on this module.
-    Shared geometry is valid because every bridge has the same geometry config;
-    only the existing parameter-free PeriodicGeometry supports this optimization.
+    Hydra enables share_condition for new runs. Its constructor default is False
+    so older checkpoint configs without the flag retain independent encoders.
+    Shared weights are registered by reference in each bridge; PyTorch deduplicates
+    them in parameters()/optimizers. Contexts live only in the current forward.
+    Shared geometry requires the same parameter-free PeriodicGeometry at each site.
     """
 
     def __init__(
@@ -31,6 +33,7 @@ class G1Bridges(nn.Module):
         module: Mapping | None = None,
         activation_checkpointing: bool = False,
         share_geometry: bool = True,
+        share_condition: bool = False,
     ):
         super().__init__()
         positions = tuple(insert_after)
@@ -40,12 +43,17 @@ class G1Bridges(nn.Module):
             or positions != tuple(sorted(set(positions)))
         ):
             raise ValueError("G1 insert_after must be sorted, unique, one-based layers <= depth")
-        if type(activation_checkpointing) is not bool or type(share_geometry) is not bool:
-            raise TypeError("G1 activation_checkpointing and share_geometry must be bool")
+        if any(
+            type(value) is not bool
+            for value in (activation_checkpointing, share_geometry, share_condition)
+        ):
+            raise TypeError("G1 checkpointing and sharing flags must be bool")
         self.insert_after = positions
         self.activation_checkpointing = activation_checkpointing
         self.share_geometry = share_geometry
+        self.share_condition = share_condition
         self.bridges = nn.ModuleDict()
+        condition_encoder = None
         for position in positions:
             bridge = (
                 G1Module(router=SoftRouter(h_dim=h_dim))
@@ -61,12 +69,59 @@ class G1Bridges(nn.Module):
                 raise ValueError("share_geometry requires the parameter-free PeriodicGeometry")
             if bridge.geometry.length_unit != "nm" or bridge.geometry.angle_unit != "radian":
                 raise ValueError("Flow supplies G1 current coordinates/lattice in nm and radian")
+            if share_condition:
+                if condition_encoder is None:
+                    condition_encoder = bridge.condition_encoder
+                elif bridge.c_dim != condition_encoder.output_dim:
+                    raise ValueError("Shared condition encoder must match every bridge's c_dim")
+                else:
+                    bridge.condition_encoder = condition_encoder
             self.bridges[str(position)] = bridge
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Never silently overwrite a shared weight with four different trained copies.
+        # Old checkpoint configs omit share_condition and therefore bypass this guard.
+        if self.share_condition:
+            first = str(self.insert_after[0])
+            encoder = self.bridges[first].condition_encoder
+            for name in encoder.state_dict():
+                reference = state_dict.get(f"{prefix}bridges.{first}.condition_encoder.{name}")
+                if reference is None:
+                    continue
+                for layer in self.insert_after[1:]:
+                    candidate = state_dict.get(f"{prefix}bridges.{layer}.condition_encoder.{name}")
+                    if candidate is not None and not torch.equal(reference, candidate):
+                        error_msgs.append(
+                            "Cannot load independent condition encoder weights into shared G1; "
+                            "use share_condition=False for the old architecture, or start "
+                            "a new shared-condition training run."
+                        )
+                        break
+                if error_msgs:
+                    break
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def prepare(
         self, feats: Mapping[str, Tensor], x_t: Tensor, l_t: Tensor, multiplicity: int = 1
     ) -> dict[str, G1Context]:
-        """Encode each bridge's conditions and the current, expanded noisy geometry.
+        """Encode conditions once when shared, plus current expanded noisy geometry.
 
         Static conditions are encoded at the original batch size, then repeated
         in exactly the same order as AtomMOF's train/sampling multiplicity.
@@ -79,8 +134,14 @@ class G1Bridges(nn.Module):
             raise ValueError("G1 noisy state must match the multiplicity-expanded atom mask")
         contexts = {}
         shared = None
+        shared_condition = None
         for key, bridge in self.bridges.items():
-            c_cond = bridge.encode_condition(feats).repeat_interleave(multiplicity, 0)
+            if not self.share_condition or shared_condition is None:
+                c_cond = bridge.encode_condition(feats).repeat_interleave(multiplicity, 0)
+                if self.share_condition:
+                    shared_condition = c_cond
+            else:
+                c_cond = shared_condition
             if not self.share_geometry or shared is None:
                 geo = bridge.geometry(x_t, l_t, mask)
                 if self.share_geometry:

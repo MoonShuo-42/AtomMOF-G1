@@ -1,0 +1,61 @@
+# @package _global_
+# Shared-condition G1 small, stage 1; same per-GPU batch cap/precision as small.
+defaults:
+  - override /data: bwdb
+  - override /model: simple
+  - override /trainer: ddp
+
+task_name: train_bwdb_g1_small_stage1_shared
+tags: [bwdb, g1, small, stage1, shared_condition]
+seed: 42
+pretrained_ckpt_path: null
+resume_ckpt_path: null
+
+trainer:
+  devices: 8
+  num_nodes: 1
+  max_epochs: 500
+  precision: 32-true
+  accumulate_grad_batches: 2
+  num_sanity_val_steps: 0
+
+data:
+  sampler: dynamic
+  num_workers: 8
+  max_num_atoms: 200
+  dynamic:
+    scaling: square
+    max_num_atoms_square: 3000000
+    max_batch_size: 32
+    skip_too_big: false
+  sample_limit_dict:
+    train: null
+    val: 1000
+
+model:
+  token_s: 256
+  token_z: 128
+  flow_model_args:
+    token_transformer_heads: 8
+    activation_checkpointing: false
+    g1:
+      enabled: true
+      insert_after: [6, 12, 18, 24]
+      share_condition: true
+      share_geometry: true
+      activation_checkpointing: false
+      module:
+        condition_encoder:
+          hidden_dim: 128
+          pair_dim: 64
+          depth: 1
+          activation_checkpointing: false
+        geometry:
+          activation_checkpointing: false
+  training_args:
+    lr_scheduler: af3
+    max_lr: 0.0001
+    lr_warmup_no_steps: 10000
+  validation_args:
+    sample_every_n_epochs: 10
+    num_workers: 1

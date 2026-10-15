@@ -375,6 +375,7 @@ def test_units_config_and_parameter_free_interface():
     output = module(coordinates, params, mask)
     assert output.E.shape == (1, 3, 3, 16) and output.rho.shape == (1, 3, 11)
     assert list(module.parameters()) == []
+    assert module.activation_checkpointing is False
     assert output.geometry_ok.tolist() == [True]
     converted = torch.cat((params[:, :3] * 10, torch.rad2deg(params[:, 3:])), -1)
     external = PeriodicGeometry(length_unit="angstrom", angle_unit="degree")
@@ -402,3 +403,86 @@ def test_invalid_configuration_fails_explicitly(kwargs):
     """Invalid configuration must not silently alter the geometric definition."""
     with pytest.raises(ValueError):
         PeriodicGeometry(**kwargs)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_batched_plan_matches_separate_samples_and_gradients(dtype, checkpoint):
+    """Mixed cells/padding/overflow retain per-sample semantics across chunk boundaries."""
+    x, _, cell, mask = sample()
+    x, cell = x.to(dtype).repeat(4, 1, 1), cell.to(dtype).repeat(4, 1, 1)
+    mask = mask.repeat(4, 1)
+    cell[1] *= 1.4
+    x[1] *= 1.4
+    mask[1, 1] = False
+    x[1, 1] = float("nan")
+    cell[2] *= 0.05  # Candidate overflow invalidates this sample only.
+    mask[3] = False
+    x.requires_grad_()
+    cell.requires_grad_()
+    module = PeriodicGeometry(pair_chunk_size=5, activation_checkpointing=checkpoint)
+    actual = module.from_cell(x, cell, mask)
+    assert actual.geometry_ok.tolist() == [True, True, False, False]
+    weights = torch.randn(actual.E.shape, dtype=dtype, generator=torch.Generator().manual_seed(81))
+    grads = torch.autograd.grad((actual.E * weights).sum(), (x, cell))
+    expected_outputs, expected_x, expected_cell = [], [], []
+    for i in range(4):
+        xi, ci = x[i : i + 1].detach().requires_grad_(), cell[i : i + 1].detach().requires_grad_()
+        out = module.from_cell(xi, ci, mask[i : i + 1])
+        dx, dc = torch.autograd.grad((out.E * weights[i : i + 1]).sum(), (xi, ci))
+        expected_outputs.append(out.E)
+        expected_x.append(dx)
+        expected_cell.append(dc)
+    torch.testing.assert_close(actual.E, torch.cat(expected_outputs))
+    torch.testing.assert_close(grads[0], torch.cat(expected_x))
+    torch.testing.assert_close(grads[1], torch.cat(expected_cell))
+    assert torch.isfinite(grads[0]).all() and torch.isfinite(grads[1]).all()
+    assert grads[0][2:].count_nonzero() == 0 and grads[1][2:].count_nonzero() == 0
+
+
+def test_batched_search_runs_once_and_uses_exact_image_padding(monkeypatch):
+    """All pair bounds are checked once, even when moments span many small chunks."""
+    module = PeriodicGeometry(pair_chunk_size=3)
+    x = torch.tensor([[[0.1, 0, 0], [0.9, 0, 0]]] * 4, dtype=torch.float64)
+    cell = torch.eye(3, dtype=x.dtype)[None].repeat(4, 1, 1)
+    mask = torch.ones(4, 2, dtype=torch.bool)
+    cell[2] *= 0.01  # Entire sample rejected; no partial candidate truncation.
+    mask[3] = False
+    original_bounds, original_enumerate = module.image_search.bounds, module.image_search.enumerate
+    bound_calls, slots, pairs = [], [], []
+
+    def bounds(*args, **kwargs):
+        bound_calls.append(args[0].shape)
+        return original_bounds(*args, **kwargs)
+
+    def enumerate_images(bounds, **kwargs):
+        shifts, valid = original_enumerate(bounds, **kwargs)
+        slots.append(shifts.shape[1])
+        pairs.append(shifts.shape[0])
+        assert torch.equal(valid.sum(-1), bounds.counts)
+        return shifts, valid
+
+    monkeypatch.setattr(module.image_search, "bounds", bounds)
+    monkeypatch.setattr(module.image_search, "enumerate", enumerate_images)
+    result = module.from_cell(x, cell, mask)
+    assert bound_calls == [torch.Size([4, 4, 3])]
+    assert slots and all(width == 1 for width in slots)
+    assert sum(pairs) == 8 and max(pairs) <= 3
+    assert result.geometry_ok.tolist() == [True, True, False, False]
+    for i in range(2):
+        torch.testing.assert_close(result.E[i], brute_force(x[i], cell[i]))
+
+
+def test_entirely_unavailable_batch_does_not_enumerate_images(monkeypatch):
+    module = PeriodicGeometry()
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Rejected samples must not launch image/moment computation")
+
+    monkeypatch.setattr(module.image_search, "enumerate", unexpected)
+    x = torch.zeros(3, 2, 3, requires_grad=True)
+    cell = (torch.eye(3)[None].repeat(3, 1, 1) * 0.01).requires_grad_()
+    out = module.from_cell(x, cell, torch.ones(3, 2))
+    assert not out.geometry_ok.any()
+    out.E.sum().backward()
+    assert x.grad.count_nonzero() == 0 and cell.grad.count_nonzero() == 0

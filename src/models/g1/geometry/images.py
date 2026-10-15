@@ -33,7 +33,7 @@ class PeriodicImageSearch:
     def bounds(self, delta: Tensor, inverse_cell: Tensor) -> ImageBounds:
         """Enclose all radius-qualified shifts, without assuming 27 images suffice."""
         fractional = delta.double() @ inverse_cell
-        radius = self.cutoff * torch.linalg.vector_norm(inverse_cell, dim=0)
+        radius = self.cutoff * torch.linalg.vector_norm(inverse_cell, dim=-2).unsqueeze(-2)
         # Outward margin also accounts for the size of the represented numbers.
         tolerance = self.margin + 16 * torch.finfo(torch.float64).eps * (
             1 + fractional.abs() + radius
@@ -51,14 +51,24 @@ class PeriodicImageSearch:
         complete = representable & torch.isfinite(counts) & (counts <= self.max_images)
         nonempty = complete & (counts > 0)
         # Never convert huge/invalid boxes to integers or silently truncate them.
-        safe_lower = torch.where(nonempty[:, None], lower, 0).long()
-        safe_widths = torch.where(nonempty[:, None], widths, 1).long()
+        safe_lower = torch.where(nonempty[..., None], lower, 0).long()
+        safe_widths = torch.where(nonempty[..., None], widths, 1).long()
         safe_counts = torch.where(nonempty, counts, 0).long()
         return ImageBounds(safe_lower, safe_widths, safe_counts, complete)
 
-    def enumerate(self, bounds: ImageBounds) -> tuple[Tensor, Tensor]:
-        """Return fixed-width integer shifts and a mask for real box entries."""
-        index = torch.arange(self.max_images, device=bounds.lower.device)[None]
+    def enumerate(
+        self, bounds: ImageBounds, *, image_slots: int | None = None
+    ) -> tuple[Tensor, Tensor]:
+        """Enumerate shifts, optionally using the plan's exact batch maximum.
+
+        Internal optimized callers supply max(counts) over all accepted pairs.
+        The cap/whole-sample rejection is checked before choosing this storage width;
+        reducing padding never truncates an accepted box.
+        """
+        slots = self.max_images if image_slots is None else image_slots
+        if type(slots) is not int or not 1 <= slots <= self.max_images:
+            raise ValueError("image_slots must be between 1 and max_images")
+        index = torch.arange(slots, device=bounds.lower.device)[None]
         widths = bounds.widths
         offsets = torch.stack(
             (

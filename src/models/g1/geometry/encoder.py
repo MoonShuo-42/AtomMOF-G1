@@ -7,9 +7,10 @@ import torch
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-from .images import PeriodicImageSearch
+from .images import ImageBounds, PeriodicImageSearch
 from .lattice import lattice_parameters_to_cell, validate_cell
 from .moments import PeriodicPairMoments, scalarize_geometry
+from .planning import build_geometry_plan
 
 
 class GeometryOutput(NamedTuple):
@@ -41,7 +42,7 @@ class PeriodicGeometry(nn.Module):
         max_cell_condition: float = 1e6,
         length_unit: Literal["nm", "angstrom"] = "nm",
         angle_unit: Literal["radian", "degree"] = "radian",
-        activation_checkpointing: bool = True,
+        activation_checkpointing: bool = False,
     ):
         super().__init__()
         if length_unit not in ("nm", "angstrom") or angle_unit not in ("radian", "degree"):
@@ -116,34 +117,29 @@ class PeriodicGeometry(nn.Module):
             valid = torch.ones(x_t.shape[0], dtype=torch.bool, device=x_t.device)
             return self._compute(x_t, cell, mask, valid)
 
-    def _pair_indices(self, size: int, device: torch.device):
-        """Yield bounded chunks of flattened valid-atom pairs."""
-        for start in range(0, size * size, self.pair_chunk_size):
-            yield torch.arange(
-                start, min(start + self.pair_chunk_size, size * size), device=device
-            )
-
     def _encode_pairs(
-        self, coordinates: Tensor, cell: Tensor, inverse: Tensor, pairs: Tensor
+        self,
+        coordinates: Tensor,
+        cell: Tensor,
+        pairs: Tensor,
+        bounds: ImageBounds,
+        image_slots: int,
     ) -> Tensor:
-        """Recompute image decisions and differentiable moments for one pair chunk."""
-        # Checkpoint recomputation may run after an outer mixed-precision context changes.
+        """Compute live displacements for one global chunk of accepted pairs."""
         with torch.autocast(device_type=coordinates.device.type, enabled=False):
-            size = coordinates.shape[0]
-            i, j = pairs // size, pairs % size
-            delta_search = coordinates[j].detach().double() - coordinates[i].detach().double()
-            bounds = self.image_search.bounds(delta_search, inverse)
-            shifts, image_mask = self.image_search.enumerate(bounds)
+            atoms = coordinates.shape[1]
+            batch_index = pairs // (atoms * atoms)
+            i, j = (pairs // atoms) % atoms, pairs % atoms
+            shifts, image_mask = self.image_search.enumerate(bounds, image_slots=image_slots)
             image_mask = image_mask & ~((i == j)[:, None] & (shifts == 0).all(-1))
-            # Select indices only under no_grad; do NOT detach these live tensors.
-            delta = coordinates[j] - coordinates[i]
-            displacements = delta[:, None, :] + shifts.to(cell.dtype) @ cell
+            delta = coordinates[batch_index, j] - coordinates[batch_index, i]
+            displacements = delta[:, None, :] + torch.bmm(shifts.to(cell.dtype), cell[batch_index])
             return self.moments(displacements, image_mask)
 
     def _compute(
         self, coordinates: Tensor, cell: Tensor, mask: Tensor, initially_valid: Tensor
     ) -> GeometryOutput:
-        """Check complete coverage before materializing any sample's geometry."""
+        """Batch all search decisions; stream accepted pairs in bounded chunks."""
         batch, atoms, _ = coordinates.shape
         cell_ok = validate_cell(cell, self.min_cell_singular_value, self.max_cell_condition)
         coordinate_finite = torch.isfinite(coordinates).all(-1)
@@ -151,54 +147,36 @@ class PeriodicGeometry(nn.Module):
         safe_coordinates = torch.where((mask & coordinate_finite)[..., None], coordinates, 0)
         identity = torch.eye(3, dtype=cell.dtype, device=cell.device)
         safe_cell = torch.where(cell_ok[:, None, None], cell, identity)
-        outputs = []
-        availability = []
-        for b in range(batch):
-            # Keeps all-invalid outputs differentiable with exactly zero gradients.
-            zero = (safe_coordinates[b] * 0).sum() + (safe_cell[b] * 0).sum()
-            empty = coordinates.new_zeros((atoms * atoms, 16)) + zero
-            if not bool(valid[b]):
-                outputs.append(empty.reshape(atoms, atoms, 16))
-                availability.append(False)
-                continue
-            indices = mask[b].nonzero(as_tuple=True)[0]
-            current = safe_coordinates[b, indices]
-            current_cell = safe_cell[b]
-            with torch.no_grad():
-                inverse = torch.linalg.inv(current_cell.detach().double())
-                complete = torch.ones((), dtype=torch.bool, device=cell.device)
-                for pairs in self._pair_indices(len(indices), cell.device):
-                    i, j = pairs // len(indices), pairs % len(indices)
-                    delta = current[j].double() - current[i].double()
-                    complete = complete & self.image_search.bounds(delta, inverse).complete.all()
-            if not bool(complete):
-                # Reject the WHOLE geometry branch, never truncate extra images.
-                outputs.append(empty.reshape(atoms, atoms, 16))
-                availability.append(False)
-                continue
-            chunks = []
-            for pairs in self._pair_indices(len(indices), cell.device):
-                if (
-                    self.activation_checkpointing
-                    and torch.is_grad_enabled()
-                    and (current.requires_grad or current_cell.requires_grad)
-                ):
-                    chunk = checkpoint(
-                        self._encode_pairs,
-                        current,
-                        current_cell,
-                        inverse,
-                        pairs,
-                        use_reentrant=False,
-                    )
-                else:
-                    chunk = self._encode_pairs(current, current_cell, inverse, pairs)
-                chunks.append(chunk)
-            locations = (indices[:, None] * atoms + indices[None, :]).reshape(-1)
-            dense = empty.index_copy(0, locations, torch.cat(chunks))
-            outputs.append(dense.reshape(atoms, atoms, 16))
-            availability.append(True)
-        pair_features = torch.stack(outputs)
+        plan = build_geometry_plan(safe_coordinates, safe_cell, mask, valid, self.image_search)
+        # Also connect entirely unavailable batches to finite zero input gradients.
+        zero = (safe_coordinates * 0).sum() + (safe_cell * 0).sum()
+        dense = coordinates.new_zeros((batch * atoms * atoms, 16)) + zero
+        chunks = []
+        for start in range(0, plan.pairs.numel(), self.pair_chunk_size):
+            stop = start + self.pair_chunk_size
+            pairs = plan.pairs[start:stop]
+            bounds = ImageBounds(*(value[start:stop] for value in plan.bounds))
+            if (
+                self.activation_checkpointing
+                and torch.is_grad_enabled()
+                and (safe_coordinates.requires_grad or safe_cell.requires_grad)
+            ):
+                chunk = checkpoint(
+                    self._encode_pairs,
+                    safe_coordinates,
+                    safe_cell,
+                    pairs,
+                    bounds,
+                    plan.image_slots,
+                    use_reentrant=False,
+                )
+            else:
+                chunk = self._encode_pairs(
+                    safe_coordinates, safe_cell, pairs, bounds, plan.image_slots
+                )
+            chunks.append(chunk)
+        if chunks:
+            dense = dense.index_copy(0, plan.pairs, torch.cat(chunks))
+        pair_features = dense.reshape(batch, atoms, atoms, 16)
         rho = scalarize_geometry(pair_features.sum(dim=2))
-        geometry_ok = torch.tensor(availability, dtype=torch.bool, device=cell.device)
-        return GeometryOutput(pair_features, rho, geometry_ok)
+        return GeometryOutput(pair_features, rho, plan.geometry_ok)

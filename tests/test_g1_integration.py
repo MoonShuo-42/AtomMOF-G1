@@ -59,12 +59,13 @@ def flow_args():
     )
 
 
-def bridge_config(checkpoint=False, share=True):
+def bridge_config(checkpoint=False, share=True, share_condition=True):
     return dict(
         enabled=True,
         insert_after=[6, 12, 18, 24],
         activation_checkpointing=checkpoint,
         share_geometry=share,
+        share_condition=share_condition,
         module={
             "_target_": "src.models.g1.G1Module",
             "condition_encoder": {
@@ -173,7 +174,7 @@ def test_disabled_creates_no_bridges_and_preserves_initialization_rng_and_state(
         torch.testing.assert_close(p.grad, q.grad, rtol=0, atol=0)
 
 
-def test_bridges_run_immediately_after_6_12_18_24_with_independent_parameters():
+def test_bridges_run_after_6_12_18_24_with_shared_condition_and_independent_updates():
     model = FlowModule(**flow_args(), g1=bridge_config())
     perturb(model)
     events, handles = [], []
@@ -200,8 +201,13 @@ def test_bridges_run_immediately_after_6_12_18_24_with_independent_parameters():
             p.grad is not None and torch.isfinite(p.grad).all() for p in bridge.parameters()
         )
         assert sum(p.grad.abs().sum() for p in bridge.parameters()) > 0
-        parameters.extend(p.data_ptr() for p in bridge.parameters())
+        parameters.extend(
+            p.data_ptr()
+            for name, p in bridge.named_parameters()
+            if not name.startswith("condition_encoder.")
+        )
     assert len(parameters) == len(set(parameters))
+    assert len({id(b.condition_encoder) for b in model.g1_bridges.bridges.values()}) == 1
     for handle in handles:
         handle.remove()
 
@@ -410,7 +416,7 @@ def test_lightning_optimizer_runs_two_real_training_steps():
     assert trainer.global_step == 2 and not torch.equal(before, parameter)
 
 
-def _ddp_worker(rank, init_file):
+def _ddp_worker(rank, init_file, checkpoint):
     from datetime import timedelta
 
     import torch.distributed as dist
@@ -425,7 +431,7 @@ def _ddp_worker(rank, init_file):
         timeout=timedelta(seconds=60),
     )
     try:
-        model = FlowModule(**flow_args(), g1=bridge_config(checkpoint=True))
+        model = FlowModule(**flow_args(), g1=bridge_config(checkpoint=checkpoint))
         wrapped = DistributedDataParallel(model, find_unused_parameters=False)
         optimizer = torch.optim.AdamW(wrapped.parameters(), lr=1e-3)
         for step in range(2):
@@ -446,13 +452,14 @@ def _ddp_worker(rank, init_file):
         dist.destroy_process_group()
 
 
-def test_two_rank_ddp_uses_all_parameters_with_bridge_checkpointing(tmp_path):
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_two_rank_ddp_uses_all_parameters_with_shared_condition(tmp_path, checkpoint):
     import torch.distributed as dist
     import torch.multiprocessing as mp
 
     if not dist.is_available() or not dist.is_gloo_available():
         pytest.skip("Gloo is unavailable in this PyTorch build")
-    mp.spawn(_ddp_worker, args=(str(tmp_path / "gloo_init"),), nprocs=2, join=True)
+    mp.spawn(_ddp_worker, args=(str(tmp_path / "gloo_init"), checkpoint), nprocs=2, join=True)
 
 
 @pytest.mark.parametrize("requested,expected", [(None, True), (False, False), (True, True)])
@@ -567,6 +574,7 @@ def test_hydra_checkpoint_restores_g1_configuration_and_can_resume(tmp_path):
     )
     loaded = SimpleMOFModule.load_from_checkpoint(path, strict=True)
     assert loaded.structure_module.flow_model.g1_enabled
+    assert loaded.hparams.flow_model_args.g1.share_condition is True
     assert loaded.hparams.flow_model_args.g1.module.router.h_dim == 16
     assert loaded.hparams.flow_model_args.g1.module.condition_encoder.hidden_dim == 8
     assert loaded.hparams.flow_model_args.g1.module.condition_encoder.pair_dim == 4
@@ -586,7 +594,7 @@ def test_small_parameter_budget_keeps_baseline_and_other_g1_components_unchanged
     del baseline
     cfg.model.flow_model_args.g1.enabled = True
     model = instantiate(cfg.model)
-    assert sum(p.numel() for p in model.parameters()) == 41_647_264
+    assert sum(p.numel() for p in model.parameters()) == 40_525_216
     bridges = model.structure_module.flow_model.g1_bridges.bridges
     assert list(bridges) == ["6", "12", "18", "24"]
     expected = {
@@ -602,3 +610,98 @@ def test_small_parameter_budget_keeps_baseline_and_other_g1_components_unchanged
             name: sum(p.numel() for p in getattr(bridge, name).parameters()) for name in expected
         } == expected
         assert sum(p.numel() for p in bridge.parameters()) == 817_736
+
+
+def test_shared_condition_runs_once_and_receives_the_sum_of_all_bridge_gradients():
+    shared = FlowModule(**flow_args(), g1=bridge_config())
+    independent = FlowModule(**flow_args(), g1=bridge_config(share_condition=False))
+    perturb(shared)
+    independent.load_state_dict(shared.state_dict(), strict=True)
+    encoder = shared.g1_bridges.bridges["6"].condition_encoder
+    calls = []
+    handle = encoder.register_forward_hook(lambda m, a, o: calls.append(o))
+    try:
+        out = shared(**inputs(2))
+        assert len(calls) == 1
+        # A later forward must recompute, with a fresh graph.
+        shared(**inputs())
+        assert len(calls) == 2
+    finally:
+        handle.remove()
+    reference = independent(**inputs(2))
+    for key in out:
+        torch.testing.assert_close(out[key], reference[key], rtol=0, atol=0)
+    loss(out).backward()
+    loss(reference).backward()
+    individual = [
+        dict(b.condition_encoder.named_parameters())
+        for b in independent.g1_bridges.bridges.values()
+    ]
+    for name, param in encoder.named_parameters():
+        expected = sum(parameters[name].grad for parameters in individual)
+        torch.testing.assert_close(param.grad, expected, rtol=3e-5, atol=2e-6, msg=name)
+    data = inputs(2)
+    contexts = shared.g1_bridges.prepare(data["feats"], data["r_noisy"], data["l_noisy"], 2)
+    assert len({id(c.c_cond) for c in contexts.values()}) == 1
+    assert contexts["6"].c_cond.grad_fn is not None
+    parameter_ids = [id(p) for p in shared.parameters()]
+    assert len(parameter_ids) == len(set(parameter_ids))
+
+
+def test_old_compact_checkpoint_without_sharing_flag_keeps_independent_encoders(tmp_path):
+    args = model_args(True)
+    del args["flow_model_args"]["g1"]["share_condition"]
+    old = SimpleMOFModule(**args).eval()
+    assert not old.structure_module.flow_model.g1_bridges.share_condition
+    assert (
+        len(
+            {
+                id(b.condition_encoder)
+                for b in old.structure_module.flow_model.g1_bridges.bridges.values()
+            }
+        )
+        == 4
+    )
+    path = tmp_path / "independent_compact.ckpt"
+    torch.save(
+        {
+            "state_dict": old.state_dict(),
+            "hyper_parameters": dict(old.hparams),
+            "pytorch-lightning_version": L.__version__,
+        },
+        path,
+    )
+    restored = SimpleMOFModule.load_from_checkpoint(path, strict=True).eval()
+    assert not restored.structure_module.flow_model.g1_bridges.share_condition
+    for key, value in old.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[key], value, rtol=0, atol=0)
+    shared = SimpleMOFModule(**model_args(True))
+    with pytest.raises(RuntimeError, match="independent condition encoder weights"):
+        shared.load_state_dict(old.state_dict(), strict=True)
+
+
+def test_stage1_experiment_aligns_small_batch_and_disables_all_recomputation():
+    os.environ.setdefault("PROJECT_ROOT", str(Path(__file__).resolve().parents[1]))
+    with initialize_config_dir(
+        config_dir=str(Path(__file__).resolve().parents[1] / "configs"), version_base=None
+    ):
+        cfg = compose(config_name="train", overrides=["experiment=g1_small_stage1"])
+    assert cfg.trainer.devices == 8 and cfg.trainer.accumulate_grad_batches == 2
+    assert cfg.trainer.precision == "32-true" and cfg.trainer.max_epochs == 500
+    assert cfg.data.max_num_atoms == 200 and cfg.data.dynamic.max_batch_size == 32
+    assert cfg.model.token_s == 256 and cfg.model.token_z == 128
+    flow = cfg.model.flow_model_args
+    assert not flow.activation_checkpointing
+    assert flow.g1.enabled and flow.g1.share_condition and flow.g1.share_geometry
+    assert not flow.g1.activation_checkpointing
+    assert not flow.g1.module.condition_encoder.activation_checkpointing
+    assert not flow.g1.module.geometry.activation_checkpointing
+    # All shipped defaults also disable recomputation without an experiment override.
+    with initialize_config_dir(
+        config_dir=str(Path(__file__).resolve().parents[1] / "configs"), version_base=None
+    ):
+        default = compose(config_name="train")
+    assert not default.model.flow_model_args.activation_checkpointing
+    assert not default.model.flow_model_args.g1.activation_checkpointing
+    assert not default.model.flow_model_args.g1.module.condition_encoder.activation_checkpointing
+    assert not default.model.flow_model_args.g1.module.geometry.activation_checkpointing

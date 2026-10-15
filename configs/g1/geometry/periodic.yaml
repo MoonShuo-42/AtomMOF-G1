@@ -10,4 +10,4 @@ min_cell_singular_value: 1.0e-6  # nm, numerical safeguard
 max_cell_condition: 1.0e6
 length_unit: nm
 angle_unit: radian
-activation_checkpointing: true
+activation_checkpointing: false
