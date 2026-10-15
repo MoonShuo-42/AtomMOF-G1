@@ -63,7 +63,9 @@ def make_inputs(lengths=(3,), atoms=None, h_dim=8):
 
 def small_model(max_groups=32):
     return G1Module(
-        condition_encoder=ConditionEncoder(atom_s=16, atom_z=8, output_dim=12, depth=1, heads=4),
+        condition_encoder=ConditionEncoder(
+            atom_s=16, atom_z=8, hidden_dim=8, pair_dim=4, output_dim=12, depth=1, heads=4
+        ),
         router=SoftRouter(
             h_dim=8, c_dim=12, time_dim=8, hidden_dim=16, key_dim=8, max_groups=max_groups
         ),
@@ -355,7 +357,9 @@ def test_CPU_autocast_remains_finite_through_all_six_modules_and_backward():
 
 
 def test_supplied_modules_are_retained_and_unspecified_widths_and_eps_are_derived():
-    condition = ConditionEncoder(atom_s=16, atom_z=8, output_dim=12, depth=1, heads=4)
+    condition = ConditionEncoder(
+        atom_s=16, atom_z=8, hidden_dim=8, pair_dim=4, output_dim=12, depth=1, heads=4
+    )
     router = SoftRouter(h_dim=8, c_dim=12, pool_eps=1e-5)
     model = G1Module(condition_encoder=condition, router=router)
     assert model.condition_encoder is condition and model.router is router
@@ -411,7 +415,8 @@ def test_Hydra_composes_existing_six_configs_and_default_model_runs():
     data = make_inputs(h_dim=256)
     result = model(**data)
     assert result.H_updated.shape == (1, 4, 256) and result.readback.shape == (1, 4, 128)
-    assert model.condition_encoder.output_dim == 128 and len(model.condition_encoder.blocks) == 3
+    assert model.condition_encoder.output_dim == 128 and len(model.condition_encoder.blocks) == 1
+    assert model.condition_encoder.hidden_dim == 128 and model.condition_encoder.pair_dim == 64
     assert model.router.max_groups == 32
     direct = G1Module()
     direct.load_state_dict(model.state_dict(), strict=True)
@@ -422,14 +427,14 @@ def test_Hydra_submodule_overrides_reach_actual_modules():
     cfg = compose_g1(
         [
             "g1.router.max_groups=2",
-            "g1.condition_encoder.depth=1",
+            "g1.condition_encoder.depth=2",
             "g1.geometry.pair_chunk_size=16",
             "g1.group_interaction.ffn_ratio=2",
             "g1.readback.value_hidden_dim=64",
         ]
     )
     model = instantiate(cfg.g1)
-    assert model.router.max_groups == 2 and len(model.condition_encoder.blocks) == 1
+    assert model.router.max_groups == 2 and len(model.condition_encoder.blocks) == 2
     assert model.geometry.pair_chunk_size == 16
     assert model.group_interaction.block.fc1.out_features == 256
     assert model.readback.value.atom_projection.out_features == 64

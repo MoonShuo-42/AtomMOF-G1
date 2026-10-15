@@ -55,7 +55,9 @@ def make_feats():
 def make_encoder(**kwargs):
     """Construct a small but real encoder for forward/backward checks."""
     torch.manual_seed(17)
-    return ConditionEncoder(atom_s=16, atom_z=8, output_dim=12, depth=2, heads=4, **kwargs)
+    return ConditionEncoder(
+        atom_s=16, atom_z=8, hidden_dim=8, pair_dim=4, output_dim=12, depth=1, heads=4, **kwargs
+    )
 
 
 def test_features_match_original_atom_encoder():
@@ -151,6 +153,8 @@ def test_gradients_reach_distant_block_members_but_not_other_blocks(backend):
     names = [
         "features.embed_atom_features.weight",
         "features.embed_bond_feats.weight",
+        "single_projection.weight",
+        "pair_projection.weight",
         "blocks.0.attn.proj_v.weight",
         "blocks.0.mlp.fc2.weight",
         "output_projection.weight",
@@ -257,23 +261,63 @@ def test_activation_checkpointing_preserves_parameter_gradients():
 
 
 def test_external_feature_entrypoint_and_optional_output_projection():
-    """Original c/p can be provided explicitly; the trunk can retain its full width."""
-    encoder = ConditionEncoder(atom_s=16, atom_z=8, output_dim=None, heads=4, depth=1)
+    """External raw c/p follow the same pre-projections as internally built features."""
+    encoder = ConditionEncoder(
+        atom_s=16, atom_z=8, hidden_dim=8, pair_dim=4, output_dim=None, heads=4
+    )
     feats = make_feats()
     c, p = encoder.features(feats)
     from_external = encoder.encode(c, p, feats["atom_pad_mask"], feats["block_index"])
     torch.testing.assert_close(encoder(feats), from_external, rtol=0, atol=0)
-    assert from_external.shape == (1, 7, 16)
+    assert from_external.shape == (1, 7, 8)
+    assert isinstance(encoder.output_projection, torch.nn.Identity)
 
 
 def test_standalone_configuration_builds_small_encoder():
-    """The delivered config creates the advertised 256/128 -> 128 interface."""
+    """Config and Python defaults use one 128/64 block after raw 256/128 features."""
     root = Path(__file__).resolve().parents[1]
     encoder = instantiate(OmegaConf.load(root / "configs/g1/condition_encoder/static.yaml"))
-    assert len(encoder.blocks) == 3
+    assert len(encoder.blocks) == 1
     assert encoder.blocks[0].attn.num_heads == 4
     assert encoder.atom_s == 256 and encoder.atom_z == 128
-    output = encoder(make_feats())
+    assert encoder.hidden_dim == 128 and encoder.pair_dim == 64
+    assert isinstance(encoder.output_projection, torch.nn.Identity)
+    assert sum(p.numel() for p in encoder.parameters()) == 374_016
+    direct = ConditionEncoder()
+    direct.load_state_dict(encoder.state_dict(), strict=True)
+    feats = make_feats()
+    c, p = encoder.features(feats)
+    assert c.shape == (1, 7, 256) and p.shape == (1, 7, 7, 128)
+    captured = []
+    hook = encoder.blocks[0].register_forward_pre_hook(
+        lambda module, args: captured.append((args[0].shape, args[1].shape))
+    )
+    try:
+        output = encoder(feats)
+    finally:
+        hook.remove()
+    assert captured == [(torch.Size([1, 7, 128]), torch.Size([1, 7, 7, 64]))]
+    torch.testing.assert_close(output, direct(feats), rtol=0, atol=0)
     assert output.shape == (1, 7, 128)
     assert torch.isfinite(output).all()
     assert torch.count_nonzero(output[:, -1]) == 0
+
+
+def test_raw_width_need_not_be_divisible_by_heads_after_projection():
+    encoder = ConditionEncoder(
+        atom_s=14, atom_z=7, hidden_dim=12, pair_dim=6, output_dim=None, heads=4
+    )
+    output = encoder(make_feats())
+    assert output.shape == (1, 7, 12) and torch.isfinite(output).all()
+    with pytest.raises(ValueError, match="hidden_dim must be divisible"):
+        ConditionEncoder(hidden_dim=14, heads=4)
+
+
+def test_equal_widths_skip_projections_for_custom_architectures():
+    encoder = ConditionEncoder(
+        atom_s=16, atom_z=8, hidden_dim=16, pair_dim=8, output_dim=None, depth=2
+    )
+    assert isinstance(encoder.single_projection, torch.nn.Identity)
+    assert isinstance(encoder.pair_projection, torch.nn.Identity)
+    assert isinstance(encoder.output_projection, torch.nn.Identity)
+    assert encoder(make_feats()).shape == (1, 7, 16)

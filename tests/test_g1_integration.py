@@ -71,6 +71,9 @@ def bridge_config(checkpoint=False, share=True):
                 "_target_": "src.models.g1.conditioning.ConditionEncoder",
                 "atom_s": 16,
                 "atom_z": 8,
+                "hidden_dim": 8,
+                "pair_dim": 4,
+                "activation_checkpointing": checkpoint,
                 "output_dim": 8,
                 "depth": 1,
                 "heads": 4,
@@ -548,6 +551,8 @@ def test_hydra_checkpoint_restores_g1_configuration_and_can_resume(tmp_path):
                 "model.flow_model_args.g1.module.condition_encoder.atom_s=16",
                 "model.flow_model_args.g1.module.condition_encoder.atom_z=8",
                 "model.flow_model_args.g1.module.condition_encoder.depth=1",
+                "model.flow_model_args.g1.module.condition_encoder.hidden_dim=8",
+                "model.flow_model_args.g1.module.condition_encoder.pair_dim=4",
             ],
         )
     model = instantiate(cfg.model)
@@ -563,5 +568,37 @@ def test_hydra_checkpoint_restores_g1_configuration_and_can_resume(tmp_path):
     loaded = SimpleMOFModule.load_from_checkpoint(path, strict=True)
     assert loaded.structure_module.flow_model.g1_enabled
     assert loaded.hparams.flow_model_args.g1.module.router.h_dim == 16
+    assert loaded.hparams.flow_model_args.g1.module.condition_encoder.hidden_dim == 8
+    assert loaded.hparams.flow_model_args.g1.module.condition_encoder.pair_dim == 4
     for key, value in model.state_dict().items():
         torch.testing.assert_close(loaded.state_dict()[key], value, rtol=0, atol=0)
+
+
+def test_small_parameter_budget_keeps_baseline_and_other_g1_components_unchanged():
+    os.environ.setdefault("PROJECT_ROOT", str(Path(__file__).resolve().parents[1]))
+    with initialize_config_dir(
+        config_dir=str(Path(__file__).resolve().parents[1] / "configs"), version_base=None
+    ):
+        cfg = compose(config_name="train", overrides=["model.token_s=256", "model.token_z=128"])
+    baseline = instantiate(cfg.model)
+    baseline_count = sum(p.numel() for p in baseline.parameters())
+    assert baseline_count == 38_376_320
+    del baseline
+    cfg.model.flow_model_args.g1.enabled = True
+    model = instantiate(cfg.model)
+    assert sum(p.numel() for p in model.parameters()) == 41_647_264
+    bridges = model.structure_module.flow_model.g1_bridges.bridges
+    assert list(bridges) == ["6", "12", "18", "24"]
+    expected = {
+        "condition_encoder": 374_016,
+        "geometry": 0,
+        "router": 60_128,
+        "aggregation": 0,
+        "group_interaction": 231_876,
+        "readback": 151_716,
+    }
+    for bridge in bridges.values():
+        assert {
+            name: sum(p.numel() for p in getattr(bridge, name).parameters()) for name in expected
+        } == expected
+        assert sum(p.numel() for p in bridge.parameters()) == 817_736

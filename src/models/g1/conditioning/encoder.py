@@ -1,4 +1,4 @@
-"""Static condition Transformer: original c/p, block mask, no time modulation."""
+"""Static condition Transformer: project original c/p before block-local attention."""
 
 from typing import Literal, Mapping, Optional
 
@@ -64,9 +64,11 @@ class StaticConditionBlock(nn.Module):
 class ConditionEncoder(nn.Module):
     """Encode each input block independently into per-atom conditions.
 
-    Defaults preserve AtomMOF-small's 256/128 single/pair widths, three encoder
-    layers and four heads, followed by a 256 -> 128 projection for G1. Set
-    output_dim=None to keep atom_s channels without an output projection.
+    Builds original AtomMOF-small c/p at 256/128 channels, then projects them
+    to hidden_dim=128 / pair_dim=64 before one static four-head Transformer.
+    The default output is 128 channels, with no additional output projection.
+    Set output_dim=None to retain hidden_dim channels. Raw feature widths and
+    internal Transformer widths can be configured independently.
 
     forward(feats) builds c/p; encode(c, p, mask, block_index) also accepts
     externally computed original c/p, enabling later feature/parameter reuse.
@@ -79,30 +81,43 @@ class ConditionEncoder(nn.Module):
         atom_s: int = 256,
         atom_z: int = 128,
         output_dim: Optional[int] = 128,
-        depth: int = 3,
+        depth: int = 1,
         heads: int = 4,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         attention_impl: AttentionImpl = "pytorch",
         activation_checkpointing: bool = False,
+        *,
+        hidden_dim: int = 128,
+        pair_dim: int = 64,
     ):
         super().__init__()
-        if atom_s <= 0 or atom_z <= 0 or heads <= 0 or atom_s % heads != 0:
-            raise ValueError("positive atom_s must be divisible by positive heads; atom_z > 0")
-        if depth < 1 or int(atom_s * mlp_ratio) < 1:
+        if atom_s <= 0 or atom_z <= 0 or hidden_dim <= 0 or pair_dim <= 0:
+            raise ValueError("atom_s, atom_z, hidden_dim and pair_dim must be positive")
+        if heads <= 0 or hidden_dim % heads != 0:
+            raise ValueError("hidden_dim must be divisible by positive heads")
+        if depth < 1 or int(hidden_dim * mlp_ratio) < 1:
             raise ValueError("depth and MLP hidden width must be positive")
         if output_dim is not None and output_dim <= 0:
             raise ValueError("output_dim must be positive or None")
         self.atom_s = atom_s
         self.atom_z = atom_z
-        self.output_dim = atom_s if output_dim is None else output_dim
+        self.hidden_dim = hidden_dim
+        self.pair_dim = pair_dim
+        self.output_dim = hidden_dim if output_dim is None else output_dim
         self.activation_checkpointing = activation_checkpointing
         self.features = AtomConditionFeatures(atom_s, atom_z)
+        self.single_projection = (
+            nn.Identity() if atom_s == hidden_dim else nn.Linear(atom_s, hidden_dim, bias=False)
+        )
+        self.pair_projection = (
+            nn.Identity() if atom_z == pair_dim else nn.Linear(atom_z, pair_dim, bias=False)
+        )
         self.blocks = nn.ModuleList(
             [
                 StaticConditionBlock(
-                    dim=atom_s,
-                    dim_pair=atom_z,
+                    dim=hidden_dim,
+                    dim_pair=pair_dim,
                     heads=heads,
                     mlp_ratio=mlp_ratio,
                     dropout=dropout,
@@ -113,15 +128,16 @@ class ConditionEncoder(nn.Module):
         )
         self.output_projection = (
             nn.Identity()
-            if self.output_dim == atom_s
-            else nn.Linear(atom_s, self.output_dim, bias=False)
+            if self.output_dim == hidden_dim
+            else nn.Linear(hidden_dim, self.output_dim, bias=False)
         )
 
     def encode(self, c: Tensor, p: Tensor, atom_mask: Tensor, block_index: Tensor) -> Tensor:
-        """Apply static blocks to c/p and return (B,N,output_dim) conditions."""
+        """Project raw c/p before static blocks; return (B,N,output_dim) conditions."""
         atom_mask = atom_mask.bool()
         allowed_pairs = block_attention_mask(atom_mask, block_index)
-        x = c.masked_fill(~atom_mask.unsqueeze(-1), 0)
+        x = self.single_projection(c.masked_fill(~atom_mask.unsqueeze(-1), 0))
+        p = self.pair_projection(p)
         for block in self.blocks:
             if self.activation_checkpointing and self.training and torch.is_grad_enabled():
                 x = checkpoint(block, x, p, atom_mask, allowed_pairs, use_reentrant=False)

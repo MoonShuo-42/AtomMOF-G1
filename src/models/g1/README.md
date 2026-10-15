@@ -243,7 +243,7 @@ with initialize_config_dir(config_dir=str(Path("configs").resolve()), version_ba
     cfg = compose(
         config_name="g1/default",
         overrides=[
-            "g1.condition_encoder.depth=3",
+            "g1.condition_encoder.depth=2",
             "g1.router.max_groups=32",
             "g1.readback.value_hidden_dim=128",
         ],
@@ -375,3 +375,63 @@ predict_args.g1_enabled=true
 
 本地环境为 PyTorch 2.6.0+cpu；测试仅隔离未使用的可选 MLIP 后端，主干、六模块、采样器和 Lightning 均为真实实现。
 没有运行服务器 8 GPU、MLIP steering、torch.compile 性能或完整数据集训练；尚无 G1 生成效果指标。
+
+## 9. 条件编码器精简（2026-10-16）
+
+本次仅改变 G1 的 ConditionEncoder。原始 AtomMOF 编码器/主干/解码器、其他五个 G1 子模块、
+四个桥的插入位置与独立参数策略保持不变。
+
+保留原始特征构造 c(B,N,256)、p(B,N,N,128)，分别经过无 bias 线性层降至 128、64 维，
+再进入 **1 层静态 Transformer（4 头，FFN 比例 4）**。输出 c_cond(B,N,128)，
+默认输出投影为 Identity。同构件掩码、无时间调制、几何输入和门控逻辑保持原样。
+
+| 模块 / 范围 | 修改前参数量 | 修改后参数量 |
+| --- | ---: | ---: |
+| ConditionEncoder / 每桥 | 2,715,776 | 374,016 |
+| 几何计算 / 每桥 | 0 | 0 |
+| Router / 每桥 | 60,128 | 60,128 |
+| U/Z 聚合 / 每桥 | 0 | 0 |
+| 组交互 / 每桥 | 231,876 | 231,876 |
+| 原子读回 / 每桥 | 151,716 | 151,716 |
+| G1 / 每桥 | 3,159,496 | 817,736 |
+| G1 / 四桥 | 12,637,984 | 3,270,944 |
+| 原始 AtomMOF small | 38,376,320 | 38,376,320 |
+| **AtomMOF small + 四桥 G1** | **51,014,304** | **41,647,264** |
+
+以上 small 为 `model.token_s=256`、`model.token_z=128`、24 层主干与其余默认参数；
+仓库默认的 512/256 token 宽度不属于此表。
+
+配置 `configs/g1/condition_encoder/static.yaml` 已更新，使用正常配置启用 G1 即采用新结构。
+若要在完整训练命令中显式记录这三个设置，可添加：
+
+~~~bash
+model.flow_model_args.g1.module.condition_encoder.hidden_dim=128 \
+model.flow_model_args.g1.module.condition_encoder.pair_dim=64 \
+model.flow_model_args.g1.module.condition_encoder.depth=1
+~~~
+
+`atom_s` / `atom_z` 控制原始特征构造，`hidden_dim` / `pair_dim` 控制降维后 Transformer，
+`output_dim` 控制输出接口；完整说明见 [条件编码器文档](conditioning/README.md)。
+
+**Checkpoint：**旧 G1 三层结构的 checkpoint 不能直接恢复到本版精简结构，
+包括此前 10 步的 G1 smoke checkpoint；本版正式训练应新建运行目录。
+baseline checkpoint 的加载、初始化 G1 和关闭 G1 时的行为保持不变。
+本版 checkpoint 保存完整宽度及层数配置，仍支持严格加载与恢复。
+
+**显存：**原始 p 的 128 维构造仍存在，其他五个 G1 模块的激活也不变。
+本表是参数量，不能据此保证原先发生 OOM 的 batch 配置可用；新结构的峰值显存需在服务器实测。
+
+### 9.1 本版验证
+
+本地 PyTorch 2.6.0+cpu：针对条件编码器、G1Module 和主干接入的 67 项测试通过；
+全仓库运行结果为 **266 passed, 2 warnings in 54.99s**。
+两条警告仍来自微型 Lightning 测试的无验证集和少量 dataloader workers。
+
+覆盖原始 c/p 数值一致、降维后的真实层输入/输出、投影梯度、padding 与构件隔离、
+四桥调用、关闭 G1 的原版路径、新结构严格 checkpoint 恢复、baseline 权重初始化 G1、
+真实 Flow 损失/采样，以及主干、条件编码器、桥的激活重算。
+两进程 Gloo DDP 使用 find_unused_parameters=False 连续优化两步通过；
+实测 small 参数量与本节表格一致。Black、isort 和 git diff --check 检查通过。
+
+此前三层 G1 已在服务器完成 8 GPU / 10 步 smoke 测试；本次精简结构尚未在服务器运行。
+CPU/DDP 回归通过不代表已验证 8 GPU 的峰值显存、训练收敛或生成指标。

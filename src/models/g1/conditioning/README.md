@@ -19,9 +19,33 @@ c_cond = encoder(feats)       # (B, N, 128)，padding 行为 0
 | `block_index` | B,N | 仅用于同构件关系，不编码编号大小 |
 | `bond_types` | B,N,N | 原版稠密键类型矩阵 |
 
-参数默认保持 small 编码器的单特征 256 维、pair 128 维、3 层、4 头，
-末端投影到 G1 条件接口的 128 维。`output_dim=None` 可取消末端投影。
-独立 Hydra 配置位于 `configs/g1/condition_encoder/static.yaml`。
+默认结构（2026-10-16 更新）：
+
+~~~text
+原始条件特征构造
+c(B,N,256)   ── Linear(256,128,bias=False) ── c'(B,N,128) ─┐
+p(B,N,N,128) ── Linear(128,64,bias=False)  ── p'(B,N,N,64) ─┤
+                                                       ↓
+                         1 层静态 Transformer（4 头，FFN 比例 4）
+                                                       ↓
+                                             c_cond(B,N,128)
+~~~
+
+先降维，再进入 Transformer。原始 c/p 构造公式、同构件 attention 掩码和无时间调制的
+残差保持一致，默认不再需要末端降维。后续 Router 等模块的 128 维条件接口不变。
+
+独立 Hydra 配置位于 `configs/g1/condition_encoder/static.yaml`：
+
+| 配置 | 默认值 | 含义 |
+| --- | --- | --- |
+| `atom_s`, `atom_z` | 256, 128 | 原始 c/p 构造宽度 |
+| `hidden_dim`, `pair_dim` | 128, 64 | Transformer 的 single/pair 宽度 |
+| `depth`, `heads` | 1, 4 | Transformer 层数与头数 |
+| `output_dim` | 128 | 输出接口宽度 |
+
+这些宽度独立配置；只有 `hidden_dim` 必须能被 `heads` 整除。
+`output_dim=None` 表示输出 `hidden_dim` 维；输出宽度相同时使用 Identity。
+入口宽度和内部宽度相同也使用 Identity，便于后续切换压缩方案。
 
 ## 模块划分
 
@@ -31,7 +55,8 @@ c_cond = encoder(feats)       # (B, N, 128)，padding 行为 0
   特征 sigmoid gate 和计算后端，仅增加严格同构件 query/key 掩码。
 - `encoder.py / StaticConditionBlock`：移除时间嵌入、adaLN shift/scale 与时间 gate，
   保留原 LayerNorm 设置及 attention/MLP 的普通残差。
-- `encoder.py / ConditionEncoder`：组织特征、固定 p 的 Transformer 层和输出投影。
+- `encoder.py / ConditionEncoder`：组织特征、独立的 `single_projection` /
+  `pair_projection`、固定压缩后 p 的 Transformer 层，以及可选输出投影。
 
 同构件的非成键原子也能直接交互。有效原子永远不能读取 padding；padding
 query 暂时只允许读取自己以避免全屏蔽 softmax，随后输出清零。全 padding 样本
@@ -40,7 +65,10 @@ query 暂时只允许读取自己以避免全屏蔽 softmax，随后输出清零
 ## 与原版一致的范围
 
 仅复用计算方式，参数默认重新初始化，不自动加载官方权重。
-原始生成主干和现有 checkpoint 键保持不变。
+原始 AtomMOF 主干及 baseline checkpoint 的键和形状保持不变。
+旧 G1 三层条件编码器与本版的参数键、形状不同，不能直接用其 checkpoint 恢复本版训练。
+新 G1 checkpoint 会保存 `hidden_dim` / `pair_dim` / `depth`，可按本版结构恢复；
+从 baseline 权重初始化 G1 的入口保持不变。
 `ref_chirality` 仍未显式使用；不新增 RBF、最短路径或构件编号 embedding。
 保留原始 `ref_pos` 和参考位移，因此不宣称参考构象旋转不变。
 原版键 embedding 和 single-to-pair 项不全部乘同构件 mask；禁止跨构件读取
@@ -61,14 +89,30 @@ encoder.features.load_state_dict(
 c_cond = encoder.encode(c, p, atom_pad_mask, block_index)
 ```
 
-这个入口不调用 `encoder.features`；若始终使用外部 c/p，应相应管理未使用的
+这个入口接收原始宽度的 c/p，并在内部执行两项入口投影；不调用 `encoder.features`。
+若始终使用外部 c/p，应相应管理未使用的
 特征模块参数。重复候选可以在编码后 `repeat_interleave`，无需重复构造条件。
 同一固定条件的采样过程可缓存输出；训练时保持梯度，不能跨优化器更新复用旧缓存。
 
 ## 计算与验证
 
 当前仍使用 dense pair 张量和 attention；加 mask 不会自动获得按构件拆分的
-计算节省。后续可以独立替换 attention 后端或特征构造。
+计算节省。p 会先按原公式构造为 128 维，再压缩到 64 维；原始 p 及其构造过程中的
+激活仍有显存开销。因此参数下降比例不能当作峰值显存下降比例，服务器显存需实测。
+后续可以独立替换 attention 后端或特征构造。
+
+单个默认 ConditionEncoder 参数量：
+
+| 部分 | 参数量 |
+| --- | ---: |
+| 原始 c/p 特征构造 | 118,656 |
+| c 入口投影 256→128 | 32,768 |
+| p 入口投影 128→64 | 8,192 |
+| 1 层 Transformer（attention + FFN） | 214,400 |
+| 输出 Identity | 0 |
+| **合计** | **374,016** |
+
+之前每个编码器为 2,715,776 参数。本次只修改 G1 条件编码器，四桥参数仍独立。
 
 ```bash
 python -m pytest tests/test_condition_encoder.py -q
@@ -76,9 +120,10 @@ python -m pytest tests/test_condition_encoder.py -q
 
 测试覆盖原始 c/p 数值对齐、取消时间调制后的残差、跨构件隔离与梯度、
 非成键远端交互、padding/单原子、原子置换与构件重编号、不读取目标或噪声、
-manual/PyTorch 后端一致性和 activation checkpointing。
+manual/PyTorch 后端一致性、入口降维的形状和梯度、可配置宽度、参数预算和 activation checkpointing。
 
 六模块统一封装与调用方式见 [G1Module](../README.md)。
 
 
-当前主干接入、开关、checkpoint 兼容性与 263 项全仓库测试记录见 [G1 总文档第 8 节](../README.md#8-atommof-主干接入与开关)。
+主干接入与开关见 [G1 总文档第 8 节](../README.md#8-atommof-主干接入与开关)，
+本次精简及验证记录见 [第 9 节](../README.md#9-条件编码器精简2026-10-16)。
