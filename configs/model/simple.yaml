@@ -1,3 +1,7 @@
+defaults:
+  - /g1@flow_model_args.g1: bridges
+  - _self_
+
 _target_: src.models.simplemof_module.SimpleMOFModule
 
 atom_s: 256

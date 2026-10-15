@@ -37,6 +37,9 @@ def set_dir_name(cfg: DictConfig) -> str:
             f"num_particles-{steering_args.num_particles}",
             f"energy_fn-{steering_args.energy_fn}",
         ])
+    # Keep legacy names by default; separate explicit G1 ablations from normal inference.
+    if cfg.predict_args.get("g1_enabled") is not None:
+        name_parts.append(f"g1-{cfg.predict_args.g1_enabled}")
     base_name = "_".join(name_parts)
     return base_name
 
@@ -77,6 +80,8 @@ def predict(cfg: DictConfig):
     log.info(f"Loading model from checkpoint <{ckpt_path}>")
     model = SimpleMOFModule.load_from_checkpoint(str(ckpt_path), predict_args=cfg.predict_args)
     model.eval()
+    if cfg.predict_args.get("g1_enabled") is not None:
+        model.structure_module.flow_model.set_g1_enabled(cfg.predict_args.g1_enabled)
 
     # Create output directory
     base_name = set_dir_name(cfg)

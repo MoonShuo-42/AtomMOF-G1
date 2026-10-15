@@ -208,7 +208,7 @@ class DiT(nn.Module):
             for _ in range(depth)
         ])
 
-    def forward(self, x, t, mask, z=None):
+    def forward(self, x, t, mask, z=None, *, after_layer=None):
         """
         Args:
             x (torch.Tensor): Input tensor of shape (B, N, D)
@@ -218,9 +218,11 @@ class DiT(nn.Module):
         # Embed t
         time_embed = self.t_embedder(t) # (B, D)
 
-        for layer in self.layers:
+        for layer_index, layer in enumerate(self.layers, start=1):
             if self.activation_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(layer, x, time_embed, mask, z, use_reentrant=False)
             else:
                 x = layer(x, time_embed, mask, z)
+            if after_layer is not None:
+                x = after_layer(layer_index, x)
         return x

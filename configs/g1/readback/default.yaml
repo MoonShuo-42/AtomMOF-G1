@@ -1,0 +1,9 @@
+# Standalone readback; share the Router's P, group_mask and pool_eps.
+_target_: src.models.g1.readback.AtomReadback
+h_dim: 256
+group_dim: 128
+heads: 4
+head_dim: 32
+bias_hidden_dim: 32
+value_hidden_dim: 128
+pool_eps: 1.0e-8

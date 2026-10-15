@@ -1,0 +1,12 @@
+# @package g1
+# Compose the six config groups inside configs/g1; use Hydra compose, not OmegaConf.load alone.
+defaults:
+  - condition_encoder@condition_encoder: static
+  - geometry@geometry: periodic
+  - router@router: adaptive
+  - aggregation@aggregation: geometry
+  - group_attention@group_interaction: default
+  - readback@readback: default
+  - _self_
+
+_target_: src.models.g1.G1Module

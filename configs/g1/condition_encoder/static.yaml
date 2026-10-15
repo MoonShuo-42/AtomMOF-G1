@@ -1,0 +1,11 @@
+# Standalone module configuration; not wired into train.py or the Flow model.
+_target_: src.models.g1.conditioning.ConditionEncoder
+atom_s: 256
+atom_z: 128
+output_dim: 128
+depth: 3
+heads: 4
+mlp_ratio: 4.0
+dropout: 0.0
+attention_impl: pytorch
+activation_checkpointing: false

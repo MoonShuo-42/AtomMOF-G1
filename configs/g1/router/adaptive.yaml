@@ -1,0 +1,11 @@
+# Per-sample active templates AND soft groups: K = min(max_groups, N_valid).
+_target_: src.models.g1.routing.SoftRouter
+h_dim: 256
+c_dim: 128
+rho_dim: 11
+time_dim: 32
+hidden_dim: 128
+key_dim: 32
+max_groups: 32
+time_frequency_divisor: 4.0
+pool_eps: 1.0e-8

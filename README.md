@@ -477,3 +477,19 @@ If you find our work useful, please consider citing the following:
   year={2026}
 }
 ```
+
+
+## Optional G1 bridges
+
+The G1 extension is **disabled by default**. Enable it in an existing training command with
+`model.flow_model_args.g1.enabled=true`. Four independent bridges run after trunk DiT layers
+6, 12, 18, and 24; backbone dimensions remain controlled by the existing model configuration.
+The configuration is in `configs/g1/bridges.yaml`.
+
+Prediction restores the architecture from the checkpoint. `predict_args.g1_enabled=null`
+(the default) preserves that choice; `false` bypasses trained G1 bridges for ablation, and
+`true` requires a checkpoint containing G1 weights. A baseline checkpoint is not silently
+augmented with random bridges for prediction.
+
+See [G1 integration and switches](src/models/g1/README.md#8-atommof-主干接入与开关)
+for configuration, checkpoint initialization/resume, context reuse, and validation details.

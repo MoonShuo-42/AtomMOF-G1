@@ -1,0 +1,2 @@
+# Parameter-free U/Z aggregation; consumes geometry.E and routes.Pbar (B,K,N).
+_target_: src.models.g1.aggregation.GeometryAggregator

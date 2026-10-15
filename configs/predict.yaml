@@ -20,6 +20,8 @@ seed: 42
 
 # Sampling parameters
 predict_args:
+  # null: checkpoint architecture; false: bypass G1; true: require trained G1 weights.
+  g1_enabled: null
   measure_time: false
   num_samples: 1
   sampling_steps: 10

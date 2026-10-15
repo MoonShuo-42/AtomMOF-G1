@@ -1,0 +1,8 @@
+# One standalone group interaction, consuming the same routing for S and Z.
+_target_: src.models.g1.group_attention.GroupInteraction
+h_dim: 256
+group_dim: 128
+heads: 4
+bias_hidden_dim: 32
+ffn_ratio: 4.0
+norm_eps: 1.0e-6

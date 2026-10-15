@@ -1,0 +1,21 @@
+# Passed as plain config data, so disabled bridges never instantiate learned modules.
+# Used under model.flow_model_args.g1 by configs/model/simple.yaml.
+defaults:
+  - default@module
+  - _self_
+
+_target_: builtins.dict
+_recursive_: false
+
+enabled: false
+insert_after: [6, 12, 18, 24]
+activation_checkpointing: false
+share_geometry: true
+
+module:
+  router:
+    h_dim: ${model.token_s}
+  group_interaction:
+    h_dim: ${model.token_s}
+  readback:
+    h_dim: ${model.token_s}

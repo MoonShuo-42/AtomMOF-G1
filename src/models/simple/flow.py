@@ -28,6 +28,7 @@ class FlowModule(nn.Module):
         atom_decoder_heads,
         attention_impl,
         activation_checkpointing=False, 
+        g1=None,
         # **kwargs
     ):
         super().__init__()
@@ -72,6 +73,33 @@ class FlowModule(nn.Module):
             activation_checkpointing=activation_checkpointing
         )
 
+        # Construct last: baseline initialization and RNG use stay unchanged when disabled.
+        self.g1_bridges = None
+        g1_args = dict(g1 or {})
+        self._g1_enabled = g1_args.pop("enabled", False)
+        if type(self._g1_enabled) is not bool:
+            raise TypeError("g1.enabled must be bool")
+        if self._g1_enabled:
+            from src.models.g1.bridges import G1Bridges
+
+            self.g1_bridges = G1Bridges(
+                h_dim=token_s, depth=token_transformer_depth, **g1_args
+            )
+
+    @property
+    def g1_enabled(self):
+        return self._g1_enabled
+
+    def set_g1_enabled(self, enabled: bool):
+        """Evaluation ablation only; training architecture is selected at construction."""
+        if type(enabled) is not bool:
+            raise TypeError("G1 switch must be bool")
+        if enabled and self.g1_bridges is None:
+            raise ValueError("This model/checkpoint has no G1 weights; train with G1 enabled first")
+        if self.training and enabled != self._g1_enabled:
+            raise RuntimeError("Change G1 through the construction config for training/DDP")
+        self._g1_enabled = enabled
+
     def _atom_to_token_single(self, atom_single, atom_to_token, multiplicity=1):
         atom_feats = self.atom_to_token_trans(atom_single)
 
@@ -111,13 +139,24 @@ class FlowModule(nn.Module):
         token_single = self.atom_to_token_trans(atom_single)
         token_pair = self.atom_to_token_trans_pair(atom_pair)
 
+        # Context is local to this call: no stale geometry across sampling steps.
+        trunk_kwargs = {}
+        if self._g1_enabled:
+            contexts = self.g1_bridges.prepare(feats, r_noisy, l_noisy, multiplicity)
+
+            def after_layer(layer_index, hidden):
+                return self.g1_bridges(layer_index, hidden, times, contexts)
+
+            trunk_kwargs["after_layer"] = after_layer
+
         # Trunk
         token_single = self.token_transformer(
             x=token_single, 
             z=token_pair,
             t=times, 
             feats=feats, 
-            multiplicity=multiplicity
+            multiplicity=multiplicity,
+            **trunk_kwargs,
         )
 
         # Token -> Atom (# TODO: Add broadcasting logic)

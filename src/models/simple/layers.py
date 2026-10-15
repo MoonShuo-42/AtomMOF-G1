@@ -259,7 +259,8 @@ class TokenTransformer(Module):
         z,
         t,
         feats,
-        multiplicity=1
+        multiplicity=1,
+        after_layer=None,
     ):
         token_mask = feats["atom_pad_mask"] # TODO: Rename to token_pad_mask
         token_mask = token_mask.repeat_interleave(multiplicity, 0)
@@ -275,6 +276,9 @@ class TokenTransformer(Module):
 
         s = self.s_mlp(s_init)
         z = self.z_mlp(z_init)
-        x = self.token_transformer(s, t, token_mask, z)
+        if after_layer is None:
+            x = self.token_transformer(s, t, token_mask, z)
+        else:
+            x = self.token_transformer(s, t, token_mask, z, after_layer=after_layer)
 
         return x
