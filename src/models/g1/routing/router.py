@@ -6,7 +6,7 @@ import torch
 from torch import Tensor, nn
 
 from .features import RouterQueryEncoder
-from .groups import AtomCountGroups
+from .groups import AtomCountGroups, GroupLayout
 from .normalization import RoutingOutput, normalize_assignments
 from .templates import TemplateBank
 from .time import FourierTimeEmbedding
@@ -52,6 +52,8 @@ class SoftRouter(nn.Module):
         t: Tensor,
         geometry_ok: Tensor,
         atom_mask: Tensor,
+        *,
+        group_layout: GroupLayout | None = None,
     ) -> RoutingOutput:
         """Return P/Pbar (B,K_batch,N), mass/group_mask, and per-sample group_counts."""
         if h.ndim != 3 or atom_mask.shape != h.shape[:2]:
@@ -63,7 +65,9 @@ class SoftRouter(nn.Module):
         # All-padding samples must remain safe even if their unused t is nonfinite.
         safe_t = torch.where(atom_mask.bool().any(-1), t, 0)
         encoded_time = self.time_embedding(safe_t)
-        return self.route_with_time_embedding(h, c, rho, encoded_time, geometry_ok, atom_mask)
+        return self.route_with_time_embedding(
+            h, c, rho, encoded_time, geometry_ok, atom_mask, group_layout=group_layout
+        )
 
     def route_with_time_embedding(
         self,
@@ -73,9 +77,33 @@ class SoftRouter(nn.Module):
         time_embedding: Tensor,
         geometry_ok: Tensor,
         atom_mask: Tensor,
+        *,
+        group_layout: GroupLayout | None = None,
     ) -> RoutingOutput:
-        """Use a precomputed (B,time_dim) embedding without changing the routing rule."""
+        """Use precomputed time and optionally a trusted layout from AtomCountGroups.
+
+        A supplied layout is valid only for this atom mask and max_groups policy.
+        P/Pbar and all H-dependent values are always recomputed.
+        """
         keys = self.query_encoder(h, c, rho, time_embedding, geometry_ok, atom_mask)
-        group_mask = self.group_selector(atom_mask)
+        if group_layout is None:
+            group_layout = self.group_selector.prepare(atom_mask)
+        group_mask = group_layout.mask
+        if (
+            group_mask.ndim != 2
+            or group_mask.shape[0] != atom_mask.shape[0]
+            or not 1 <= group_mask.shape[1] <= self.max_groups
+            or group_mask.device != atom_mask.device
+            or group_mask.dtype != torch.bool
+            or group_layout.counts.shape != (atom_mask.shape[0],)
+            or group_layout.counts.device != atom_mask.device
+        ):
+            raise ValueError("group_layout must match atom_mask and this router's capacity")
         logits = self.template_bank(keys, num_active=group_mask.shape[1])
-        return normalize_assignments(logits, atom_mask, self.pool_eps, group_mask=group_mask)
+        return normalize_assignments(
+            logits,
+            atom_mask,
+            self.pool_eps,
+            group_mask=group_mask,
+            trusted_layout=True,
+        )

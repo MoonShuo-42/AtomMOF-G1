@@ -705,3 +705,42 @@ def test_stage1_experiment_aligns_small_batch_and_disables_all_recomputation():
     assert not default.model.flow_model_args.g1.activation_checkpointing
     assert not default.model.flow_model_args.g1.module.condition_encoder.activation_checkpointing
     assert not default.model.flow_model_args.g1.module.geometry.activation_checkpointing
+
+
+def test_four_bridges_prepare_group_layout_once_and_refresh_for_next_batch(monkeypatch):
+    from src.models.g1.routing.groups import AtomCountGroups
+
+    model = FlowModule(**flow_args(), g1=bridge_config())
+    perturb(model)
+    data = inputs()
+    calls = []
+    original = AtomCountGroups.prepare
+
+    def prepare(selector, mask):
+        result = original(selector, mask)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(AtomCountGroups, "prepare", prepare)
+    output = model(**data)
+    loss(output).backward()
+    assert len(calls) == 1
+    schedule = model.g1_bridges
+    contexts = schedule.prepare(data["feats"], data["r_noisy"], data["l_noisy"])
+    assert len(calls) == 2
+    assert len({id(c.group_layout) for c in contexts.values()}) == 1
+    assert contexts["6"].group_layout is not calls[0]
+    assert contexts["6"].group_layout.counts.tolist() == [3, 2]
+    for i, context in contexts.items():
+        assert context.group_layout.mask.shape == (2, 3)
+
+
+def test_optimized_defaults_keep_small_architecture_and_disable_recomputation():
+    root = Path(__file__).resolve().parents[1]
+    with initialize_config_dir(version_base="1.3", config_dir=str(root / "configs")):
+        cfg = compose(config_name="train", overrides=["experiment=g1_small_stage1"])
+    module = cfg.model.flow_model_args.g1.module
+    assert module.condition_encoder.pair_mode == "local"
+    assert module.geometry.pair_chunk_size == 32768
+    assert module.geometry.image_chunk_size == 524288
+    assert not module.geometry.activation_checkpointing

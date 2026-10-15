@@ -41,6 +41,8 @@ def normalize_assignments(
     atom_mask: Tensor,
     pool_eps: float = 1e-8,
     group_mask: Tensor | None = None,
+    *,
+    trusted_layout: bool = False,
 ) -> RoutingOutput:
     """Softmax over active groups, then Pbar_ik = P_ik / (sum_i P_ik + eps).
 
@@ -48,6 +50,8 @@ def normalize_assignments(
     slots are enabled for nonempty samples. SoftRouter supplies its own mask.
     Padded atoms/groups and empty samples have zero weights and finite gradients.
     Pbar's sum over atoms is mass/(mass+eps), not necessarily exactly one.
+    trusted_layout is internal: only use with AtomCountGroups' already-valid
+    boolean mask, for exactly the same atom ordering and max_groups policy.
     """
     if not math.isfinite(pool_eps) or pool_eps <= 0:
         raise ValueError("pool_eps must be finite and positive")
@@ -56,13 +60,16 @@ def normalize_assignments(
     if not logits.is_floating_point() or logits.device != atom_mask.device:
         raise ValueError("floating logits and atom_mask must share a device")
     shape = (logits.shape[0], logits.shape[2])
-    nonempty = atom_mask.bool().any(-1)
     if group_mask is None:
         group_mask = torch.ones(shape, dtype=torch.bool, device=logits.device)
     elif group_mask.shape != shape or group_mask.device != logits.device:
         raise ValueError("group_mask must be (B,K) on logits' device")
-    group_mask = group_mask.bool() & nonempty[:, None]
-    if (nonempty & ~group_mask.any(-1)).any():
+    if not trusted_layout:
+        nonempty = atom_mask.bool().any(-1)
+        group_mask = group_mask.bool() & nonempty[:, None]
+    # AtomCountGroups has already guaranteed a valid layout; avoid a CUDA scalar
+    # read in every bridge. Public/custom masks retain the original validation.
+    if not trusted_layout and (nonempty & ~group_mask.any(-1)).any():
         raise ValueError("each sample with valid atoms must have at least one active group")
     dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
     with torch.autocast(device_type=logits.device.type, enabled=False):

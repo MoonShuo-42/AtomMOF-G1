@@ -1,7 +1,16 @@
 """Choose active templates/groups from each sample's valid atom count."""
 
+from typing import NamedTuple
+
 import torch
 from torch import Tensor, nn
+
+
+class GroupLayout(NamedTuple):
+    """Per-forward routing layout, independent of H, t and learned templates."""
+
+    mask: Tensor  # (B,K_batch), bool
+    counts: Tensor  # (B,), active groups; zero for empty samples
 
 
 class AtomCountGroups(nn.Module):
@@ -23,8 +32,13 @@ class AtomCountGroups(nn.Module):
         Reading the maximum count synchronizes with the host on CUDA. No learned
         parameters are created, resized or reset here.
         """
+        return self.prepare(atom_mask).mask
+
+    def prepare(self, atom_mask: Tensor) -> GroupLayout:
+        """Compute once and reuse only while the atom mask and max_groups are unchanged."""
         if atom_mask.ndim != 2 or min(atom_mask.shape) < 1:
             raise ValueError("atom_mask must be nonempty (B,N)")
         counts = atom_mask.bool().sum(-1).clamp(max=self.max_groups)
         batch_groups = max(1, int(counts.max().item()))
-        return torch.arange(batch_groups, device=atom_mask.device)[None] < counts[:, None]
+        mask = torch.arange(batch_groups, device=atom_mask.device)[None] < counts[:, None]
+        return GroupLayout(mask, counts)

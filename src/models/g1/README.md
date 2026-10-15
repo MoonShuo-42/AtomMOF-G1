@@ -474,7 +474,7 @@ G1Bridges 的 Python 构造器对缺失的该字段按 false 处理；新 Hydra 
 - `geometry/planning.py` 单独负责离散规划：批量晶胞求逆、一次性计算全批原子对的搜索边界。
 - 先检查每个样本的完整覆盖，再统一筛选有效原子对。任一有效原子对超限，仍禁用该样本全部几何。
 - 删除逐样本 Python 循环和逐样本 bool(GPU tensor) 分支；只在批级压紧索引和读取最大候选数。
-- 分块使用已经计算好的边界，不在每块前重复搜索。默认每块最多 4096 个有效原子对。
+- 分块使用已经计算好的边界，不在每块前重复搜索。当时默认每块最多 4096 个有效原子对；后续分块策略见第 11 节。
 - 镜像存储宽度按本批有效候选数的最大值分配。例如实际最多 8 个，就只展开 8 个槽；
   不再固定填满 125 个槽，也不会截断任何被接受的候选。
 - 周期位移和矩仍在张量上计算，输入需要梯度时保留坐标/晶胞梯度。
@@ -548,3 +548,101 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -u src/train.py \
 原始 AtomMOF 源码未修改；关闭 G1 的初始化/状态/前向/梯度回归、训练与预测配置、
 严格 checkpoint 加载、实际 Flow 损失和采样均通过。格式与 git diff --check 检查通过。
 本版本尚未在服务器进行八卡性能、峰值显存或收敛/生成效果测量。
+
+## 11. 四项执行优化（2026-10-16）
+
+本节保持四桥、分组规则、参数共享、精度和模型参数不变。
+G1 small 总参数仍为 **40,525,216**。原始 AtomMOF 源码没有改动。
+
+### 11.1 四桥复用分组布局
+
+routing/groups.py 的 GroupLayout 保存有效组数和 group mask，由同一原子 mask
+和 max_groups 生成；G1Bridges.prepare 按分组容量只计算一次，写入每个 G1Context。
+路由继续按每处 H/t 重新计算 P/Pbar，不共享这些学习结果。
+避免每个桥分别读取 counts.max().item()；内部已知合法的 mask 不再重复触发
+normalize_assignments 的 GPU 布尔检查。公开自定义 mask 入口保留检查。
+布局只存在于本次前向上下文，不跨 batch 缓存；空样本组数仍为零。
+
+### 11.2 紧凑的条件原子对
+
+新增 condition_encoder.pair_mode=local（默认），dense 为原路径的对照/回退开关。
+只为同构件有效原子对计算原始 p、三层 pair MLP、128→64 投影以及每头 bias。
+保留 c 256→128、单层 Transformer 和原有全部参数。只有每头 bias 被散射回稠密形状。
+被 attention 永久屏蔽的跨构件原子对不再执行这些计算。
+完整 dense 特征 API 和外部 encode API 保留，原 attention 后端与公式保留。
+
+此优化不等于整层采用稀疏 attention：QK/softmax 仍为 N×N；
+紧凑 pair 的工作量为各构件原子数平方之和，压紧索引仍有一次批级同步。
+全 padding/单原子、mask、非连续构件编号和原子顺序语义保持一致。
+
+### 11.3 按镜像数设置几何块大小
+
+默认 pair_chunk_size=32768、image_chunk_size=524288。
+实际块大小由两者及本批已知 image_slots 共同决定，镜像少时合并更多原子对，
+镜像多时控制单块临时计算规模；不增加剩余显存查询或动态标量同步。
+保持所有候选、原子对、整样本超限回退和坐标/晶胞梯度，不改变 cutoff/max_images。
+固定旧块大小的对照可设置 pair_chunk_size=4096。
+这只是临时工作量预算，不能保证完整训练峰值显存。
+
+### 11.4 共享组内几何描述
+
+geometry/groups.py 在每个桥内一次提取 Z_kk、chi(Z_kk) 和对称 Q_kk，
+随后由组交互与原子读回引用同一可微对象。不同桥的 Z 不同，不能共用该对象。
+U、Z 的第二矩阵各自只展开一次，再供 scalarize_geometry 与交叉收缩复用。
+保留完整对称矩阵收缩，保留非对角项的双份贡献，不引入近似。
+独立 GroupInteraction/AtomReadback 入口仍可自行准备描述；特殊混合 dtype 会按需重算。
+共享图会改变浮点梯度累加顺序，比较采用数值容差，而非要求逐位相等。
+
+### 11.5 使用与计时
+
+新训练读取更新后的 YAML，上一版完整训练命令可以继续使用。若想明确固定执行选项，
+可在原命令中增加（这些键已存在，不加前缀 +）：
+
+~~~bash
+model.flow_model_args.g1.module.condition_encoder.pair_mode=local
+model.flow_model_args.g1.module.geometry.pair_chunk_size=32768
+model.flow_model_args.g1.module.geometry.image_chunk_size=524288
+~~~
+
+仅执行方式改变，40a5290 共享版本的模型参数键/形状和优化器参数顺序保持兼容。
+如果按旧 checkpoint 保存的配置构造模型，其显式 pair_chunk_size=4096 仍会生效；
+新建训练使用新 YAML。已运行的 Python 进程不会因 git pull 自动切换代码。
+
+新增 scripts/benchmark_g1_optimizations.py，单独比较条件 pair、几何分块、
+组内描述复用和四桥布局复用。与正式训练分开运行，例如：
+
+~~~bash
+CUDA_VISIBLE_DEVICES=0 python scripts/benchmark_g1_optimizations.py \
+  --device cuda --batch-size 32 --atoms 200 --block-size 20 \
+  --warmup 5 --iterations 20 --backward \
+  --output logs/g1_component_benchmark.json
+~~~
+
+脚本先核对输出，再预热并同步计时，报告单卡组件时间；不能直接换算成八卡 epoch 时间。
+--backward 对可微组件同时测反向；几何的输入梯度测试比当前训练中无输入梯度的情形更重。
+整体训练速度仍需相同数据、batch、精度、预热和验证口径的服务器实测。
+
+### 11.6 本地验证
+
+全仓库回归：**295 passed, 2 warnings in 78.64s**。
+两条警告仍为微型 Lightning 测试的无验证集和少量 dataloader workers。
+覆盖非零权重下 local/dense 条件输出及全部参数/参考坐标梯度、两种 attention 后端、
+全 padding、激活重算、四桥布局复用与下一批更新、缓存/独立几何描述的梯度、
+候选不丢失的分块/镜像预算、baseline 关闭路径、训练/采样、checkpoint 与参数预算。
+两进程 Gloo DDP 使用 find_unused_parameters=False，重算开/关均连续优化两步通过。
+GPU 显存、CUDA 性能和完整八卡 epoch 耗时尚需服务器验证。
+
+CPU 组件微基准（PyTorch 2.6.0+cpu，单线程，FP32，B=4、N=64、
+每构件 8 原子；含可微组件反向，预热 5 次、20 次中位数）：
+
+| 对照项 | 对照时间 | 优化时间 |
+| --- | ---: | ---: |
+| 条件编码：dense / local | 129.09 ms | 26.14 ms |
+| 几何：固定 4096 / 双限额分块 | 22.99 ms | 19.70 ms |
+| 组内描述：独立准备两次 / 共用一次 | 19.41 ms | 18.77 ms |
+| 四桥布局：独立准备四次 / 共用一次 | 0.191 ms | 0.055 ms |
+
+这些是合成组件对照，不是完整旧版/新版模型或 CUDA/DDP 性能对照。
+组内描述项目的首次 5 次短测为 20.26/22.19 ms，重复测量仅有小幅收益，
+说明这一项的 CPU 增益较小且受计时波动影响，不能承诺 GPU 提速。
+本轮仅消除明确的重复工作；优化前后真实 epoch 对照仍以服务器结果为准。

@@ -160,7 +160,7 @@ E 中 v、Q 在共同旋转下分别按向量、二阶张量变换；ρ 在共�
 
 ## 内存、复用与配置
 
-默认按全批最多 4096 个有效原子对分块，不一次展开全部 BN²×125 位移。
+默认按全批最多 32768 个有效原子对分块，并以 524288 个 pair-image 条目限制单块工作量；不一次展开全部 BN²×125 位移。
 先在 planning.py 中批量求逆、计算原子对边界、验证整样本覆盖，再压紧全部有效原子对。
 各块复用已算边界；候选槽宽度采用本批有效候选数的最大值，不再固定填满 125 个槽。
 离散搜索仍不求导，活跃位移和矩保持梯度。逐样本 Python 循环和标量同步已移除；
@@ -183,7 +183,8 @@ cutoff: 0.6
 radial_sigma: 0.2
 delta: 0.1
 max_images: 125
-pair_chunk_size: 4096
+pair_chunk_size: 32768
+image_chunk_size: 524288
 bounds_margin: 1.0e-9
 min_cell_singular_value: 1.0e-6
 max_cell_condition: 1.0e6
@@ -217,3 +218,13 @@ python -m pytest tests -q
 
 
 主干接入见第 8 节；最新批量几何优化与验证见 [G1 总文档第 10 节](../README.md#10-共享条件批量几何与关闭重算2026-10-16)。
+
+## 2026-10-16：按镜像工作量调整分块
+
+默认原子对上限从 4096 调整为 32768，另加 image_chunk_size=524288。
+实际块大小为 min(pair_chunk_size, max(1, image_chunk_size // max(1,image_slots)))。
+例如候选宽度为 1 时可一次处理 32768 对，宽度为 125 时最多 4194 对。
+不读取实时剩余显存、不做额外 GPU 标量同步，也不改变 max_images=125 的候选完整性检查。
+image_chunk_size 限制每块临时镜像条目；单对不可拆分，超过预算时仍完整处理这一对。
+它不承诺限制整个训练图峰值显存：坐标需要梯度时，各块保存的反向激活仍会累计。
+显存余量不足可降低 pair_chunk_size/image_chunk_size；不会改变几何定义。

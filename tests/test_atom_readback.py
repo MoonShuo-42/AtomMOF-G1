@@ -558,3 +558,43 @@ def test_real_full_condition_geometry_router_group_and_readback_chain_backpropag
         readback.residual.output_projection.weight,
     ):
         assert torch.isfinite(param.grad).all() and param.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_cached_internal_geometry_matches_independent_descriptors_and_gradients(dtype):
+    from src.models.g1.geometry.groups import prepare_group_internal
+    from src.models.g1.group_attention import GroupGeometryFeatures
+
+    data = inputs(batch=3, dtype=dtype)
+    data["group_mask"][0, -1] = False
+    data["atom_mask"][0, -1] = False
+    available = torch.tensor([True, False, True])
+    data["Z"][0, -1] = float("nan")
+    data["Z"][0, :, -1] = float("nan")
+    data["Z"][1] = float("nan")
+    data["U"][0, :, -1] = float("nan")
+    data["U"][0, -1] = float("nan")
+    data["U"][1] = float("nan")
+    Z, U = data["Z"].requires_grad_(), data["U"].requires_grad_()
+    ref_Z, ref_U = Z.detach().clone().requires_grad_(), U.detach().clone().requires_grad_()
+    mask, groups = data["atom_mask"], data["group_mask"]
+    internal = prepare_group_internal(Z, groups, available)
+    attention, readback = GroupGeometryFeatures(), ReadbackGeometryFeatures()
+    actual = (
+        attention(Z, groups, available, internal_geometry=internal),
+        readback(U, Z, mask, groups, available, internal_geometry=internal),
+    )
+    expected = (
+        attention(ref_Z, groups, available),
+        readback(ref_U, ref_Z, mask, groups, available),
+    )
+    signals = [torch.randn_like(v) for v in actual]
+    for a, b in zip(actual, expected):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    a_grads = torch.autograd.grad(sum((a * w).sum() for a, w in zip(actual, signals)), (Z, U))
+    b_grads = torch.autograd.grad(
+        sum((a * w).sum() for a, w in zip(expected, signals)), (ref_Z, ref_U)
+    )
+    for a, b in zip(a_grads, b_grads):
+        assert torch.isfinite(a).all()
+        torch.testing.assert_close(a, b)

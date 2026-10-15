@@ -499,3 +499,9 @@ It aligns the per-GPU batch cap (32), accumulation (2), and FP32 settings with s
 shares one condition encoder across four bridges, and disables all activation
 checkpointing. See the [G1 performance/configuration notes](src/models/g1/README.md#10-共享条件批量几何与关闭重算2026-10-16)
 for the full server command, checkpoint compatibility, and validation limits.
+
+The latest G1 execution optimizations compact within-block condition pairs, reuse
+per-batch group layouts and per-bridge geometry descriptors, and adapt geometry
+chunks to the image count. Parameter shapes and the baseline path are unchanged.
+See [G1 execution optimizations](src/models/g1/README.md#11-四项执行优化2026-10-16)
+and the CPU/CUDA component benchmark in scripts/benchmark_g1_optimizations.py.

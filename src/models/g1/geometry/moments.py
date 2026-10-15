@@ -21,7 +21,7 @@ def unpack_second_moment(packed: Tensor) -> Tensor:
     )
 
 
-def scalarize_geometry(geometry: Tensor) -> Tensor:
+def scalarize_geometry(geometry: Tensor, second_moment: Tensor | None = None) -> Tensor:
     """chi([r(6),v(3),Q(6),D]) = [r,D,|v|²,trQ,tr(Q²),vᵀQv].
 
     Apply this AFTER aggregation, e.g. rho = chi(E.sum(dim=2)).
@@ -30,7 +30,10 @@ def scalarize_geometry(geometry: Tensor) -> Tensor:
     if geometry.shape[-1] != 16:
         raise ValueError("geometry must have 16 channels")
     vector = geometry[..., 6:9]
-    matrix = unpack_second_moment(geometry[..., 9:15])
+    # A caller computing several descriptors can unpack Q just once.
+    matrix = unpack_second_moment(geometry[..., 9:15]) if second_moment is None else second_moment
+    if matrix.shape != (*geometry.shape[:-1], 3, 3):
+        raise ValueError("second_moment must match geometry's leading dimensions")
     vector_norm = vector.square().sum(-1, keepdim=True)
     trace = matrix.diagonal(dim1=-2, dim2=-1).sum(-1, keepdim=True)
     trace_square = matrix.square().sum(dim=(-2, -1)).unsqueeze(-1)

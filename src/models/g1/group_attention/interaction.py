@@ -4,6 +4,7 @@ from typing import NamedTuple
 
 from torch import Tensor, nn
 
+from ..geometry.groups import GroupInternalGeometry
 from .block import GroupAttentionBlock
 from .geometry import GroupGeometryBias
 from .pooling import GroupContentPool
@@ -38,10 +39,16 @@ class GroupInteraction(nn.Module):
         self.block = GroupAttentionBlock(group_dim, heads, ffn_ratio, norm_eps)
 
     def update_groups(
-        self, S: Tensor, Z: Tensor, group_mask: Tensor, geometry_ok: Tensor | None = None
+        self,
+        S: Tensor,
+        Z: Tensor,
+        group_mask: Tensor,
+        geometry_ok: Tensor | None = None,
+        *,
+        internal_geometry: GroupInternalGeometry | None = None,
     ) -> GroupInteractionOutput:
         """Update externally pooled S, enabling independent changes to content pooling."""
-        bias = self.geometry_bias(Z, group_mask, geometry_ok)
+        bias = self.geometry_bias(Z, group_mask, geometry_ok, internal_geometry=internal_geometry)
         result = self.block(S, bias, group_mask)
         # Match the block's padding convention for externally supplied group content.
         clean_S = S.to(result.S_plus.dtype).masked_fill(~group_mask.bool()[..., None], 0)
@@ -55,7 +62,11 @@ class GroupInteraction(nn.Module):
         atom_mask: Tensor,
         group_mask: Tensor,
         geometry_ok: Tensor | None = None,
+        *,
+        internal_geometry: GroupInternalGeometry | None = None,
     ) -> GroupInteractionOutput:
         """Consume group-major Pbar (B,K,N) and Z (B,K,K,16) from the SAME routing."""
         content = self.content_pool(H, Pbar, atom_mask, group_mask)
-        return self.update_groups(content.S, Z, group_mask, geometry_ok)
+        return self.update_groups(
+            content.S, Z, group_mask, geometry_ok, internal_geometry=internal_geometry
+        )

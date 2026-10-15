@@ -7,6 +7,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
+from .chunking import geometry_chunk_size
 from .images import ImageBounds, PeriodicImageSearch
 from .lattice import lattice_parameters_to_cell, validate_cell
 from .moments import PeriodicPairMoments, scalarize_geometry
@@ -26,6 +27,8 @@ class PeriodicGeometry(nn.Module):
 
     Default input units: Cartesian nm and (a,b,c,alpha,beta,gamma) in nm/radians.
     from_cell accepts explicit ROW lattice vectors, in the same frame as X_t.
+    Chunks obey both pair_chunk_size and image_chunk_size (padded pair-image
+    entries), except that one indivisible pair may exceed the latter.
     This module has no trainable parameters, but gradients reach coordinates
     and cells wherever the discrete validity/search decisions remain unchanged.
     """
@@ -36,13 +39,14 @@ class PeriodicGeometry(nn.Module):
         radial_sigma: float = 0.2,
         delta: float = 0.1,
         max_images: int = 125,
-        pair_chunk_size: int = 4096,
+        pair_chunk_size: int = 32768,
         bounds_margin: float = 1e-9,
         min_cell_singular_value: float = 1e-6,
         max_cell_condition: float = 1e6,
         length_unit: Literal["nm", "angstrom"] = "nm",
         angle_unit: Literal["radian", "degree"] = "radian",
         activation_checkpointing: bool = False,
+        image_chunk_size: int = 524288,
     ):
         super().__init__()
         if length_unit not in ("nm", "angstrom") or angle_unit not in ("radian", "degree"):
@@ -50,6 +54,9 @@ class PeriodicGeometry(nn.Module):
         if (
             not isinstance(pair_chunk_size, int)
             or pair_chunk_size < 1
+            or not isinstance(image_chunk_size, int)
+            or isinstance(image_chunk_size, bool)
+            or image_chunk_size < 1
             or not isinstance(max_images, int)
             or max_images < 1
             or not math.isfinite(bounds_margin)
@@ -63,6 +70,7 @@ class PeriodicGeometry(nn.Module):
         self.moments = PeriodicPairMoments(cutoff, radial_sigma, delta)
         self.image_search = PeriodicImageSearch(cutoff, max_images, bounds_margin)
         self.pair_chunk_size = pair_chunk_size
+        self.image_chunk_size = image_chunk_size
         self.min_cell_singular_value = min_cell_singular_value
         self.max_cell_condition = max_cell_condition
         self.length_unit = length_unit
@@ -152,8 +160,11 @@ class PeriodicGeometry(nn.Module):
         zero = (safe_coordinates * 0).sum() + (safe_cell * 0).sum()
         dense = coordinates.new_zeros((batch * atoms * atoms, 16)) + zero
         chunks = []
-        for start in range(0, plan.pairs.numel(), self.pair_chunk_size):
-            stop = start + self.pair_chunk_size
+        chunk_size = geometry_chunk_size(
+            self.pair_chunk_size, self.image_chunk_size, plan.image_slots
+        )
+        for start in range(0, plan.pairs.numel(), chunk_size):
+            stop = start + chunk_size
             pairs = plan.pairs[start:stop]
             bounds = ImageBounds(*(value[start:stop] for value in plan.bounds))
             if (

@@ -486,3 +486,50 @@ def test_entirely_unavailable_batch_does_not_enumerate_images(monkeypatch):
     assert not out.geometry_ok.any()
     out.E.sum().backward()
     assert x.grad.count_nonzero() == 0 and cell.grad.count_nonzero() == 0
+
+
+@pytest.mark.parametrize("side", [0.55, 1.5])
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_image_budget_limits_chunks_without_dropping_pairs_or_gradients(
+    side, checkpoint, monkeypatch
+):
+    generator = torch.Generator().manual_seed(97)
+    x = (torch.rand(2, 9, 3, generator=generator, dtype=torch.float64) * side).requires_grad_()
+    cell = (torch.eye(3, dtype=x.dtype)[None].repeat(2, 1, 1) * side).requires_grad_()
+    mask = torch.ones(2, 9, dtype=torch.bool)
+    mask[0, -2:] = False
+    module = PeriodicGeometry(
+        pair_chunk_size=32, image_chunk_size=64, activation_checkpointing=checkpoint
+    )
+    calls = []
+    original = module.image_search.enumerate
+
+    def enumerate_images(bounds, **kwargs):
+        shifts, valid = original(bounds, **kwargs)
+        calls.append(shifts.shape[:2])
+        assert torch.equal(valid.sum(-1), bounds.counts)
+        return shifts, valid
+
+    monkeypatch.setattr(module.image_search, "enumerate", enumerate_images)
+    actual = module.from_cell(x, cell, mask)
+    expected = PeriodicGeometry(pair_chunk_size=3).from_cell(x, cell, mask)
+    assert actual.geometry_ok.all()
+    assert calls and all(pairs <= 32 and pairs * slots <= 64 for pairs, slots in calls)
+    torch.testing.assert_close(actual.E, expected.E, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(actual.rho, expected.rho, rtol=1e-12, atol=1e-12)
+    weights = torch.randn(actual.E.shape, generator=generator, dtype=x.dtype)
+    a_grads = torch.autograd.grad((actual.E * weights).sum() + actual.rho.sum(), (x, cell))
+    b_grads = torch.autograd.grad((expected.E * weights).sum() + expected.rho.sum(), (x, cell))
+    for a, b in zip(a_grads, b_grads):
+        torch.testing.assert_close(a, b, rtol=1e-10, atol=1e-11)
+
+
+def test_geometry_chunk_policy_grows_only_when_image_work_allows():
+    from src.models.g1.geometry.chunking import geometry_chunk_size
+
+    assert geometry_chunk_size(32768, 524288, 1) == 32768
+    assert geometry_chunk_size(32768, 524288, 125) == 4194
+    assert geometry_chunk_size(4096, 524288, 1) == 4096
+    for invalid in (0, -1, True, 1.5):
+        with pytest.raises(ValueError):
+            PeriodicGeometry(image_chunk_size=invalid)

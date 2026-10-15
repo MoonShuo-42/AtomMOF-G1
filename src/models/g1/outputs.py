@@ -9,6 +9,7 @@ from .geometry import GeometryOutput
 from .group_attention import GroupInteractionOutput
 from .readback import AtomReadbackOutput
 from .routing import RoutingOutput
+from .routing.groups import GroupLayout
 
 
 class G1Context(NamedTuple):
@@ -16,11 +17,13 @@ class G1Context(NamedTuple):
 
     Tensors are not detached. The caller controls lifetime and invalidation;
     this is not an automatic cache across training or sampling steps.
+    group_layout additionally assumes the same max_groups policy.
     """
 
     c_cond: Tensor  # (B,N,c_dim)
     geometry: GeometryOutput  # E, rho, geometry_ok
     atom_mask: Tensor  # (B,N), bool
+    group_layout: GroupLayout | None = None  # optional for legacy explicit contexts
 
 
 class G1Intermediates(NamedTuple):

@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..geometry import scalarize_geometry, unpack_second_moment
+from ..geometry.groups import GroupInternalGeometry, resolve_group_internal
 from .utils import compute_dtype, linear, positive_int
 
 
@@ -29,26 +30,30 @@ class GroupGeometryFeatures(nn.Module):
     """[chi(Z_rk),chi(Z_rr),chi(Z_kk),v^T Q_rr v,v^T Q_kk v,
     tr(Q_rk Q_rr),tr(Q_rk Q_kk)] in that order, 11+11+11+4=37.
 
-    Q is reconstructed as a symmetric 3x3 matrix before contractions; a packed
-    six-component dot product would omit the double off-diagonal contributions.
+    Symmetric matrices are unpacked once and reused by the scalar and cross
+    contractions, including both copies of every off-diagonal entry.
     This mathematical descriptor has no learned parameters.
     """
 
-    def forward(self, Z: Tensor, group_mask: Tensor, geometry_ok: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        Z: Tensor,
+        group_mask: Tensor,
+        geometry_ok: Tensor | None = None,
+        *,
+        internal_geometry: GroupInternalGeometry | None = None,
+    ) -> Tensor:
         pair_valid = geometry_pair_mask(Z, group_mask, geometry_ok)
         with torch.autocast(device_type=Z.device.type, enabled=False):
             safe_Z = torch.where(pair_valid[..., None], Z.to(compute_dtype(Z)), 0)
-            # torch.diagonal appends the diagonal axis: (B,16,K) -> (B,K,16).
-            internal = safe_Z.diagonal(dim1=1, dim2=2).movedim(-1, 1)
-            chi_pair = scalarize_geometry(safe_Z)
-            chi_internal = scalarize_geometry(internal)
-            source_chi = chi_internal[:, :, None, :].expand_as(chi_pair)
-            target_chi = chi_internal[:, None, :, :].expand_as(chi_pair)
-            v = safe_Z[..., 6:9]
+            internal = resolve_group_internal(safe_Z, group_mask, geometry_ok, internal_geometry)
             Q = unpack_second_moment(safe_Z[..., 9:15])
-            Q_internal = unpack_second_moment(internal[..., 9:15])
-            Q_source = Q_internal[:, :, None]
-            Q_target = Q_internal[:, None, :]
+            chi_pair = scalarize_geometry(safe_Z, Q)
+            source_chi = internal.scalars[:, :, None, :].expand_as(chi_pair)
+            target_chi = internal.scalars[:, None, :, :].expand_as(chi_pair)
+            v = safe_Z[..., 6:9]
+            Q_source = internal.second[:, :, None]
+            Q_target = internal.second[:, None, :]
             source_direction = (v * (Q_source @ v.unsqueeze(-1)).squeeze(-1)).sum(-1)
             target_direction = (v * (Q_target @ v.unsqueeze(-1)).squeeze(-1)).sum(-1)
             source_trace = (Q * Q_source.transpose(-1, -2)).sum((-2, -1))
@@ -75,12 +80,21 @@ class GroupGeometryBias(nn.Module):
         self.fc1 = nn.Linear(37, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, heads)
 
-    def forward(self, Z: Tensor, group_mask: Tensor, geometry_ok: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        Z: Tensor,
+        group_mask: Tensor,
+        geometry_ok: Tensor | None = None,
+        *,
+        internal_geometry: GroupInternalGeometry | None = None,
+    ) -> Tensor:
         if Z.device != self.fc1.weight.device:
             raise ValueError("Z and bias parameters must share a device")
         dtype = compute_dtype(Z, self.fc1.weight)
         with torch.autocast(device_type=Z.device.type, enabled=False):
-            features = self.features(Z.to(dtype), group_mask, geometry_ok)
+            features = self.features(
+                Z.to(dtype), group_mask, geometry_ok, internal_geometry=internal_geometry
+            )
             bias = linear(F.silu(linear(features, self.fc1)), self.fc2)
             pair_valid = geometry_pair_mask(Z, group_mask, geometry_ok)
             return bias.masked_fill(~pair_valid[..., None], 0)

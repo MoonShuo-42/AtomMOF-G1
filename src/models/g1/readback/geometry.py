@@ -5,6 +5,11 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..geometry import scalarize_geometry, unpack_second_moment
+from ..geometry.groups import (
+    GroupInternalGeometry,
+    extract_group_internal,
+    resolve_group_internal,
+)
 from .utils import (
     available_geometry,
     compute_dtype,
@@ -13,24 +18,6 @@ from .utils import (
     positive_int,
     validate_descriptors,
 )
-
-
-def extract_group_internal(
-    Z: Tensor, group_mask: Tensor, geometry_ok: Tensor | None = None
-) -> Tensor:
-    """Return Z_kk (B,K,16); off-diagonal Z values are not read or differentiated."""
-    if group_mask.ndim != 2 or min(group_mask.shape) < 1:
-        raise ValueError("group_mask must be nonempty (B,K)")
-    batch, groups = group_mask.shape
-    if Z.shape != (batch, groups, groups, 16):
-        raise ValueError("Z must be (B,K,K,16)")
-    if not Z.is_floating_point():
-        raise TypeError("Z must be floating-point")
-    if Z.device != group_mask.device:
-        raise ValueError("Z and group_mask must share a device")
-    internal = Z.diagonal(dim1=1, dim2=2).movedim(-1, 1)
-    valid = group_mask.bool() & available_geometry(geometry_ok, Z)[:, None]
-    return torch.where(valid[..., None], internal, 0)
 
 
 class ReadbackGeometryFeatures(nn.Module):
@@ -47,6 +34,8 @@ class ReadbackGeometryFeatures(nn.Module):
         atom_mask: Tensor,
         group_mask: Tensor,
         geometry_ok: Tensor | None = None,
+        *,
+        internal_geometry: GroupInternalGeometry | None = None,
     ) -> Tensor:
         valid = pair_mask(atom_mask, group_mask)
         if U.shape != (*valid.shape, 16):
@@ -55,17 +44,18 @@ class ReadbackGeometryFeatures(nn.Module):
             raise TypeError("U must be floating-point")
         if U.device != Z.device or U.device != valid.device:
             raise ValueError("U, Z and masks must share a device")
-        internal = extract_group_internal(Z, group_mask, geometry_ok)
         valid = valid & available_geometry(geometry_ok, U)[:, None, None]
         dtype = compute_dtype(U, Z)
         with torch.autocast(device_type=U.device.type, enabled=False):
             safe_U = torch.where(valid[..., None], U.to(dtype), 0)
-            internal = internal.to(dtype)
-            chi_U = scalarize_geometry(safe_U)
-            chi_internal = scalarize_geometry(internal)[:, None].expand_as(chi_U)
-            v = safe_U[..., 6:9]
+            internal = resolve_group_internal(
+                Z.to(dtype), group_mask, geometry_ok, internal_geometry
+            )
             Q_U = unpack_second_moment(safe_U[..., 9:15])
-            Q_group = unpack_second_moment(internal[..., 9:15])[:, None]
+            chi_U = scalarize_geometry(safe_U, Q_U)
+            chi_internal = internal.scalars[:, None].expand_as(chi_U)
+            v = safe_U[..., 6:9]
+            Q_group = internal.second[:, None]
             direction = (v * (Q_group @ v.unsqueeze(-1)).squeeze(-1)).sum(-1)
             trace = (Q_U * Q_group.transpose(-1, -2)).sum((-2, -1))
             features = torch.cat((chi_U, chi_internal, torch.stack((direction, trace), -1)), -1)

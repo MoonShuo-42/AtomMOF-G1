@@ -4,6 +4,7 @@ from typing import NamedTuple
 
 from torch import Tensor, nn
 
+from ..geometry.groups import GroupInternalGeometry
 from .attention import ReadbackAttention
 from .geometry import ReadbackGeometryBias, ReadbackGeometryFeatures
 from .projection import AtomResidualUpdate
@@ -55,8 +56,12 @@ class AtomReadback(nn.Module):
         atom_mask: Tensor,
         group_mask: Tensor,
         geometry_ok: Tensor | None = None,
+        *,
+        internal_geometry: GroupInternalGeometry | None = None,
     ) -> AtomReadbackOutput:
-        features = self.geometry_features(U, Z, atom_mask, group_mask, geometry_ok)
+        features = self.geometry_features(
+            U, Z, atom_mask, group_mask, geometry_ok, internal_geometry=internal_geometry
+        )
         bias = self.geometry_bias(features, atom_mask, group_mask, geometry_ok)
         weights = self.attention(H, S_plus, P, bias, atom_mask, group_mask)
         values = self.value(H, S_plus, features, atom_mask, group_mask, geometry_ok)

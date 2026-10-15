@@ -296,7 +296,9 @@ def test_standalone_configuration_builds_small_encoder():
         output = encoder(feats)
     finally:
         hook.remove()
-    assert captured == [(torch.Size([1, 7, 128]), torch.Size([1, 7, 7, 64]))]
+    assert encoder.pair_mode == "local"
+    # Four atoms in one block and two in the other: 4**2 + 2**2 pairs.
+    assert captured == [(torch.Size([1, 7, 128]), torch.Size([20, 64]))]
     torch.testing.assert_close(output, direct(feats), rtol=0, atol=0)
     assert output.shape == (1, 7, 128)
     assert torch.isfinite(output).all()
@@ -321,3 +323,55 @@ def test_equal_widths_skip_projections_for_custom_architectures():
     assert isinstance(encoder.pair_projection, torch.nn.Identity)
     assert isinstance(encoder.output_projection, torch.nn.Identity)
     assert encoder(make_feats()).shape == (1, 7, 16)
+
+
+@pytest.mark.parametrize("backend", ["manual", "pytorch"])
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_compact_pairs_match_trained_dense_values_and_all_gradients(backend, empty, checkpoint):
+    """Reference all original pairs, including trained pair MLP and bond/single terms."""
+    # AtomMOF's inherited attention backends compute in FP32.
+    dtype = torch.float32
+    local = make_encoder(attention_impl=backend, activation_checkpointing=checkpoint)
+    with torch.no_grad():
+        for parameter in local.parameters():
+            parameter.uniform_(-0.25, 0.25)
+    dense = deepcopy(local)
+    dense.pair_mode = "dense"
+    assert local.state_dict().keys() == dense.state_dict().keys()
+    feats = {k: v.repeat(2, *([1] * (v.ndim - 1))) for k, v in make_feats().items()}
+    for key in ("ref_pos", "ref_charge"):
+        feats[key] = feats[key].to(dtype)
+    feats["atom_pad_mask"][1, 2:4] = 0
+    feats["block_index"][1] += 1000
+    if empty:
+        feats["atom_pad_mask"].zero_()
+    feats["ref_pos"].requires_grad_()
+    other = deepcopy(feats)
+    observed = []
+    handle = local.features.p_mlp.register_forward_pre_hook(
+        lambda m, a: observed.append(a[0].shape)
+    )
+    actual, expected = local(feats), dense(other)
+    handle.remove()
+    allowed = (
+        feats["atom_pad_mask"].bool()[:, :, None]
+        & feats["atom_pad_mask"].bool()[:, None, :]
+        & (feats["block_index"][:, :, None] == feats["block_index"][:, None, :])
+    )
+    assert observed == [(int(allowed.sum()), local.atom_z)]
+    atol, rtol = 3e-6, 3e-4
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    signal = torch.randn_like(actual)
+    (actual * signal).sum().backward()
+    (expected * signal).sum().backward()
+    torch.testing.assert_close(feats["ref_pos"].grad, other["ref_pos"].grad, atol=atol, rtol=rtol)
+    for (name, p), (_, q) in zip(local.named_parameters(), dense.named_parameters()):
+        assert p.grad is not None and q.grad is not None, name
+        assert torch.isfinite(p.grad).all(), name
+        torch.testing.assert_close(p.grad, q.grad, atol=atol, rtol=rtol, msg=name)
+
+
+def test_invalid_condition_pair_mode_fails():
+    with pytest.raises(ValueError, match="pair_mode"):
+        ConditionEncoder(pair_mode="unsupported")

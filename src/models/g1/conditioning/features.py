@@ -61,17 +61,7 @@ class AtomConditionFeatures(nn.Module):
         ref_pos = feats["ref_pos"]
         atom_mask = feats["atom_pad_mask"].bool()
         block_index = feats["block_index"]
-        atom_feats = torch.cat(
-            [
-                ref_pos,
-                feats["ref_charge"].unsqueeze(-1),
-                feats["atom_pad_mask"].unsqueeze(-1),
-                feats["ref_element"].unsqueeze(-1),
-                one_hot(feats["block_type"], num_classes=len(const.block_types)).float(),
-            ],
-            dim=-1,
-        )
-        c = self.embed_atom_features(atom_feats)
+        c = self.single_features(feats)
         d = ref_pos.unsqueeze(1) - ref_pos.unsqueeze(2)
         d_norm = 1 / (1 + torch.sum(d * d, dim=-1, keepdim=True))
         same_block = (
@@ -91,3 +81,43 @@ class AtomConditionFeatures(nn.Module):
         p = p + self.c_to_p_trans_k(c.unsqueeze(1))
         p = p + self.p_mlp(p)
         return c, p
+
+    def single_features(self, feats: Mapping[str, Tensor]) -> Tensor:
+        """Original raw c, also used by the compact pair path."""
+        ref_pos = feats["ref_pos"]
+        atom_feats = torch.cat(
+            [
+                ref_pos,
+                feats["ref_charge"].unsqueeze(-1),
+                feats["atom_pad_mask"].unsqueeze(-1),
+                feats["ref_element"].unsqueeze(-1),
+                one_hot(feats["block_type"], num_classes=len(const.block_types)).float(),
+            ],
+            dim=-1,
+        )
+        return self.embed_atom_features(atom_feats)
+
+    def local_features(
+        self, feats: Mapping[str, Tensor], pair_indices: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        """Original c and exact p only for valid within-block pairs.
+
+        Pair MLP, bond embedding and 128-channel p are never constructed for
+        cross-block/padded pairs. Dense forward remains available for callers
+        that need raw p everywhere. Empty layouts keep all parameters in autograd.
+        """
+        c = self.single_features(feats)
+        positions = feats["ref_pos"]
+        atoms = positions.shape[1]
+        b = pair_indices // (atoms * atoms)
+        i, j = (pair_indices // atoms) % atoms, pair_indices % atoms
+        d = positions[b, j] - positions[b, i]
+        d_norm = 1 / (1 + torch.sum(d * d, dim=-1, keepdim=True))
+        same_block = d.new_ones((pair_indices.numel(), 1))
+        p = self.embed_atompair_ref_pos(d)
+        p = p + self.embed_atompair_ref_dist(d_norm)
+        p = p + self.embed_atompair_mask(same_block)
+        p = p + self.embed_bond_feats(feats["bond_types"][b, i, j])
+        p = p + self.c_to_p_trans_q(c)[b, i]
+        p = p + self.c_to_p_trans_k(c)[b, j]
+        return c, p + self.p_mlp(p)

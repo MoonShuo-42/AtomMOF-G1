@@ -161,10 +161,11 @@ def test_composed_forward_and_gradients_equal_the_explicit_six_stage_reference()
     for name in ("H_updated", "delta_H", "readback"):
         torch.testing.assert_close(getattr(result, name), getattr(reference, name), rtol=0, atol=0)
     assert result.intermediates is None
+    # Reusing internal descriptors merges gradient contributions in a different order.
     loss_from(result).backward()
     loss_from(reference).backward()
     for key in ("H", "x_t", "l_t", "t"):
-        torch.testing.assert_close(data[key].grad, reference_data[key].grad, rtol=0, atol=0)
+        torch.testing.assert_close(data[key].grad, reference_data[key].grad, rtol=2e-5, atol=2e-6)
         assert torch.isfinite(data[key].grad).all() and data[key].grad.abs().sum() > 0
     torch.testing.assert_close(
         data["feats"]["ref_pos"].grad, reference_data["feats"]["ref_pos"].grad
@@ -174,7 +175,7 @@ def test_composed_forward_and_gradients_equal_the_explicit_six_stage_reference()
         combined.named_parameters(), explicit.named_parameters()
     ):
         assert name == other_name and p.grad is not None and q.grad is not None
-        torch.testing.assert_close(p.grad, q.grad, rtol=0, atol=0)
+        torch.testing.assert_close(p.grad, q.grad, rtol=2e-5, atol=2e-6)
     for p in (
         combined.condition_encoder.output_projection.weight,
         combined.router.template_bank.weight,
@@ -504,3 +505,36 @@ def test_context_shape_checks_reject_mismatched_atoms_condition_and_geometry():
         model(**data, lattice_format="auto")
     with pytest.raises(ValueError, match="c_cond"):
         model.prepare(data["feats"], data["x_t"], data["l_t"], c_cond=torch.zeros(1, 4, 3))
+
+
+def test_group_internal_descriptors_are_reused_by_attention_and_readback(monkeypatch):
+    import src.models.g1.geometry.groups as shared_geometry
+
+    model, data = small_model(), make_inputs(lengths=(3, 0))
+    calls, seen = [], []
+    original = shared_geometry.scalarize_geometry
+
+    def scalarize(values, second_moment=None):
+        calls.append(values.shape)
+        return original(values, second_moment)
+
+    monkeypatch.setattr(shared_geometry, "scalarize_geometry", scalarize)
+
+    def capture(module, args, kwargs):
+        seen.append(kwargs["internal_geometry"])
+
+    handles = [
+        model.group_interaction.geometry_bias.features.register_forward_pre_hook(
+            capture, with_kwargs=True
+        ),
+        model.readback.geometry_features.register_forward_pre_hook(capture, with_kwargs=True),
+    ]
+    try:
+        result = model(**data)
+        assert calls == [torch.Size([2, 3, 16])]
+        assert len(seen) == 2 and seen[0] is seen[1]
+        assert seen[0].values.grad_fn is not None
+        loss_from(result).backward()
+    finally:
+        for handle in handles:
+            handle.remove()

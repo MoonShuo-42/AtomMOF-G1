@@ -12,6 +12,7 @@ from .geometry import PeriodicGeometry
 from .module import G1Module
 from .outputs import G1Context
 from .routing import SoftRouter
+from .routing.groups import AtomCountGroups
 from .validation import validate_mask
 
 
@@ -135,6 +136,7 @@ class G1Bridges(nn.Module):
         contexts = {}
         shared = None
         shared_condition = None
+        layouts = {}
         for key, bridge in self.bridges.items():
             if not self.share_condition or shared_condition is None:
                 c_cond = bridge.encode_condition(feats).repeat_interleave(multiplicity, 0)
@@ -148,7 +150,16 @@ class G1Bridges(nn.Module):
                     shared = geo
             else:
                 geo = shared
-            contexts[key] = G1Context(c_cond, geo, mask)
+            selector = bridge.router.group_selector
+            # Reuse only the known atom-count policy; custom selectors prepare independently.
+            capacity = selector.max_groups
+            if type(selector) is AtomCountGroups:
+                if capacity not in layouts:
+                    layouts[capacity] = selector.prepare(mask)
+                layout = layouts[capacity]
+            else:
+                layout = selector.prepare(mask)
+            contexts[key] = G1Context(c_cond, geo, mask, layout)
         return contexts
 
     def forward(

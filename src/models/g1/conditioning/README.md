@@ -96,10 +96,17 @@ c_cond = encoder.encode(c, p, atom_pad_mask, block_index)
 
 ## 计算与验证
 
-当前仍使用 dense pair 张量和 attention；加 mask 不会自动获得按构件拆分的
-计算节省。p 会先按原公式构造为 128 维，再压缩到 64 维；原始 p 及其构造过程中的
-激活仍有显存开销。因此参数下降比例不能当作峰值显存下降比例，服务器显存需实测。
-后续可以独立替换 attention 后端或特征构造。
+默认 pair_mode=local：先收集同构件有效原子对，再按原公式构造紧凑的
+p(M,128)，经过原 pair MLP 和 128→64 投影，M=各样本各构件原子数平方之和。
+Transformer 内 pair LayerNorm 和 bias 投影也只在这些原子对上运行，
+最后散射为 (B,heads,N,N) 注意力偏置。避免分配 dense p 的 128/64 通道张量。
+
+attention 的 QK 和 softmax 仍是 dense N×N，不能把整层复杂度都算成 M。
+布局压紧每次条件编码包含一次 nonzero；训练不跨 optimizer step 缓存。
+pair_mode=dense 保留完整参考路径；features(feats) 和 encode(c,p,mask,block_index)
+的公开 dense 接口仍可使用。无有效原子对时所有参数仍连接到零梯度图，支持 DDP。
+数学公式和权重键/形状保持一致；GEMM 与梯度求和顺序变化允许浮点舍入误差。
+GPU 加速比例与构件大小分布有关，需实测。
 
 单个默认 ConditionEncoder 参数量：
 
