@@ -125,7 +125,13 @@ class G1Module(nn.Module):
         validate_context(H, t, context, self.h_dim, self.c_dim)
         c_cond, geo, mask = context.c_cond, context.geometry, context.atom_mask
         routes = self.router(
-            H, c_cond, geo.rho, t, geo.geometry_ok, mask, group_layout=context.group_layout
+            H,
+            c_cond,
+            geo.rho,
+            t,
+            geo.geometry_ok,
+            mask,
+            group_layout=context.group_layout,
         )
         relations = self.aggregation(geo.E, routes.Pbar, mask, routes.group_mask, geo.geometry_ok)
         internal = prepare_group_internal(relations.Z, routes.group_mask, geo.geometry_ok)
@@ -159,7 +165,7 @@ class G1Module(nn.Module):
             result.H_updated,
             result.delta_H,
             result.readback,
-            routes.group_counts if context.group_layout is None else context.group_layout.counts,
+            context.group_layout.counts,
             geo.geometry_ok,
             intermediates,
         )

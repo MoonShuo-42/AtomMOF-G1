@@ -230,8 +230,7 @@ python -m pytest tests/test_soft_router.py -q
 python -m pytest tests -q
 ~~~
 
-2026-10-15，本地 PyTorch 2.6.0+cpu 验证：Router 相关 45 项测试通过；
-全仓库 112 项测试通过（112 passed in 27.09s）。
+历史测试结果保留在 Git 对应提交中；当前验证状态统一见 [G1 总文档](../README.md#7-验证与实验状态)。
 
 验证范围：
 
@@ -244,10 +243,10 @@ python -m pytest tests -q
 - H/c/rho/t 的有限差分梯度；与 ConditionEncoder、PeriodicGeometry 的实际连接。
 - 组数变化期间参数对象及优化器状态保持；独立桥参数和配置实例化。
 
-这些检查不保证真实训练中模板训练充分或分组质量；尚未运行 GPU / 8 GPU 训练，
+这些检查不保证真实训练中模板训练充分或分组质量；八卡运行进展见总文档，
 Router 已接入 Flow，默认关闭；当前尚无真实 G1 训练效果指标。
 
 六模块统一封装与调用方式见 [G1Module](../README.md)。
 
 
-当前主干接入、开关、checkpoint 兼容性与 263 项全仓库测试记录见 [G1 总文档第 8 节](../README.md#8-atommof-主干接入与开关)。
+当前主干接入、训练命令和验证状态见 [G1 总文档](../README.md)。

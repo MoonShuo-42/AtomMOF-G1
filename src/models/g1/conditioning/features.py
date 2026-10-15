@@ -56,32 +56,6 @@ class AtomConditionFeatures(nn.Module):
         init.final_init_(self.c_to_p_trans_q[1].weight)
         init.final_init_(self.p_mlp[5].weight)
 
-    def forward(self, feats: Mapping[str, Tensor]) -> Tuple[Tensor, Tensor]:
-        """Return c (B,N,atom_s) and p (B,N,N,atom_z), before any attention."""
-        ref_pos = feats["ref_pos"]
-        atom_mask = feats["atom_pad_mask"].bool()
-        block_index = feats["block_index"]
-        c = self.single_features(feats)
-        d = ref_pos.unsqueeze(1) - ref_pos.unsqueeze(2)
-        d_norm = 1 / (1 + torch.sum(d * d, dim=-1, keepdim=True))
-        same_block = (
-            (
-                atom_mask[:, :, None]
-                & atom_mask[:, None, :]
-                & (block_index[:, :, None] == block_index[:, None, :])
-            )
-            .float()
-            .unsqueeze(-1)
-        )
-        p = self.embed_atompair_ref_pos(d) * same_block
-        p = p + self.embed_atompair_ref_dist(d_norm) * same_block
-        p = p + self.embed_atompair_mask(same_block) * same_block
-        p = p + self.embed_bond_feats(feats["bond_types"])
-        p = p + self.c_to_p_trans_q(c.unsqueeze(2))
-        p = p + self.c_to_p_trans_k(c.unsqueeze(1))
-        p = p + self.p_mlp(p)
-        return c, p
-
     def single_features(self, feats: Mapping[str, Tensor]) -> Tensor:
         """Original raw c, also used by the compact pair path."""
         ref_pos = feats["ref_pos"]
@@ -97,14 +71,12 @@ class AtomConditionFeatures(nn.Module):
         )
         return self.embed_atom_features(atom_feats)
 
-    def local_features(
-        self, feats: Mapping[str, Tensor], pair_indices: Tensor
-    ) -> Tuple[Tensor, Tensor]:
+    def forward(self, feats: Mapping[str, Tensor], pair_indices: Tensor) -> Tuple[Tensor, Tensor]:
         """Original c and exact p only for valid within-block pairs.
 
         Pair MLP, bond embedding and 128-channel p are never constructed for
-        cross-block/padded pairs. Dense forward remains available for callers
-        that need raw p everywhere. Empty layouts keep all parameters in autograd.
+        cross-block/padded pairs. pair_indices comes from local_pair_layout.
+        Empty layouts keep all parameters in autograd.
         """
         c = self.single_features(feats)
         positions = feats["ref_pos"]

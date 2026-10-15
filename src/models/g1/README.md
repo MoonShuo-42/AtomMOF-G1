@@ -76,7 +76,6 @@ src/models/g1/
 统一入口仍为 from src.models.g1 import G1Module；
 独立子模块改用 from src.models.g1.conditioning import ConditionEncoder 等路径。
 六个子模块的配置也统一放入 configs/g1/，测试仍放在 tests/；配置加载路径、Hydra defaults 和测试已同步更新。
-本次为目录整理，子模块注册名称和 state_dict 键不变。
 
 配置目录与代码目录分别集中管理：
 
@@ -92,7 +91,7 @@ configs/g1/
 └── readback/default.yaml
 ~~~
 
-原 configs/ 下的六个平级配置目录已移入此处。default.yaml 使用相对于 g1/ 的配置组路径；
+default.yaml 使用相对于 g1/ 的配置组路径；
 对外仍通过 compose(config_name="g1/default") 加载，实例化入口仍为 cfg.g1，
 参数覆盖仍使用 g1.router.max_groups 等键。group_attention 配置组装入 group_interaction 字段。
 独立子模块可继续 OmegaConf.load 对应 YAML，例如 configs/g1/router/adaptive.yaml；
@@ -253,39 +252,42 @@ g1 = instantiate(cfg.g1)
 
 组合配置显式构造所有六个组件，修改关联维度或 pool_eps 时须同步相应子配置。
 default.yaml 保留独立实例化入口。新增 bridges.yaml 复用它并由 configs/model/simple.yaml 组合，
-接入训练构造与 checkpoint 保存；推理根据 checkpoint 还原架构。
+接入训练构造与 checkpoint 保存；推理根据当前方案的 checkpoint 还原架构。
 
-## 7. 验证与接入范围
+## 7. 验证与实验状态
 
 ~~~bash
-python -m pytest tests/test_g1_module.py -q
 python -m pytest tests -q
 ~~~
 
-2026-10-15，本地 PyTorch 2.6.0+cpu：统一封装测试共 25 项；六个子模块迁入 g1 后，全仓库 240 项测试通过（240 passed in 38.32s），包括独立子模块、Hydra 配置组合与完整链路验证。代码格式检查通过。
+本地回归覆盖六模块前向/梯度、紧凑条件与数学参考对照、四桥共享条件及梯度累加、
+动态组数与 mask、周期几何、当前 checkpoint 保存恢复、baseline 权重初始化 G1、
+真实 Flow 损失与采样、两进程 Gloo DDP。
 
-同日进一步将六个配置目录迁入 configs/g1/，更新 defaults 和配置加载路径后，
-重新运行全仓库测试：240 passed in 34.99s。独立配置加载、Hydra 组合、参数覆盖和完整链路均通过。
+2026-10-16 本次清理验证（PyTorch 2.6.0+cpu）：受影响测试 124 项通过，
+其余测试 170 项通过，合计 **294 项通过**。两条警告来自微型 Lightning 测试的
+无验证 dataloader 和较少 workers。组件基准脚本也通过 CPU 前向/反向运行检查；
+该小规模运行只验证脚本可用，不作为性能测量结论。
 
-检查包括：六个组件注册与同一份 P/Pbar 的传递、与手动六阶段串联的数值和参数梯度对齐、
-残差只执行一次、显式上下文复用与失效边界、静态条件复用、动态组数和样本独立性、
-几何不可用时保留内容路径、全 padding 的有限零梯度、原子置换、行晶格接口、
-CPU autocast、参数独立性与状态保存恢复、Hydra 配置组合和子模块参数覆盖。
+服务器已完成八卡 smoke 测试，并开始 G1 small 阶段一正式训练。
+2026-10-16 用户反馈优化后训练段约 3 分半；截图为进行中的进度估计，
+不是固定实验条件下完成整轮的基准，也不包含完整验证阶段。
+这些结果说明代码已在服务器运行；收敛与生成指标仍需后续实验评估。
 
-已完成独立 G1、四桥调度及 Flow 训练/推理接入，默认关闭；尚未进行 G1 GPU 训练。
-本地数值测试不代表实际训练效果或显存性能。
-
+清理前曾直接对照接入前的 2e21e0e 源码：CPU FP32、24 层且缩小测试宽度，
+主干重算开/关 × multiplicity 1/2 共四组，G1 关闭时初始化 RNG、参数、
+前向输出、参数梯度和输入梯度完全一致。当前回归继续检查 baseline 关闭路径。
 
 ## 8. AtomMOF 主干接入与开关
 
-G1Bridges 在 FlowModule 中注册四个独立 G1Module。TokenTransformer 将回调传入主干 DiT，
+G1Bridges 在 FlowModule 中注册四个共享条件编码器的 G1Module。TokenTransformer 将回调传入主干 DiT，
 每层完成后按一基编号检查插入位置，默认依次在 6、12、18、24 层之后更新隐藏特征。
 原始原子编码器、原子解码器、pair 特征和时间调制的调用方式保留。
 目前主干 token 与原子仍一一对应；若未来真正执行 atom-to-token 分组，需要另行适配 G1 的原子轴。
 
 桥的 H 宽度取实际 model.token_s，可能为 256 或 512，不硬编码为 256。
 bridges.yaml 将 router、group_interaction、readback 的 h_dim 联动到 model.token_s；
-组特征与条件输出的默认 128 维保持原设定。新配置共享一套条件编码器；Router、组交互和读回参数仍逐桥独立。
+组特征与条件输出的默认 128 维保持原设定。始终共享一套条件编码器；Router、组交互和读回参数仍逐桥独立。
 
 配置入口为 configs/g1/bridges.yaml，位于 model.flow_model_args.g1：
 
@@ -297,7 +299,6 @@ model:
       insert_after: [6, 12, 18, 24]
       activation_checkpointing: false
       share_geometry: true
-      share_condition: true
       module: # 由 default.yaml 组合出的 G1Module 配置
         ...
 ~~~
@@ -327,8 +328,8 @@ model.flow_model_args.g1.module.router.max_groups=32
 ### 8.1 上下文与多样本
 
 同一 Flow forward 内，默认只计算一次当前 x_t/l_t 的无参数几何，四个桥共用 E/rho/g_ok。
-share_condition=true 时，在原始 batch 上只运行一次共享 ConditionEncoder，再按 repeat_interleave 扩展 multiplicity；四桥引用同一 c_cond 计算图。
-share_condition=false 保留旧的逐桥独立编码模式。梯度不 detach，四个插入位置的梯度累加到共享参数。
+在原始 batch 上只运行一次共享 ConditionEncoder，再按 repeat_interleave 扩展 multiplicity；
+四桥引用同一 c_cond 计算图。梯度不 detach，四个插入位置的梯度累加到共享参数。
 每个插入位置用当前隐藏特征重新计算自己的路由、U/Z、S_plus 和读回；不重复添加残差。
 上下文只保存在本次调用的局部变量中，不跨采样步缓存、不 detach，也不跨优化器更新保留计算图。
 share_geometry=false 可关闭几何复用；共享模式要求各桥采用同一配置的无参数 PeriodicGeometry。
@@ -339,7 +340,7 @@ Flow 已将当前坐标/晶格转换为 nm/radian，集成模式会校验该单�
 | 场景 | 行为 |
 | --- | --- |
 | 原 baseline checkpoint | 缺少 g1 配置时按关闭处理，严格加载原有权重 |
-| G1 checkpoint | 保存四桥参数与 flow_model_args.g1，推理时自动恢复 |
+| 当前方案 G1 checkpoint | 保存四桥参数与 flow_model_args.g1，推理时自动恢复 |
 | baseline 权重初始化 G1 训练 | 启用 G1，并使用 pretrained_ckpt_path；主干尺寸应一致，新桥随机初始化 |
 | 继续 G1 训练 | 同样启用 G1、保留相同结构，使用 resume_ckpt_path 恢复优化器与训练进度 |
 
@@ -362,148 +363,54 @@ predict_args.g1_enabled=true
 程序调用可在 model.eval() 后使用 model.structure_module.flow_model.set_g1_enabled(False)。
 构造时关闭的模型不能在运行时凭空开启 G1；需要包含 G1 权重的模型。
 
-### 8.3 接入验证（2026-10-15）
+只维护当前 G1 架构和配置，不提供旧 G1 checkpoint 的自动迁移或旧结构恢复模式。
+原始 AtomMOF baseline 的加载、初始化 G1 训练和关闭开关保留。
+共享条件编码器的四组 state_dict 名称是同一套权重的别名；加载时检查它们一致，
+避免损坏或人工修改的 checkpoint 静默覆盖共享权重。
 
-新增 tests/test_g1_integration.py：23 项集成测试通过。
-提交前复核：全仓库 263 passed, 2 warnings in 80.78s；两条警告来自 CPU 微型训练测试的无验证集与少量 dataloader workers。
-覆盖四个插入位置、独立参数、multiplicity、当前几何复用与失效、主干/桥激活重算的梯度一致性、
-真实训练损失与两步 Lightning 优化、ODE 与最终 refinement、严格 checkpoint 恢复、baseline 权重初始化 G1、
-训练/预测 Hydra 入口及预测开关。两进程 Gloo DDP 使用 find_unused_parameters=False 连续训练两步通过，
-其中一个 rank 的样本进入几何回退分支。
+## 9. 当前架构与参数
 
-另与修改前保存的 Flow/TokenTransformer/DiT 源码进行独立比较：关闭 G1 时，
-初始化 RNG、481 个状态项、前向输出、全部参数梯度与输入梯度逐项完全相等，
-主干激活重算关闭和开启两种情况均通过（小尺寸合成输入、CPU）。
+后续修改以本节方案为基础。六个子模块可独立修改，接口由 G1Module 统一检查。
 
-本地环境为 PyTorch 2.6.0+cpu；测试仅隔离未使用的可选 MLIP 后端，主干、六模块、采样器和 Lightning 均为真实实现。
-没有运行服务器 8 GPU、MLIP steering、torch.compile 性能或完整数据集训练；尚无 G1 生成效果指标。
-
-## 9. 条件编码器精简（2026-10-16）
-
-本节记录提交 8b8e551 的独立编码器版本；后续共享与几何优化见第 10 节。
-
-本次仅改变 G1 的 ConditionEncoder。原始 AtomMOF 编码器/主干/解码器、其他五个 G1 子模块、
-四个桥的插入位置与独立参数策略保持不变。
-
-保留原始特征构造 c(B,N,256)、p(B,N,N,128)，分别经过无 bias 线性层降至 128、64 维，
-再进入 **1 层静态 Transformer（4 头，FFN 比例 4）**。输出 c_cond(B,N,128)，
-默认输出投影为 Identity。同构件掩码、无时间调制、几何输入和门控逻辑保持原样。
-
-| 模块 / 范围 | 修改前参数量 | 修改后参数量 |
-| --- | ---: | ---: |
-| ConditionEncoder / 每桥 | 2,715,776 | 374,016 |
-| 几何计算 / 每桥 | 0 | 0 |
-| Router / 每桥 | 60,128 | 60,128 |
-| U/Z 聚合 / 每桥 | 0 | 0 |
-| 组交互 / 每桥 | 231,876 | 231,876 |
-| 原子读回 / 每桥 | 151,716 | 151,716 |
-| G1 / 每桥 | 3,159,496 | 817,736 |
-| G1 / 四桥 | 12,637,984 | 3,270,944 |
-| 原始 AtomMOF small | 38,376,320 | 38,376,320 |
-| **AtomMOF small + 四桥 G1** | **51,014,304** | **41,647,264** |
-
-以上 small 为 `model.token_s=256`、`model.token_z=128`、24 层主干与其余默认参数；
-仓库默认的 512/256 token 宽度不属于此表。
-
-配置 `configs/g1/condition_encoder/static.yaml` 已更新，使用正常配置启用 G1 即采用新结构。
-若要在完整训练命令中显式记录这三个设置，可添加：
-
-~~~bash
-model.flow_model_args.g1.module.condition_encoder.hidden_dim=128 \
-model.flow_model_args.g1.module.condition_encoder.pair_dim=64 \
-model.flow_model_args.g1.module.condition_encoder.depth=1
-~~~
-
-`atom_s` / `atom_z` 控制原始特征构造，`hidden_dim` / `pair_dim` 控制降维后 Transformer，
-`output_dim` 控制输出接口；完整说明见 [条件编码器文档](conditioning/README.md)。
-
-**Checkpoint：**旧 G1 三层结构的 checkpoint 不能直接恢复到本版精简结构，
-包括此前 10 步的 G1 smoke checkpoint；本版正式训练应新建运行目录。
-baseline checkpoint 的加载、初始化 G1 和关闭 G1 时的行为保持不变。
-本版 checkpoint 保存完整宽度及层数配置，仍支持严格加载与恢复。
-
-**显存：**原始 p 的 128 维构造仍存在，其他五个 G1 模块的激活也不变。
-本表是参数量，不能据此保证原先发生 OOM 的 batch 配置可用；新结构的峰值显存需在服务器实测。
-
-### 9.1 本版验证
-
-本地 PyTorch 2.6.0+cpu：针对条件编码器、G1Module 和主干接入的 67 项测试通过；
-全仓库运行结果为 **266 passed, 2 warnings in 54.99s**。
-两条警告仍来自微型 Lightning 测试的无验证集和少量 dataloader workers。
-
-覆盖原始 c/p 数值一致、降维后的真实层输入/输出、投影梯度、padding 与构件隔离、
-四桥调用、关闭 G1 的原版路径、新结构严格 checkpoint 恢复、baseline 权重初始化 G1、
-真实 Flow 损失/采样，以及主干、条件编码器、桥的激活重算。
-两进程 Gloo DDP 使用 find_unused_parameters=False 连续优化两步通过；
-实测 small 参数量与本节表格一致。Black、isort 和 git diff --check 检查通过。
-
-此前三层 G1 已在服务器完成 8 GPU / 10 步 smoke 测试；本次精简结构尚未在服务器运行。
-CPU/DDP 回归通过不代表已验证 8 GPU 的峰值显存、训练收敛或生成指标。
-
-## 10. 共享条件、批量几何与关闭重算（2026-10-16）
-
-### 10.1 一次条件编码、四桥使用
-
-新配置默认 `model.flow_model_args.g1.share_condition=true`。四个 G1Module 注册引用同一个
-ConditionEncoder 实例；每次 Flow 前向只执行一次完整 c/p 构造、入口投影和单层 Transformer。
-同次调用的四个上下文引用相同 c_cond，不复制计算、不 detach、不跨优化器更新缓存。
-Router、U/Z、组交互和原子读回继续使用各插入位置的 H，独立执行；其中可训练参数仍逐桥独立。
-
-参数共享也意味着学习方式改变：四个桥的条件梯度累加到同一组权重，
-不再允许四套条件编码器分别学习。PyTorch 的 parameters()/优化器会对共享参数去重。
-state_dict 保留四个桥原有条件编码器键，它们指向同一存储，不代表训练了四套参数。
+- 条件编码：c 为 256→128；同构件有效原子对 p 为 128→64；1 层、4 头静态 Transformer，
+  输出 128 维，不注入当前噪声和时间调制。
+- 四桥固定共享一套 ConditionEncoder，一次 Flow forward 只编码一次。
+- Router、组交互和原子读回在各桥独立学习；每桥使用当前 H/t 重新计算。
+- K_b=min(32,N_b)，分组布局在同次前向内复用；不共享学习得到的 P/Pbar。
+- 当前周期几何默认四桥复用；组内几何描述只在同一桥内的组交互和读回之间复用。
+- 默认主干、桥、条件编码器和几何模块均关闭激活重算。重算仍是可调的内存功能。
 
 | 范围（small：token_s=256、token_z=128） | 参数量 |
 | --- | ---: |
 | 共享 ConditionEncoder（合计一套） | 374,016 |
-| 每桥独立的其余可训练模块 | 443,720 |
+| 每桥独立的 Router | 60,128 |
+| 每桥独立的组交互 | 231,876 |
+| 每桥独立的原子读回 | 151,716 |
+| 周期几何与 U/Z 汇总 | 0 |
 | G1 合计（共享条件 + 四套更新） | 2,148,896 |
 | 原始 AtomMOF small | 38,376,320 |
 | **AtomMOF small + G1** | **40,525,216** |
 
-`share_condition=false` 可恢复四套独立条件参数。为兼容旧版精简模型 checkpoint，
-G1Bridges 的 Python 构造器对缺失的该字段按 false 处理；新 Hydra 配置显式设置 true。
-旧 8b8e551 checkpoint 按其保存配置加载时仍恢复独立结构。
-若把四份不同的旧条件权重强行加载到共享结构，程序明确报错，不选择其中一份覆盖其他权重。
-新共享结构应新建训练目录；不要用旧独立结构的优化器状态直接续训共享结构。
+当前训练接口不再提供 share_condition 或 condition_encoder.pair_mode 两个参数；
+四桥共享与紧凑 pair 已是唯一实现。不要在新命令中继续传入这两个配置键。
+外部 dense c/p 的 encode 入口、缺少 group_layout 的旧 G1Context 接口也已删除。
+GroupInternalGeometry 及其提取函数统一位于 geometry/groups.py。
 
-### 10.2 几何执行优化
+## 10. 阶段一训练配置
 
-数学定义、125 候选上限、整样本回退规则、输出 E/rho/g_ok 及可微路径保持一致：
-
-- `geometry/planning.py` 单独负责离散规划：批量晶胞求逆、一次性计算全批原子对的搜索边界。
-- 先检查每个样本的完整覆盖，再统一筛选有效原子对。任一有效原子对超限，仍禁用该样本全部几何。
-- 删除逐样本 Python 循环和逐样本 bool(GPU tensor) 分支；只在批级压紧索引和读取最大候选数。
-- 分块使用已经计算好的边界，不在每块前重复搜索。当时默认每块最多 4096 个有效原子对；后续分块策略见第 11 节。
-- 镜像存储宽度按本批有效候选数的最大值分配。例如实际最多 8 个，就只展开 8 个槽；
-  不再固定填满 125 个槽，也不会截断任何被接受的候选。
-- 周期位移和矩仍在张量上计算，输入需要梯度时保留坐标/晶胞梯度。
-  几何结果仍每次 Flow 前向只计算一次，四桥共用。
-
-此实现仍包含稠密 O(BN²) 边界/E 存储、分块循环、批级动态索引同步及其他模块的同步点，
-不宣称全模型已经完全无同步。峰值候选张量按 `pair_chunk_size × image_slots` 控制，
-不会一次展开整个批次的所有周期镜像。
-
-### 10.3 与 small 对齐的阶段一配置
-
-新增 `configs/experiment/g1_small_stage1.yaml`：
+configs/experiment/g1_small_stage1.yaml 组合当前方案：
 
 - 8 GPU、FP32、单卡动态 batch 上限 32、梯度累积 2。
 - small token 宽度 256/128、最多 200 原子、完整筛选后训练集、验证 1000 样本、500 epochs。
-- 主干、G1 桥、条件编码器、几何模块的 activation_checkpointing 均为 false。
-- 条件维度 128/64、1 层、四桥位置 6/12/18/24，条件与几何都共享。
+- 四桥位置 6/12/18/24；共享条件、默认共享几何；所有激活重算关闭。
 - AF3 学习率调度、max_lr=1e-4、warmup=10000 次优化器更新；默认从头训练。
 
-其余默认配置也关闭激活重算；原始 AtomMOF 代码与默认关闭 G1 的行为不变。
-命令行覆盖优先级更高：旧命令中的 `activation_checkpointing=true` 必须删除或改为 false。
-
-服务器新运行示例（先结束旧训练并确认 GPU 已释放，在原环境中执行）：
+在已激活环境的服务器上，新建运行目录：
 
 ~~~bash
 cd /data/ai4science/AtomMOF-G1 || exit 1
-git pull --ff-only origin main
 export PROJECT_ROOT=/data/ai4science/AtomMOF-G1
-export RUN_DIR="$PROJECT_ROOT/logs/train_bwdb_g1_small_stage1_shared_8gpu_$(date +%Y%m%d_%H%M%S)"
+export RUN_DIR="$PROJECT_ROOT/logs/train_bwdb_g1_small_stage1_8gpu_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN_DIR"
 set -o pipefail
 
@@ -518,98 +425,35 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -u src/train.py \
   2>&1 | tee "$RUN_DIR/train.log"
 ~~~
 
-关闭重算会增加保留的训练激活；共享条件会减少重复条件激活，两者合并后的 GPU 峰值显存需实测。
-本地 CPU 验证不能保证 batch 32 在服务器上的显存余量或恢复到每轮 3 分钟。
+本次清理后生成的 checkpoint 可按相同结构续训。清理前 checkpoint 中保存的
+share_condition/pair_mode 等已删除字段不再接受，也不自动迁移旧配置。
+修改磁盘代码不会改变已运行 Python 进程；本次本地清理不改变服务器上正在执行的实验。
 
-### 10.4 验证与性能边界
+## 11. 当前计算实现与性能验证
 
-几何/集成首轮验证 69 项通过。新增检查包括：共享条件只计算一次且四桥梯度求和一致、
-重复 forward 使用新计算图、共享参数去重、旧独立 checkpoint 的加载/错误模式、
-混合有效/超限/padding 批次的值和梯度、整样本回退、搜索只执行一次及候选不截断。
+### 条件原子对
 
-本地 CPU 几何微基准：PyTorch 2.6.0+cpu、单线程、FP32、无梯度，B=8、N=64、
-每样本 56 个有效原子，立方晶胞边长 1.4 nm；先预热，每项重复三次取中位数。
-旧参考为提交 8b8e551 的实际几何 encoder。混合批次将一半晶胞缩小到触发候选超限，
-全不可用批次将全部晶胞缩小到超限；E、rho 和 geometry_ok 均先做数值对照。
+只对同构件有效原子对计算 p(M,128)、原 pair MLP、128→64 投影和每头 bias，
+M 为各样本各构件原子数平方之和。只有 bias 散射回 (B,heads,N,N)；
+不构造完整的 128/64 通道原子对张量。QK/softmax 仍为稠密 N×N。
+这是当前唯一训练路径；dense 数学参考仅在 tests/reference_g1_condition.py，
+由数值测试和组件基准使用，训练与推理不导入该文件。
 
-| CPU 合成场景（仅几何前向） | 旧实现 | 新实现 |
-| --- | ---: | ---: |
-| 全部有效 | 970.33 ms | 21.30 ms |
-| 有效与超限混合 | 482.51 ms | 16.33 ms |
-| 全部超限 | 13.31 ms | 10.54 ms |
+### 几何与分组复用
 
-大幅改善与此用例的镜像填充、无候选原子对比例有关，不代表所有晶胞都会有同样收益。
-这不是 GPU/八卡训练基准，不能将该比例换算成整轮训练加速。
+geometry/planning.py 批量规划搜索边界，按本批实际最大候选数分配镜像槽。
+默认 pair_chunk_size=32768、image_chunk_size=524288，按镜像数同时限制分块规模；
+保留全部合法候选、125 候选上限和超限样本整条禁用几何的规则。
+这些是当前几何定义与资源控制，不是旧模型的兼容逻辑。
 
-提交前全仓库回归：**276 passed, 2 warnings in 69.15s**。
-两条警告来自微型 Lightning 测试的无验证集和少量 dataloader workers。
-两进程 Gloo DDP 在共享条件 + 关闭重算、共享条件 + 开启重算两种模式均连续优化两步通过，
-使用 find_unused_parameters=False，含一个 rank 的几何回退样本。
-原始 AtomMOF 源码未修改；关闭 G1 的初始化/状态/前向/梯度回归、训练与预测配置、
-严格 checkpoint 加载、实际 Flow 损失和采样均通过。格式与 git diff --check 检查通过。
-本版本尚未在服务器进行八卡性能、峰值显存或收敛/生成效果测量。
+G1Bridges.prepare 按 max_groups 复用 GroupLayout；它是 G1Context 的必需字段。
+缓存只存在于本次前向，不跨 batch 或优化器更新。
+geometry/groups.py 每桥提取一次 Z_kk、chi(Z_kk) 和 Q_kk，供组交互和读回共享；
+不同桥的 Z 不同，不能共享该描述。完整对称矩阵收缩和可微路径保留。
 
-## 11. 四项执行优化（2026-10-16）
+### 组件基准
 
-本节保持四桥、分组规则、参数共享、精度和模型参数不变。
-G1 small 总参数仍为 **40,525,216**。原始 AtomMOF 源码没有改动。
-
-### 11.1 四桥复用分组布局
-
-routing/groups.py 的 GroupLayout 保存有效组数和 group mask，由同一原子 mask
-和 max_groups 生成；G1Bridges.prepare 按分组容量只计算一次，写入每个 G1Context。
-路由继续按每处 H/t 重新计算 P/Pbar，不共享这些学习结果。
-避免每个桥分别读取 counts.max().item()；内部已知合法的 mask 不再重复触发
-normalize_assignments 的 GPU 布尔检查。公开自定义 mask 入口保留检查。
-布局只存在于本次前向上下文，不跨 batch 缓存；空样本组数仍为零。
-
-### 11.2 紧凑的条件原子对
-
-新增 condition_encoder.pair_mode=local（默认），dense 为原路径的对照/回退开关。
-只为同构件有效原子对计算原始 p、三层 pair MLP、128→64 投影以及每头 bias。
-保留 c 256→128、单层 Transformer 和原有全部参数。只有每头 bias 被散射回稠密形状。
-被 attention 永久屏蔽的跨构件原子对不再执行这些计算。
-完整 dense 特征 API 和外部 encode API 保留，原 attention 后端与公式保留。
-
-此优化不等于整层采用稀疏 attention：QK/softmax 仍为 N×N；
-紧凑 pair 的工作量为各构件原子数平方之和，压紧索引仍有一次批级同步。
-全 padding/单原子、mask、非连续构件编号和原子顺序语义保持一致。
-
-### 11.3 按镜像数设置几何块大小
-
-默认 pair_chunk_size=32768、image_chunk_size=524288。
-实际块大小由两者及本批已知 image_slots 共同决定，镜像少时合并更多原子对，
-镜像多时控制单块临时计算规模；不增加剩余显存查询或动态标量同步。
-保持所有候选、原子对、整样本超限回退和坐标/晶胞梯度，不改变 cutoff/max_images。
-固定旧块大小的对照可设置 pair_chunk_size=4096。
-这只是临时工作量预算，不能保证完整训练峰值显存。
-
-### 11.4 共享组内几何描述
-
-geometry/groups.py 在每个桥内一次提取 Z_kk、chi(Z_kk) 和对称 Q_kk，
-随后由组交互与原子读回引用同一可微对象。不同桥的 Z 不同，不能共用该对象。
-U、Z 的第二矩阵各自只展开一次，再供 scalarize_geometry 与交叉收缩复用。
-保留完整对称矩阵收缩，保留非对角项的双份贡献，不引入近似。
-独立 GroupInteraction/AtomReadback 入口仍可自行准备描述；特殊混合 dtype 会按需重算。
-共享图会改变浮点梯度累加顺序，比较采用数值容差，而非要求逐位相等。
-
-### 11.5 使用与计时
-
-新训练读取更新后的 YAML，上一版完整训练命令可以继续使用。若想明确固定执行选项，
-可在原命令中增加（这些键已存在，不加前缀 +）：
-
-~~~bash
-model.flow_model_args.g1.module.condition_encoder.pair_mode=local
-model.flow_model_args.g1.module.geometry.pair_chunk_size=32768
-model.flow_model_args.g1.module.geometry.image_chunk_size=524288
-~~~
-
-仅执行方式改变，40a5290 共享版本的模型参数键/形状和优化器参数顺序保持兼容。
-如果按旧 checkpoint 保存的配置构造模型，其显式 pair_chunk_size=4096 仍会生效；
-新建训练使用新 YAML。已运行的 Python 进程不会因 git pull 自动切换代码。
-
-新增 scripts/benchmark_g1_optimizations.py，单独比较条件 pair、几何分块、
-组内描述复用和四桥布局复用。与正式训练分开运行，例如：
+与正式训练分开运行：
 
 ~~~bash
 CUDA_VISIBLE_DEVICES=0 python scripts/benchmark_g1_optimizations.py \
@@ -618,31 +462,20 @@ CUDA_VISIBLE_DEVICES=0 python scripts/benchmark_g1_optimizations.py \
   --output logs/g1_component_benchmark.json
 ~~~
 
-脚本先核对输出，再预热并同步计时，报告单卡组件时间；不能直接换算成八卡 epoch 时间。
---backward 对可微组件同时测反向；几何的输入梯度测试比当前训练中无输入梯度的情形更重。
-整体训练速度仍需相同数据、batch、精度、预热和验证口径的服务器实测。
+脚本先核对输出，再预热并同步计时。它调用测试目录的数学参考进行对照，
+不会把参考路径注册到训练配置。组件时间不能直接换算成八卡 epoch 时间；
+完整训练需统一数据、batch、精度、预热和验证口径后测量。
 
-### 11.6 本地验证
+## 12. 历史记录
 
-全仓库回归：**295 passed, 2 warnings in 78.64s**。
-两条警告仍为微型 Lightning 测试的无验证集和少量 dataloader workers。
-覆盖非零权重下 local/dense 条件输出及全部参数/参考坐标梯度、两种 attention 后端、
-全 padding、激活重算、四桥布局复用与下一批更新、缓存/独立几何描述的梯度、
-候选不丢失的分块/镜像预算、baseline 关闭路径、训练/采样、checkpoint 与参数预算。
-两进程 Gloo DDP 使用 find_unused_parameters=False，重算开/关均连续优化两步通过。
-GPU 显存、CUDA 性能和完整八卡 epoch 耗时尚需服务器验证。
+历史实现、完整旧命令和当时的验证输出通过 Git 查询，不在当前文档中维护多套操作方案。
 
-CPU 组件微基准（PyTorch 2.6.0+cpu，单线程，FP32，B=4、N=64、
-每构件 8 原子；含可微组件反向，预热 5 次、20 次中位数）：
+| 提交 | 当时的变更 |
+| --- | --- |
+| 9a971b0 | 可选 G1 四桥接入训练与推理 |
+| 8b8e551 | 条件编码先降维，再经过一层 Transformer |
+| 40a5290 | 共享条件编码、批量周期几何、默认关闭重算 |
+| e41eb75 | 紧凑原子对、分组布局与组内描述复用、几何分块优化 |
 
-| 对照项 | 对照时间 | 优化时间 |
-| --- | ---: | ---: |
-| 条件编码：dense / local | 129.09 ms | 26.14 ms |
-| 几何：固定 4096 / 双限额分块 | 22.99 ms | 19.70 ms |
-| 组内描述：独立准备两次 / 共用一次 | 19.41 ms | 18.77 ms |
-| 四桥布局：独立准备四次 / 共用一次 | 0.191 ms | 0.055 ms |
-
-这些是合成组件对照，不是完整旧版/新版模型或 CUDA/DDP 性能对照。
-组内描述项目的首次 5 次短测为 20.26/22.19 ms，重复测量仅有小幅收益，
-说明这一项的 CPU 增益较小且受计时波动影响，不能承诺 GPU 提速。
-本轮仅消除明确的重复工作；优化前后真实 epoch 对照仍以服务器结果为准。
+2026-10-16 清理：只维护当前共享/紧凑方案，删除旧 G1 兼容入口，
+合并当前说明，并将 dense 数学参考移至测试目录。既有 Git 历史保留。

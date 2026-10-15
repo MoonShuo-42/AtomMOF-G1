@@ -5,11 +5,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..geometry import scalarize_geometry, unpack_second_moment
-from ..geometry.groups import (
-    GroupInternalGeometry,
-    extract_group_internal,
-    resolve_group_internal,
-)
+from ..geometry.groups import GroupInternalGeometry, resolve_group_internal
 from .utils import (
     available_geometry,
     compute_dtype,

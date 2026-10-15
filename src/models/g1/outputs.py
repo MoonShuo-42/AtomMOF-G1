@@ -23,7 +23,7 @@ class G1Context(NamedTuple):
     c_cond: Tensor  # (B,N,c_dim)
     geometry: GeometryOutput  # E, rho, geometry_ok
     atom_mask: Tensor  # (B,N), bool
-    group_layout: GroupLayout | None = None  # optional for legacy explicit contexts
+    group_layout: GroupLayout  # required layout prepared for this atom mask and group policy
 
 
 class G1Intermediates(NamedTuple):

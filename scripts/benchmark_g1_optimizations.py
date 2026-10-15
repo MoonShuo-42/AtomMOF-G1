@@ -13,8 +13,10 @@ from copy import deepcopy
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 
 import torch
+from reference_g1_condition import dense_condition_reference
 
 from src.models.g1.conditioning import ConditionEncoder
 from src.models.g1.geometry import PeriodicGeometry
@@ -114,10 +116,15 @@ def main():
         }
         print(name + ": " + json.dumps(records[name]), flush=True)
 
-    local = ConditionEncoder(pair_mode="local").to(device)
+    local = ConditionEncoder().to(device)
     dense = deepcopy(local)
-    dense.pair_mode = "dense"
-    compare("condition_pairs", lambda: dense(feats), lambda: local(feats), dense, local)
+    compare(
+        "condition_pairs",
+        lambda: dense_condition_reference(dense, feats),
+        lambda: local(feats),
+        dense,
+        local,
+    )
     del dense, local
 
     x = torch.rand(B, N, 3, device=device).requires_grad_(args.backward)
@@ -139,7 +146,10 @@ def main():
     Z = (torch.randn(B, K, K, 16, device=device) * 0.1).requires_grad_(args.backward)
     U = (torch.randn(B, N, K, 16, device=device) * 0.1).requires_grad_(args.backward)
     groups = torch.ones(B, K, dtype=torch.bool, device=device)
-    group_features, readback_features = GroupGeometryFeatures(), ReadbackGeometryFeatures()
+    group_features, readback_features = (
+        GroupGeometryFeatures(),
+        ReadbackGeometryFeatures(),
+    )
 
     def descriptors(shared):
         internal = prepare_group_internal(Z, groups) if shared else None

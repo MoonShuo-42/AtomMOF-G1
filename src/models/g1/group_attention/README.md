@@ -187,8 +187,7 @@ python -m pytest tests/test_group_attention.py -q
 python -m pytest tests -q
 ~~~
 
-2026-10-15，本地 PyTorch 2.6.0+cpu：新增组交互测试 35 项通过；
-全仓库 175 项测试通过（175 passed in 31.42s）。
+历史测试结果保留在 Git 对应提交中；当前验证状态统一见 [G1 总文档](../README.md#7-验证与实验状态)。
 
 验证覆盖手算内容池化与注意力、37 通道的独立 NumPy 核对、Q 非对角项计数、
 来源/目标顺序、缩放因子、几何偏置实际影响输出、残差/FFN、动态 mask、
@@ -205,4 +204,4 @@ python -m pytest tests -q
 六模块统一封装与调用方式见 [G1Module](../README.md)。
 
 
-当前主干接入、开关、checkpoint 兼容性与 263 项全仓库测试记录见 [G1 总文档第 8 节](../README.md#8-atommof-主干接入与开关)。
+当前主干接入、训练命令和验证状态见 [G1 总文档](../README.md)。

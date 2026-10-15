@@ -41,7 +41,6 @@ model:
     g1:
       enabled: true
       insert_after: [6, 12, 18, 24]
-      share_condition: true
       share_geometry: true
       activation_checkpointing: false
       module:

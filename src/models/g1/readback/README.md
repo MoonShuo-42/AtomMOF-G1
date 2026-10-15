@@ -12,7 +12,7 @@ P、S_plus、U、Z 必须来自同一份分组。本模块不自动验证这一�
 
 | 文件 / 对象 | 职责 | 可独立修改的部分 |
 | --- | --- | --- |
-| geometry.py / extract_group_internal | 提取 Z 的组轴对角线 Z_kk | 组内几何的来源 |
+| ../geometry/groups.py / extract_group_internal | 提取 Z 的组轴对角线 Z_kk | 组内几何的来源 |
 | geometry.py / ReadbackGeometryFeatures | U 与 Z_kk 转成 24 维不变标量 | 描述定义，纯数学计算 |
 | geometry.py / ReadbackGeometryBias | 24→32→4 的 SiLU MLP | 几何偏置网络 |
 | attention.py / ReadbackAttention | Query/Key、几何偏置、log P、softmax | 读取权重 |
@@ -72,7 +72,7 @@ Query/Key 投影不带 bias。这里使用 routes.P，即每个原子分配到�
 接口接收组在前的 P (B,K,N)，与 Router 的实际返回格式一致；图中 P_ik 的排列为 (B,N,K)。
 若传入 routes.P_nk，需要先转置回 (B,K,N)。当 N=K 时形状本身无法辨别转置错误。
 有效位置的 P 必须有限且非负；此处不会重新归一化或检查其和是否等于 1。
-该有限性检查会触发设备同步，GPU 性能尚未实测。
+该有限性检查会触发设备同步；本模块单独的 GPU 耗时尚无测量记录。
 
 eps_pool 默认 1e-8，应与 Router 一致。
 P=0 的有效组仍有 eps 级先验，可通过其他项获得权重；只有 group_mask 执行硬屏蔽。
@@ -200,7 +200,7 @@ python -m pytest tests/test_atom_readback.py -q
 python -m pytest tests -q
 ~~~
 
-2026-10-15，本地 PyTorch 2.6.0+cpu：原子读回测试 40 项通过；全仓库 215 项通过（215 passed in 29.16s）。
+历史测试结果保留在 Git 对应提交中；当前验证状态统一见 [G1 总文档](../README.md#7-验证与实验状态)。
 测试覆盖 24 通道 NumPy 独立核对、Z 对角选择、非对角 Q 计数、log P、各头轴与缩放、
 408→128→128 value 等价性、手算加权汇总、残差、动态 mask、几何不可用、NaN/Inf padding、
 原子/组置换、共同旋转、半精度/CPU autocast、有限差分梯度，
@@ -212,4 +212,4 @@ CPU 数值检查不代表 GPU 性能或训练效果。
 六模块统一封装与调用方式见 [G1Module](../README.md)。
 
 
-当前主干接入、开关、checkpoint 兼容性与 263 项全仓库测试记录见 [G1 总文档第 8 节](../README.md#8-atommof-主干接入与开关)。
+当前主干接入、训练命令和验证状态见 [G1 总文档](../README.md)。

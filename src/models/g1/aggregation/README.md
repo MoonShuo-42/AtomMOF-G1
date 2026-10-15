@@ -107,8 +107,7 @@ python -m pytest tests/test_geometry_aggregation.py -q
 python -m pytest tests -q
 ~~~
 
-2026-10-15，本地 PyTorch 2.6.0+cpu：新增几何汇总测试 28 项通过；
-全仓库 140 项测试通过（140 passed in 33.85s）。
+历史测试结果保留在 Git 对应提交中；当前验证状态统一见 [G1 总文档](../README.md#7-验证与实验状态)。
 
 验证覆盖独立双重求和、手算 U 不同但 Z 相同的例子、方向和对角线保留、
 Pbar 缩放对 U/Z 的一次/二次作用、动态组 mask、NaN/Inf padding、
@@ -123,4 +122,4 @@ Pbar 缩放对 U/Z 的一次/二次作用、动态组 mask、NaN/Inf padding、
 六模块统一封装与调用方式见 [G1Module](../README.md)。
 
 
-当前主干接入、开关、checkpoint 兼容性与 263 项全仓库测试记录见 [G1 总文档第 8 节](../README.md#8-atommof-主干接入与开关)。
+当前主干接入、训练命令和验证状态见 [G1 总文档](../README.md)。

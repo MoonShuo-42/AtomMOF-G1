@@ -1,11 +1,7 @@
 """Modular G1 atom readback from group content and periodic geometry."""
 
 from .attention import ReadbackAttention
-from .geometry import (
-    ReadbackGeometryBias,
-    ReadbackGeometryFeatures,
-    extract_group_internal,
-)
+from .geometry import ReadbackGeometryBias, ReadbackGeometryFeatures
 from .projection import AtomResidualOutput, AtomResidualUpdate
 from .readback import AtomReadback, AtomReadbackOutput
 from .reduction import WeightedReadback
@@ -17,7 +13,6 @@ __all__ = [
     "ReadbackAttention",
     "ReadbackGeometryFeatures",
     "ReadbackGeometryBias",
-    "extract_group_internal",
     "RelationConditionedValue",
     "WeightedReadback",
     "AtomResidualUpdate",

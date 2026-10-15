@@ -482,7 +482,7 @@ If you find our work useful, please consider citing the following:
 ## Optional G1 bridges
 
 The G1 extension is **disabled by default**. Enable it in an existing training command with
-`model.flow_model_args.g1.enabled=true`. Four independent bridges run after trunk DiT layers
+`model.flow_model_args.g1.enabled=true`. Four bridges share one condition encoder and run after trunk DiT layers
 6, 12, 18, and 24; backbone dimensions remain controlled by the existing model configuration.
 The configuration is in `configs/g1/bridges.yaml`.
 
@@ -497,11 +497,16 @@ for configuration, checkpoint initialization/resume, context reuse, and validati
 For the shared-condition G1 small stage-1 setup, use `experiment=g1_small_stage1`.
 It aligns the per-GPU batch cap (32), accumulation (2), and FP32 settings with small,
 shares one condition encoder across four bridges, and disables all activation
-checkpointing. See the [G1 performance/configuration notes](src/models/g1/README.md#10-共享条件批量几何与关闭重算2026-10-16)
-for the full server command, checkpoint compatibility, and validation limits.
+checkpointing. See the [G1 performance/configuration notes](src/models/g1/README.md#10-阶段一训练配置)
+for the current server command and validation limits. Only the current G1 architecture is maintained;
+legacy G1 configurations are not restored or automatically migrated.
 
 The latest G1 execution optimizations compact within-block condition pairs, reuse
 per-batch group layouts and per-bridge geometry descriptors, and adapt geometry
 chunks to the image count. Parameter shapes and the baseline path are unchanged.
-See [G1 execution optimizations](src/models/g1/README.md#11-四项执行优化2026-10-16)
+See [G1 execution optimizations](src/models/g1/README.md#11-当前计算实现与性能验证)
 and the CPU/CUDA component benchmark in scripts/benchmark_g1_optimizations.py.
+
+Condition sharing and compact pairs are now unconditional: remove the former
+share_condition and condition_encoder.pair_mode overrides from training commands.
+Dense mathematical references live only in tests/reference_g1_condition.py.

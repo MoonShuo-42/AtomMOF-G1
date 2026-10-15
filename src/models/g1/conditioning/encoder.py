@@ -8,7 +8,7 @@ from torch.utils.checkpoint import checkpoint
 
 from src.models.simple.transformers import Mlp
 
-from .attention import BlockPairAttention, block_attention_mask
+from .attention import BlockPairAttention
 from .features import AtomConditionFeatures
 from .pairs import local_pair_layout
 
@@ -61,7 +61,7 @@ class StaticConditionBlock(nn.Module):
         p: Tensor,
         atom_mask: Tensor,
         allowed_pairs: Tensor,
-        pair_indices: Tensor | None = None,
+        pair_indices: Tensor,
     ) -> Tensor:
         """Update atom features using static pair bias and ordinary residuals."""
         x = x + self.attn(self.norm1(x), atom_mask, p, allowed_pairs, pair_indices)
@@ -78,10 +78,8 @@ class ConditionEncoder(nn.Module):
     Set output_dim=None to retain hidden_dim channels. Raw feature widths and
     internal Transformer widths can be configured independently.
 
-    forward(feats) computes only valid within-block pairs by default. Pair MLP
+    forward(feats) computes only valid within-block pairs. Pair MLP
     and pair projection remain compact; attention still uses dense per-head bias.
-    pair_mode="dense" retains the reference path. encode(c,p,mask,block_index)
-    continues to accept externally computed dense original c/p.
     No noise, lattice, time, positional index embedding, or target is read.
     Parameters are newly initialized, not automatically loaded from small.ckpt.
     """
@@ -100,7 +98,6 @@ class ConditionEncoder(nn.Module):
         *,
         hidden_dim: int = 128,
         pair_dim: int = 64,
-        pair_mode: Literal["local", "dense"] = "local",
     ):
         super().__init__()
         if atom_s <= 0 or atom_z <= 0 or hidden_dim <= 0 or pair_dim <= 0:
@@ -111,9 +108,6 @@ class ConditionEncoder(nn.Module):
             raise ValueError("depth and MLP hidden width must be positive")
         if output_dim is not None and output_dim <= 0:
             raise ValueError("output_dim must be positive or None")
-        if pair_mode not in ("local", "dense"):
-            raise ValueError("pair_mode must be local or dense")
-        self.pair_mode = pair_mode
         self.atom_s = atom_s
         self.atom_z = atom_z
         self.hidden_dim = hidden_dim
@@ -146,26 +140,26 @@ class ConditionEncoder(nn.Module):
             else nn.Linear(hidden_dim, self.output_dim, bias=False)
         )
 
-    def encode(self, c: Tensor, p: Tensor, atom_mask: Tensor, block_index: Tensor) -> Tensor:
-        """Project raw c/p before static blocks; return (B,N,output_dim) conditions."""
-        atom_mask = atom_mask.bool()
-        allowed_pairs = block_attention_mask(atom_mask, block_index)
-        return self._encode(c, p, atom_mask, allowed_pairs)
-
     def _encode(
         self,
         c: Tensor,
         p: Tensor,
         atom_mask: Tensor,
         allowed_pairs: Tensor,
-        pair_indices: Tensor | None = None,
+        pair_indices: Tensor,
     ) -> Tensor:
         x = self.single_projection(c.masked_fill(~atom_mask.unsqueeze(-1), 0))
         p = self.pair_projection(p)
         for block in self.blocks:
             if self.activation_checkpointing and self.training and torch.is_grad_enabled():
                 x = checkpoint(
-                    block, x, p, atom_mask, allowed_pairs, pair_indices, use_reentrant=False
+                    block,
+                    x,
+                    p,
+                    atom_mask,
+                    allowed_pairs,
+                    pair_indices,
+                    use_reentrant=False,
                 )
             else:
                 x = block(x, p, atom_mask, allowed_pairs, pair_indices)
@@ -173,10 +167,7 @@ class ConditionEncoder(nn.Module):
 
     def forward(self, feats: Mapping[str, Tensor]) -> Tensor:
         """Read only original chemical/reference features; preserve atom ordering."""
-        if self.pair_mode == "dense":
-            c, p = self.features(feats)
-            return self.encode(c, p, feats["atom_pad_mask"], feats["block_index"])
         mask = feats["atom_pad_mask"].bool()
         layout = local_pair_layout(mask, feats["block_index"])
-        c, p = self.features.local_features(feats, layout.indices)
+        c, p = self.features(feats, layout.indices)
         return self._encode(c, p, mask, layout.allowed, layout.indices)

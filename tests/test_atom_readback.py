@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 
 from src.models.g1.aggregation import GeometryAggregator
 from src.models.g1.geometry import PeriodicGeometry, unpack_second_moment
+from src.models.g1.geometry.groups import extract_group_internal
 from src.models.g1.group_attention import GroupInteraction
 from src.models.g1.readback import (
     AtomReadback,
@@ -21,7 +22,6 @@ from src.models.g1.readback import (
     ReadbackGeometryFeatures,
     RelationConditionedValue,
     WeightedReadback,
-    extract_group_internal,
 )
 from src.models.g1.routing import AtomCountGroups, SoftRouter
 
@@ -73,7 +73,11 @@ def numpy_descriptor(U, Z):
                 v, Q = pair[6:9], numpy_matrix(pair[9:15])
                 Qk = numpy_matrix(internal[9:15])
                 result[b, i, k] = np.concatenate(
-                    (numpy_chi(pair), numpy_chi(internal), [v @ Qk @ v, np.trace(Q @ Qk)])
+                    (
+                        numpy_chi(pair),
+                        numpy_chi(internal),
+                        [v @ Qk @ v, np.trace(Q @ Qk)],
+                    )
                 )
     return torch.from_numpy(result)
 
@@ -174,7 +178,8 @@ def test_pair_value_equals_concatenated_408_128_128_MLP():
     a, g = torch.ones(1, 2), torch.ones(1, 3)
     result = value(H, S, zeta, a, g)
     raw = torch.cat(
-        (H[:, :, None].expand(-1, -1, 3, -1), S[:, None].expand(-1, 2, -1, -1), zeta), -1
+        (H[:, :, None].expand(-1, -1, 3, -1), S[:, None].expand(-1, 2, -1, -1), zeta),
+        -1,
     )
     weight = torch.cat(
         (
@@ -256,13 +261,14 @@ def test_unavailable_geometry_retains_content_attention_and_masks_geometry_gradi
         assert torch.isfinite(data[key].grad).all() and data[key].grad.abs().sum() > 0
     assert model.value.geometry_projection.weight.grad.count_nonzero() == 0
     assert all(
-        p.grad is not None and p.grad.count_nonzero() == 0
-        for p in model.geometry_bias.parameters()
+        p.grad is not None and p.grad.count_nonzero() == 0 for p in model.geometry_bias.parameters()
     )
 
 
 @pytest.mark.parametrize("poison", [float("nan"), float("inf")])
-def test_dynamic_mixed_groups_and_padding_remain_finite_with_zero_padded_gradients(poison):
+def test_dynamic_mixed_groups_and_padding_remain_finite_with_zero_padded_gradients(
+    poison,
+):
     data = inputs(batch=4, atoms=40, groups=32)
     atoms = torch.arange(40)[None] < torch.tensor([3, 40, 0, 1])[:, None]
     groups = AtomCountGroups()(atoms)
@@ -425,7 +431,12 @@ def test_full_readback_input_gradients_match_finite_differences():
 
     def forward(*tensors):
         result = model(**{**data, **dict(zip(keys, tensors))})
-        return result.readback, result.H_updated, result.geometry_bias, result.attention_weights
+        return (
+            result.readback,
+            result.H_updated,
+            result.geometry_bias,
+            result.attention_weights,
+        )
 
     assert torch.autograd.gradcheck(forward, tuple(data[key] for key in keys), fast_mode=True)
 
@@ -513,7 +524,8 @@ def test_real_full_condition_geometry_router_group_and_readback_chain_backpropag
     geometry, router = PeriodicGeometry(), SoftRouter()
     aggregate, interact = GeometryAggregator(), GroupInteraction()
     x = torch.tensor(
-        [[[0.1, 0.1, 0.1], [0.9, 0.2, 0.1], [0.45, 0.35, 0.25], [0, 0, 0.0]]], requires_grad=True
+        [[[0.1, 0.1, 0.1], [0.9, 0.2, 0.1], [0.45, 0.35, 0.25], [0, 0, 0.0]]],
+        requires_grad=True,
     )
     lattice = torch.tensor([[1, 1, 1, math.pi / 2, math.pi / 2, math.pi / 2]], requires_grad=True)
     H = torch.randn(1, 4, 256, requires_grad=True)
@@ -533,7 +545,12 @@ def test_real_full_condition_geometry_router_group_and_readback_chain_backpropag
         routes.group_mask,
         geo.geometry_ok,
     )
-    assert result.readback.shape == (1, 4, 128) and result.geometry_bias.shape == (1, 4, 3, 4)
+    assert result.readback.shape == (1, 4, 128) and result.geometry_bias.shape == (
+        1,
+        4,
+        3,
+        4,
+    )
     assert result.H_updated.shape == (1, 4, 256)
     assert result.attention_weights.shape == (1, 4, 4, 3)
     loss_from(result).backward()
@@ -576,7 +593,10 @@ def test_cached_internal_geometry_matches_independent_descriptors_and_gradients(
     data["U"][0, -1] = float("nan")
     data["U"][1] = float("nan")
     Z, U = data["Z"].requires_grad_(), data["U"].requires_grad_()
-    ref_Z, ref_U = Z.detach().clone().requires_grad_(), U.detach().clone().requires_grad_()
+    ref_Z, ref_U = (
+        Z.detach().clone().requires_grad_(),
+        U.detach().clone().requires_grad_(),
+    )
     mask, groups = data["atom_mask"], data["group_mask"]
     internal = prepare_group_internal(Z, groups, available)
     attention, readback = GroupGeometryFeatures(), ReadbackGeometryFeatures()

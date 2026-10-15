@@ -7,10 +7,12 @@ import pytest
 import torch
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
+from reference_g1_condition import dense_condition_reference
 
 from src.models.g1.conditioning import AtomConditionFeatures, ConditionEncoder
 from src.models.g1.conditioning.attention import block_attention_mask
 from src.models.g1.conditioning.encoder import StaticConditionBlock
+from src.models.g1.conditioning.pairs import local_pair_layout
 from src.models.simple.layers import AtomAttentionEncoder
 from src.models.simple.transformers import DiTBlock
 
@@ -56,7 +58,14 @@ def make_encoder(**kwargs):
     """Construct a small but real encoder for forward/backward checks."""
     torch.manual_seed(17)
     return ConditionEncoder(
-        atom_s=16, atom_z=8, hidden_dim=8, pair_dim=4, output_dim=12, depth=1, heads=4, **kwargs
+        atom_s=16,
+        atom_z=8,
+        hidden_dim=8,
+        pair_dim=4,
+        output_dim=12,
+        depth=1,
+        heads=4,
+        **kwargs,
     )
 
 
@@ -90,11 +99,13 @@ def test_features_match_original_atom_encoder():
         with torch.no_grad():
             # Zero states bypass the original bias-free noisy-state projections.
             original(torch.zeros(1, 7, 3), torch.zeros(1, 6), torch.ones(1), feats)
-            c, p = features(feats)
+            layout = local_pair_layout(feats["atom_pad_mask"], feats["block_index"])
+            c, p = features(feats, layout.indices)
     finally:
         hook.remove()
     torch.testing.assert_close(c, captured["c"], rtol=0, atol=0)
-    torch.testing.assert_close(p, captured["p"], rtol=0, atol=0)
+    expected_p = captured["p"].reshape(-1, 8)[layout.indices]
+    torch.testing.assert_close(p, expected_p, rtol=1e-5, atol=1e-6)
 
 
 def test_static_block_matches_dit_with_identity_modulation():
@@ -112,7 +123,8 @@ def test_static_block_matches_dit_with_identity_modulation():
     pair_before = pair.clone()
     mask = torch.ones(2, 4, dtype=torch.bool)
     allowed = block_attention_mask(mask, torch.zeros(2, 4, dtype=torch.long))
-    actual = static(x, pair, mask, allowed)
+    indices = torch.arange(2 * 4 * 4)
+    actual = static(x, pair.reshape(-1, 8), mask, allowed, indices)
     expected = original(x, torch.randn(2, 16), mask, pair)
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(pair, pair_before, rtol=0, atol=0)
@@ -260,16 +272,11 @@ def test_activation_checkpointing_preserves_parameter_gradients():
         torch.testing.assert_close(left.grad, right.grad, rtol=0, atol=0, msg=name)
 
 
-def test_external_feature_entrypoint_and_optional_output_projection():
-    """External raw c/p follow the same pre-projections as internally built features."""
+def test_optional_output_projection():
     encoder = ConditionEncoder(
         atom_s=16, atom_z=8, hidden_dim=8, pair_dim=4, output_dim=None, heads=4
     )
-    feats = make_feats()
-    c, p = encoder.features(feats)
-    from_external = encoder.encode(c, p, feats["atom_pad_mask"], feats["block_index"])
-    torch.testing.assert_close(encoder(feats), from_external, rtol=0, atol=0)
-    assert from_external.shape == (1, 7, 8)
+    assert encoder(make_feats()).shape == (1, 7, 8)
     assert isinstance(encoder.output_projection, torch.nn.Identity)
 
 
@@ -286,8 +293,9 @@ def test_standalone_configuration_builds_small_encoder():
     direct = ConditionEncoder()
     direct.load_state_dict(encoder.state_dict(), strict=True)
     feats = make_feats()
-    c, p = encoder.features(feats)
-    assert c.shape == (1, 7, 256) and p.shape == (1, 7, 7, 128)
+    layout = local_pair_layout(feats["atom_pad_mask"], feats["block_index"])
+    c, p = encoder.features(feats, layout.indices)
+    assert c.shape == (1, 7, 256) and p.shape == (20, 128)
     captured = []
     hook = encoder.blocks[0].register_forward_pre_hook(
         lambda module, args: captured.append((args[0].shape, args[1].shape))
@@ -296,7 +304,6 @@ def test_standalone_configuration_builds_small_encoder():
         output = encoder(feats)
     finally:
         hook.remove()
-    assert encoder.pair_mode == "local"
     # Four atoms in one block and two in the other: 4**2 + 2**2 pairs.
     assert captured == [(torch.Size([1, 7, 128]), torch.Size([20, 64]))]
     torch.testing.assert_close(output, direct(feats), rtol=0, atol=0)
@@ -337,7 +344,6 @@ def test_compact_pairs_match_trained_dense_values_and_all_gradients(backend, emp
         for parameter in local.parameters():
             parameter.uniform_(-0.25, 0.25)
     dense = deepcopy(local)
-    dense.pair_mode = "dense"
     assert local.state_dict().keys() == dense.state_dict().keys()
     feats = {k: v.repeat(2, *([1] * (v.ndim - 1))) for k, v in make_feats().items()}
     for key in ("ref_pos", "ref_charge"):
@@ -352,7 +358,7 @@ def test_compact_pairs_match_trained_dense_values_and_all_gradients(backend, emp
     handle = local.features.p_mlp.register_forward_pre_hook(
         lambda m, a: observed.append(a[0].shape)
     )
-    actual, expected = local(feats), dense(other)
+    actual, expected = local(feats), dense_condition_reference(dense, other)
     handle.remove()
     allowed = (
         feats["atom_pad_mask"].bool()[:, :, None]
@@ -370,8 +376,3 @@ def test_compact_pairs_match_trained_dense_values_and_all_gradients(backend, emp
         assert p.grad is not None and q.grad is not None, name
         assert torch.isfinite(p.grad).all(), name
         torch.testing.assert_close(p.grad, q.grad, atol=atol, rtol=rtol, msg=name)
-
-
-def test_invalid_condition_pair_mode_fails():
-    with pytest.raises(ValueError, match="pair_mode"):
-        ConditionEncoder(pair_mode="unsupported")

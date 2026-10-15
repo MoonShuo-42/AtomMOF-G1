@@ -4,6 +4,7 @@ import torch
 from torch import Tensor, nn
 
 from .outputs import G1Context
+from .routing.groups import GroupLayout
 
 
 def require_module(name: str, module: nn.Module | None) -> None:
@@ -21,7 +22,11 @@ def validate_components(condition_encoder, router, group_interaction, readback) 
         (query.rho_dim, 11, "router rho_dim / periodic geometry rho"),
         (query.h_dim, pool.h_dim, "router / group interaction h_dim"),
         (query.h_dim, attention.h_dim, "router / readback h_dim"),
-        (pool.value_projection.out_features, attention.group_dim, "S_plus / readback group_dim"),
+        (
+            pool.value_projection.out_features,
+            attention.group_dim,
+            "S_plus / readback group_dim",
+        ),
         (router.pool_eps, attention.pool_eps, "router / readback pool_eps"),
     )
     for source, target, description in checks:
@@ -49,6 +54,8 @@ def validate_context(H: Tensor, t: Tensor, context: G1Context, h_dim: int, c_dim
         raise TypeError(
             "context must be a G1Context from prepare or an explicit compatible context"
         )
+    if not isinstance(context.group_layout, GroupLayout):
+        raise TypeError("context.group_layout must be a prepared GroupLayout")
     mask = validate_mask(context.atom_mask)
     batch, atoms = mask.shape
     if H.shape != (batch, atoms, h_dim):

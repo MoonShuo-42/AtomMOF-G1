@@ -41,7 +41,7 @@ class BlockPairAttention(AttentionPairBias):
         mask: Tensor,
         z: Tensor,
         allowed_pairs: Tensor,
-        pair_indices: Tensor | None = None,
+        pair_indices: Tensor,
     ) -> Tensor:
         """Attend within blocks and return exactly zero at padded query rows."""
         batch_size, num_atoms, _ = s.shape
@@ -52,18 +52,13 @@ class BlockPairAttention(AttentionPairBias):
         gate = self.proj_g(s).sigmoid()
 
         # Mask AFTER adding pair bias: zeroing z would not mask the QK term.
-        if pair_indices is None:
-            bias = self.proj_z(z)
-        else:
-            # LayerNorm/projection are pointwise over pairs. Scatter only H channels,
-            # never a dense (B,N,N,64/128) tensor. Padding diagonal bias can be zero:
-            # a padded query reads only itself and its output is discarded.
-            compact_bias = self.proj_z(z)  # (num_local_pairs, heads)
-            flat_bias = compact_bias.new_zeros(
-                (batch_size * num_atoms * num_atoms, self.num_heads)
-            )
-            bias = flat_bias.index_copy(0, pair_indices, compact_bias)
-            bias = bias.view(batch_size, num_atoms, num_atoms, self.num_heads).permute(0, 3, 1, 2)
+        # LayerNorm/projection are pointwise over pairs. Scatter only H channels,
+        # never a dense (B,N,N,64/128) tensor. Padding diagonal bias can be zero:
+        # a padded query reads only itself and its output is discarded.
+        compact_bias = self.proj_z(z)  # (num_local_pairs, heads)
+        flat_bias = compact_bias.new_zeros((batch_size * num_atoms * num_atoms, self.num_heads))
+        bias = flat_bias.index_copy(0, pair_indices, compact_bias)
+        bias = bias.view(batch_size, num_atoms, num_atoms, self.num_heads).permute(0, 3, 1, 2)
         attn_bias = bias.masked_fill(~allowed_pairs[:, None], float("-inf"))
         output = self.attention_fn(q, k, v, attn_bias.contiguous())
         output = output.reshape(batch_size, num_atoms, self.c_s)

@@ -11,4 +11,3 @@ mlp_ratio: 4.0
 dropout: 0.0
 attention_impl: pytorch
 activation_checkpointing: false
-pair_mode: local  # compact same-block pairs; dense is the reference/fallback path
