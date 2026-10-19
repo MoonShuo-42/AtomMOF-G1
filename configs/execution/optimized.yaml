@@ -13,6 +13,12 @@ model:
   flow_model_args:
     execution:
       pair_norm_reuse: true
+      pair_cast_reuse: true
+      broadcast_masks: true
+      defer_validation: true
+      prepared_layouts: true
+      cache_sampling_conditions: true
+      low_precision_pairs: false
       fused_qkvg: true
       native_sdpa: true
       sdpa_backend: auto
@@ -28,5 +34,7 @@ model:
   training_args:
     fused_adam: true
 data:
+  compact_batch: true
+  prepare_g1_metadata: ${model.flow_model_args.g1.enabled}
   persistent_workers: true
   prefetch_factor: 2

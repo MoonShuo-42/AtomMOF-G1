@@ -14,6 +14,11 @@ from src.models.simple.flow import FlowModule
 from src.models.simple.transformers import DiT
 
 MATH = dict(
+    pair_cast_reuse=True,
+    broadcast_masks=True,
+    defer_validation=True,
+    prepared_layouts=True,
+    cache_sampling_conditions=True,
     pair_norm_reuse=True,
     fused_qkvg=True,
     fold_readback=True,
@@ -339,6 +344,9 @@ def _optimized_ddp_worker(rank, init_file):
         optimizer = torch.optim.AdamW(wrapped.parameters(), lr=1e-4)
         for step in range(2):
             data = inputs()
+            from src.data.execution_features import prepare_execution_layouts
+
+            prepare_execution_layouts(data["feats"])
             if rank == 1:
                 data["l_noisy"][0, 0] = -1
             optimizer.zero_grad(set_to_none=True)

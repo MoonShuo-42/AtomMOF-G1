@@ -1,4 +1,6 @@
 from pathlib import Path
+from functools import partial
+from src.data.execution_features import prepare_execution_layouts
 from typing import List, Optional, Dict
 
 import torch
@@ -14,7 +16,7 @@ from src.data.sampler import DynamicBatchSampler, OverfitSampler
 from src.data.prior.prior_sampler import PriorSampler
 
 
-def collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
+def collate_fn(batch: List[Dict[str, Tensor]], *, compact_batch=False, prepare_g1_metadata=False) -> Dict[str, Tensor]:
     """
     Collates a batch of featurized Structure dictionaries for a Transformer.
     """
@@ -24,13 +26,13 @@ def collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
     # Define key types
     atom_keys_N = ['ref_element', 'ref_charge', 'ref_chirality', 'block_index', 'block_type']
     atom_keys_ND = ['ref_pos', 'cart_coords', 'frac_coords', 'cart_coords_0']
-    atom_keys_NN = ['atom_to_token', 'token_to_rep_atom']
+    atom_keys_NN = [] if compact_batch else ['atom_to_token', 'token_to_rep_atom']
     structure_keys = ['lattice', 'cell', 'lattice_0']
     
     # Define all output keys
     all_output_keys = (
         atom_keys_N + atom_keys_ND + atom_keys_NN + structure_keys +
-        ['atom_pad_mask', 'bond_indices', 'bond_types']
+        ['atom_pad_mask', 'bond_types'] + ([] if compact_batch else ['bond_indices'])
     )
     collated = {key: [] for key in all_output_keys}
 
@@ -47,20 +49,23 @@ def collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         collated['atom_pad_mask'].append(atom_pad_mask)
 
         ##### Create bond matrices #####
-        bond_indices_matrix = torch.zeros((max_atoms, max_atoms), dtype=torch.long)
+        if not compact_batch:
+            bond_indices_matrix = torch.zeros((max_atoms, max_atoms), dtype=torch.long)
         bond_types_matrix = torch.zeros((max_atoms, max_atoms), dtype=torch.long)
         
         indices = data['bond_indices']
         types = data['bond_types']
         
         if types.shape[0] > 0:
-            bond_indices_matrix[indices[0], indices[1]] = 1
-            bond_indices_matrix[indices[1], indices[0]] = 1  # Symmetric
+            if not compact_batch:
+                bond_indices_matrix[indices[0], indices[1]] = 1
+                bond_indices_matrix[indices[1], indices[0]] = 1  # Symmetric
             
             bond_types_matrix[indices[0], indices[1]] = types
             bond_types_matrix[indices[1], indices[0]] = types  # Symmetric
         
-        collated['bond_indices'].append(bond_indices_matrix)
+        if not compact_batch:
+            collated['bond_indices'].append(bond_indices_matrix)
         collated['bond_types'].append(bond_types_matrix)
 
         ##### Pad atom features: (N, ...) -> (max_N, ...) #####
@@ -89,7 +94,7 @@ def collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         if tensor_list: # Only stack if the key was present in at least one item
             final_batch[key] = torch.stack(tensor_list, dim=0)
 
-    return final_batch
+    return prepare_execution_layouts(final_batch) if prepare_g1_metadata else final_batch
 
 
 class BWDBDataModule(LightningDataModule):
@@ -107,6 +112,8 @@ class BWDBDataModule(LightningDataModule):
         prefetch_factor: int = 2,
         pin_memory: bool = True,
         persistent_workers: bool = False,
+        compact_batch: bool = False,
+        prepare_g1_metadata: bool = False,
         sampler: Optional[str] = None,
         dynamic: Optional[Dict] = None,
         predict_split: str = 'val',
@@ -124,6 +131,8 @@ class BWDBDataModule(LightningDataModule):
         self.prefetch_factor = prefetch_factor
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers
+        self.compact_batch = compact_batch
+        self.prepare_g1_metadata = prepare_g1_metadata
         self.sampler = sampler
         self.dynamic = dynamic
         self.predict_split = predict_split
@@ -148,6 +157,7 @@ class BWDBDataModule(LightningDataModule):
                 self._datasets[split] = BWDBDataset(
                     lmdb_path=lmdb_path,
                     featurizer=self.featurizer,
+                    compact_batch=self.compact_batch,
                     prior_sampler=self.prior_sampler,
                     sample_limit=sample_limit,
                     max_num_atoms=self.max_num_atoms,
@@ -164,6 +174,7 @@ class BWDBDataModule(LightningDataModule):
                 self._datasets['predict'] = BWDBDataset(
                     lmdb_path=lmdb_path,
                     featurizer=self.featurizer,
+                    compact_batch=self.compact_batch,
                     sample_limit=sample_limit,
                     max_num_atoms=self.max_num_atoms,
                 )
@@ -217,7 +228,7 @@ class BWDBDataModule(LightningDataModule):
             batch_size=batch_size if batch_sampler is None else 1,
             sampler=sampler,
             batch_sampler=batch_sampler,
-            collate_fn=collate_fn,
+            collate_fn=partial(collate_fn, compact_batch=self.compact_batch, prepare_g1_metadata=self.prepare_g1_metadata),
             shuffle=is_train if sampler is None and batch_sampler is None else False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,

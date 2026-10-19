@@ -1,6 +1,6 @@
 # Local validation: 2026-10-19
 
-Base commit: `8780c8b4bec007cd8822b1016dc86d0ee848c7e3`.
+Base commit for this refinement: `f75a6e3fe4f62a8de7b36cc931d5267a767dfb2d`.
 
 Environment: Windows, Python 3.12, PyTorch 2.6.0+cpu, Lightning 2.5.4,
 NumPy 2.2.6. Validation used an isolated environment outside the repository.
@@ -10,11 +10,14 @@ training code are real.
 
 ## Completed checks
 
-- Full regression suite: 317 passed, 6 warnings, 116.80 seconds.
-- Benchmark comparison checks were subsequently expanded to reject unequal
-  warmup lengths, measured batch counts and measured sample counts, in addition
-  to unequal optimizer update counts. The benchmark-selected suite then passed
-  all 8 checks (4 warnings, 15.38 seconds).
+- Full regression invocation: 351 passed, one failed, 6 warnings, 164.65 seconds.
+  The failure was the independent-condition test oracle not accepting the new
+  optional `c_cond` keyword. Its signature was updated and explicitly asserts
+  `c_cond is None` during training. The failed test then passed in a targeted
+  rerun (1 passed, 12.22 seconds), including all shared-encoder gradients.
+  All 352 collected checks therefore have a passing result; there are no
+  outstanding failures. The original failure and rerun are recorded rather than
+  reported as a clean single invocation.
 - Reference and algebraic profiles: full Flow outputs, all parameter gradients,
   one AdamW update, masks and multiplicity 1/2, both baseline and G1.
 - Readback fold: non-normalized weights, learned output bias, empty groups,
@@ -28,6 +31,28 @@ training code are real.
 - Regional compile graph capture with the eager backend: forward/backward and
   checkpoint names. This does not validate CUDA Inductor compilation.
 - Generated reference/math/optimized benchmark commands compose with Hydra.
+- Shared AMP pair cast: 24 independent projection branches preserve every input,
+  LayerNorm-affine and projection gradient, with exact CPU equality to separate
+  casts. The real 24-layer DiT saves only one distinct low-precision pair storage.
+- Decoder broadcast mask: exact CPU outputs and gradients in FP32 and BF16.
+- Current versus previous math paths: exact CPU full Flow outputs and all parameter
+  gradients, baseline/G1, FP32/BF16, multiplicity 2. Reference versus math still
+  uses tolerances because algebraic folding changes floating-point operation order.
+- CPU-prepared layouts: nonprefix masks, all-padding batches, group capacities;
+  compact featurizer/collator retains the same used features and RNG state.
+- Deferred checks still reject invalid values and restore scope after exceptions.
+- Sampling cache: baseline/G1, Euler/SDE, FP32/BF16, multiplicity 2 and final
+  refinement. Static encoding runs once instead of four times for a three-step
+  solve plus refinement; geometry still runs each step. The next sample call
+  recomputes its cache. Training and cross-batch cache reuse are rejected.
+- Shared AMP cast also works with activation checkpointing and eager compile
+  capture. Disabling regional compilation removes wrappers without changing keys.
+- Checkpoint prediction entry covers reference/math/optimized profiles with all
+  three G1 override choices; saved model weights stay identical.
+- Isolated attention diagnostic exercises real CPU profiling and pair-bias input /
+  parameter gradients. CPU results have no GPU memory value.
+- Optional low-precision learned pair storage has finite BF16 CPU gradients;
+  it remains disabled in both shipped execution profiles.
 
 Full small architecture, same initialization seed:
 
@@ -36,8 +61,9 @@ Full small architecture, same initialization seed:
 | Baseline small | 38,376,320 | Identical across execution profiles |
 | G1 small | 40,525,216 | Identical across execution profiles |
 
-An isolated eight-layer DiT saved fewer distinct pair activation storages with
-shared standardization. This is a structural check, not a GPU memory measurement.
+Shared standardization reduces distinct pair activation storages. The refinement
+also reduces the real 24-layer DiT's distinct BF16 pair cast storages from per-layer
+copies to one. These are structural checks, not GPU peak-memory measurements.
 
 ## Pending server validation
 

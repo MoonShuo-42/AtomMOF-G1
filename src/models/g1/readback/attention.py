@@ -1,6 +1,7 @@
 """Atom-to-group attention with content, geometry and log-membership preference."""
 
 import math
+from src.models.execution.validation import check_tensor
 
 import torch
 from src.models.execution.ops import content_autocast
@@ -64,8 +65,10 @@ class ReadbackAttention(nn.Module):
             H = torch.where(atom_mask.bool()[..., None], H.to(dtype), 0)
             S_plus = torch.where(group_mask.bool()[..., None], S_plus.to(dtype), 0)
             prior = torch.where(valid, P.to(dtype).transpose(1, 2), 0)
-            if not (torch.isfinite(prior) & (prior >= 0)).all():
-                raise ValueError("valid P entries must be finite and nonnegative")
+            check_tensor(
+                (torch.isfinite(prior) & (prior >= 0)).all(),
+                "valid P entries must be finite and nonnegative",
+            )
             bias = torch.where(valid[..., None], geometry_bias.to(dtype), 0)
             q = linear(H, self.query_projection).reshape(batch, atoms, self.heads, self.head_dim)
             k = linear(S_plus, self.key_projection).reshape(

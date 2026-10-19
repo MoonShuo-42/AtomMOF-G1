@@ -125,13 +125,20 @@ class AtomAttentionEncoder(Module):
             .unsqueeze(-1) # (B, N, N, 1)
         )
 
+        # Geometry above remains FP32; this optional experiment only changes
+        # learned pair feature storage and additive arithmetic under AMP.
+        pair_dtype = c.dtype if (getattr(self, "low_precision_pairs", False)
+                                 and c.dtype in (torch.float16, torch.bfloat16)) else None
+        if pair_dtype is not None:
+            v = v.to(pair_dtype)
         # Initial pairwise embedding
         p = self.embed_atompair_ref_pos(d) * v
         p = p + self.embed_atompair_ref_dist(d_norm) * v
         p = p + self.embed_atompair_mask(v) * v
 
         # Add bond features
-        p = p + self.embed_bond_feats(feats["bond_types"])
+        bonds = self.embed_bond_feats(feats["bond_types"])
+        p = p + (bonds.to(pair_dtype) if pair_dtype is not None else bonds)
 
         # Add combined single conditioning to pair representation
         p = p + self.c_to_p_trans_q(c.view(B, N, 1, c.shape[-1]))
@@ -146,11 +153,12 @@ class AtomAttentionEncoder(Module):
         l_t,
         t,
         feats,
-        multiplicity=1
+        multiplicity=1,
+        static_condition=None,
     ):
         B, N, _ = feats["ref_pos"].shape
         atom_mask = feats["atom_pad_mask"].bool()
-        c, p = self.condition_features(feats)
+        c, p = self.condition_features(feats) if static_condition is None else static_condition
         q = c
 
         # Multiplicity for different versions

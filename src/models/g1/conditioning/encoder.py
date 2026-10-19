@@ -10,7 +10,7 @@ from src.models.simple.transformers import Mlp
 
 from .attention import BlockPairAttention
 from .features import AtomConditionFeatures
-from .pairs import local_pair_layout
+from .pairs import local_pair_layout, prepared_local_pairs
 
 AttentionImpl = Literal["manual", "pytorch", "xformers"]
 
@@ -168,6 +168,7 @@ class ConditionEncoder(nn.Module):
     def forward(self, feats: Mapping[str, Tensor]) -> Tensor:
         """Read only original chemical/reference features; preserve atom ordering."""
         mask = feats["atom_pad_mask"].bool()
-        layout = local_pair_layout(mask, feats["block_index"])
+        layout = (prepared_local_pairs(feats) if getattr(self, "prepared_layouts", False)
+                  else local_pair_layout(mask, feats["block_index"]))
         c, p = self.features(feats, layout.indices)
         return self._encode(c, p, mask, layout.allowed, layout.indices)

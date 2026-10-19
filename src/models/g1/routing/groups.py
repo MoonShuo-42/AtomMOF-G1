@@ -34,11 +34,18 @@ class AtomCountGroups(nn.Module):
         """
         return self.prepare(atom_mask).mask
 
-    def prepare(self, atom_mask: Tensor) -> GroupLayout:
+    def prepare(self, atom_mask: Tensor, *, atom_counts=None, max_atoms=None) -> GroupLayout:
         """Compute once and reuse only while the atom mask and max_groups are unchanged."""
         if atom_mask.ndim != 2 or min(atom_mask.shape) < 1:
             raise ValueError("atom_mask must be nonempty (B,N)")
-        counts = atom_mask.bool().sum(-1).clamp(max=self.max_groups)
-        batch_groups = max(1, int(counts.max().item()))
+        if atom_counts is None or max_atoms is None:
+            counts = atom_mask.bool().sum(-1).clamp(max=self.max_groups)
+            batch_groups = max(1, int(counts.max().item()))
+        else:
+            if (atom_counts.shape != atom_mask.shape[:1] or atom_counts.device != atom_mask.device
+                    or atom_counts.dtype != torch.long or type(max_atoms) is not int or max_atoms < 0):
+                raise ValueError("invalid prepared atom-count metadata")
+            counts = atom_counts.clamp(max=self.max_groups)
+            batch_groups = max(1, min(self.max_groups, max_atoms))
         mask = torch.arange(batch_groups, device=atom_mask.device)[None] < counts[:, None]
         return GroupLayout(mask, counts)

@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.simple.attention import AttentionPairBias
-from src.models.execution.ops import normalize_pairs
+from src.models.execution.ops import normalize_pairs, pair_projection_copy
 
 
 def modulate(x, shift, scale):
@@ -164,7 +164,7 @@ class DiTBlock(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x, c, mask, z=None, pair_normalized=False):
+    def forward(self, x, c, mask, z=None, pair_normalized=False, pair_copy=None):
         # Generate modulation parameters (shift, scale gate) from condition c
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
             c
@@ -172,7 +172,7 @@ class DiTBlock(nn.Module):
 
         # Attention block
         _x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = x + gate_msa.unsqueeze(1) * self.attn(s=_x, mask=mask, z=z, pair_normalized=pair_normalized)
+        x = x + gate_msa.unsqueeze(1) * self.attn(s=_x, mask=mask, z=z, pair_normalized=pair_normalized, pair_copy=pair_copy)
 
         # MLP block
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
@@ -197,6 +197,7 @@ class DiT(nn.Module):
 
         self.activation_checkpointing = activation_checkpointing
         self.pair_norm_reuse = False
+        self.pair_cast_reuse = False
         self.t_embedder = TimestepEmbedder(dim)
         self.layers = nn.ModuleList([
             DiTBlock(
@@ -221,21 +222,25 @@ class DiT(nn.Module):
         time_embed = self.t_embedder(t) # (B, D)
 
         normalized = {}
+        copies = {}
         for layer_index, layer in enumerate(self.layers, start=1):
             reuse = self.pair_norm_reuse and z is not None and layer.attn.use_pair_bias
             pair = z
+            pair_copy = None
             if reuse:
                 norm = layer.attn.proj_z[0]
                 key = (norm.normalized_shape, norm.eps)
                 if key not in normalized:
                     normalized[key] = normalize_pairs(z, norm)
+                    copies[key] = pair_projection_copy(normalized[key], self.pair_cast_reuse)
                 pair = normalized[key]
+                pair_copy = copies[key]
             if self.activation_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(
-                    layer, x, time_embed, mask, pair, reuse, use_reentrant=False
+                    layer, x, time_embed, mask, pair, reuse, pair_copy, use_reentrant=False
                 )
             else:
-                x = layer(x, time_embed, mask, pair, reuse)
+                x = layer(x, time_embed, mask, pair, reuse, pair_copy)
             if after_layer is not None:
                 x = after_layer(layer_index, x)
         return x

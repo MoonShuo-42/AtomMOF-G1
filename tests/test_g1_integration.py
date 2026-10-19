@@ -467,8 +467,9 @@ def test_two_rank_ddp_uses_all_parameters_with_shared_condition(tmp_path, checkp
 
 
 @pytest.mark.parametrize("requested,expected", [(None, True), (False, False), (True, True)])
+@pytest.mark.parametrize("profile", [None, "math", "optimized"])
 def test_prediction_entry_honors_checkpoint_and_override(
-    tmp_path, monkeypatch, requested, expected
+    tmp_path, monkeypatch, requested, expected, profile
 ):
     import src.predict as entry
 
@@ -500,12 +501,20 @@ def test_prediction_entry_honors_checkpoint_and_override(
             },
         }
     )
+    if profile is not None:
+        profile_config = OmegaConf.load(
+            Path(__file__).resolve().parents[1] / "configs" / "execution" / f"{profile}.yaml"
+        )
+        cfg.model = profile_config.model
     seen = []
 
     class Trainer:
         def predict(self, loaded, **kwargs):
             flow = loaded.structure_module.flow_model
             assert flow.g1_enabled is expected
+            assert flow.execution_options["cache_sampling_conditions"] is (profile is not None)
+            for key, value in model.state_dict().items():
+                torch.testing.assert_close(value, loaded.state_dict()[key], rtol=0, atol=0)
             assert torch.isfinite(flow(**inputs())["r_update"]).all()
             seen.append(True)
 
@@ -629,7 +638,8 @@ def test_shared_condition_runs_once_and_receives_the_sum_of_all_bridge_gradients
         bridge.condition_encoder = deepcopy(bridge.condition_encoder)
     prepare = schedule.prepare
 
-    def separate_conditions(feats, x_t, l_t, multiplicity=1):
+    def separate_conditions(feats, x_t, l_t, multiplicity=1, *, c_cond=None):
+        assert c_cond is None  # training must never use the sampling cache
         contexts = prepare(feats, x_t, l_t, multiplicity)
         return {
             key: context._replace(

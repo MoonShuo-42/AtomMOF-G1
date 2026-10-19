@@ -10,6 +10,7 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 from src.callbacks import PredictionWriter, InferenceTimer
 from src.models.simplemof_module import SimpleMOFModule
+from src.models.execution import configure_execution
 from src.utils import RankedLogger, extras
 
 log = RankedLogger(__name__, rank_zero_only=True)
@@ -82,6 +83,11 @@ def predict(cfg: DictConfig):
     model.eval()
     if cfg.predict_args.get("g1_enabled") is not None:
         model.structure_module.flow_model.set_g1_enabled(cfg.predict_args.g1_enabled)
+
+    # Optional runtime override; checkpoint architecture and learned weights stay intact.
+    execution = OmegaConf.select(cfg, "model.flow_model_args.execution")
+    if execution is not None:
+        configure_execution(model.structure_module.flow_model, execution)
 
     # Create output directory
     base_name = set_dir_name(cfg)

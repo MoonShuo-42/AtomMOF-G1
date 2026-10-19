@@ -9,6 +9,7 @@ defaults:
   - paths: default
   - extras: default
   - hydra: default
+  - execution: null
 
 task_name: "predict"
 

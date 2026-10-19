@@ -11,8 +11,11 @@ reference execution. No training data, epochs or accumulation are reduced.
 - `execution=math`: shared pair standardization with independent affine and
   projection weights; fused Q/K/V/gate projections; folded G1 readback; shared
   masked geometry contraction layout; vectorized time-bin logging; removal of
-  redundant copies when sample multiplicity is one. Existing
-  precision is retained.
+  redundant copies when sample multiplicity is one. It also shares AMP pair casts,
+  broadcasts decoder padding masks, prepares static G1 layouts in CPU workers,
+  batches device validity checks and caches static conditions during sampling.
+  Unused token maps and dense bond-index matrices are omitted from BWDB batches;
+  the bond-type matrix is retained. Existing precision is retained.
 - `execution=optimized`: the math profile plus BF16 mixed precision for learned
   content/MLPs, native-dtype SDPA, fused AdamW, DDP gradient bucket views and
   persistent DataLoader workers. Sensitive geometry/search/normalization retain
@@ -42,7 +45,10 @@ standardization is shared (grouped by epsilon and normalized shape). Each layer
 keeps its own gamma, beta and projection W. The effective W*gamma and W*beta are
 computed differentiably in each forward; they are not new parameters or detached
 cached weights. Autograd saves one standardized pair tensor instead of a separate
-128-channel affine output per layer. No learned pair bias or gradient is dropped.
+128-channel affine output per layer. Under AMP, one BF16/FP16 copy of the normalized
+pair tensor is also shared by all layers. Separate autograd nodes convert each
+branch's gradient back to FP32 before accumulation; one shared BF16 gradient
+accumulator would change rounding. No learned pair bias or gradient is dropped.
 
 G1 readback pools the SiLU hidden values per attention head BEFORE the final linear
 projection. The output bias is multiplied by the actual attention mass, including
@@ -50,10 +56,29 @@ empty/padded rows. This is algebraically equivalent for arbitrary weights, not o
 weights summing to one. Parameters stay under the same value module names.
 
 G1 E is masked and arranged once as (B,N*16,N) in the current forward. Four bridges
-reuse this layout, but recompute their own routing, U and Z. No context is reused
-across diffusion steps or optimizer updates. Coordinates and cell gradients remain
-connected. Geometry cutoffs, search precision, 125-image cap and whole-sample
+reuse this layout, but recompute their own routing, U and Z. Dynamic geometry
+contexts are not reused across diffusion steps or optimizer updates. Coordinates
+and cell gradients remain connected. Geometry cutoffs, search precision, 125-image cap and whole-sample
 fallback rules are unchanged.
+
+For G1, the CPU collator prepares same-block pair indices, the allowed-pair mask,
+valid atom counts and the batch maximum atom count. These depend only on static
+features. This removes GPU `nonzero()` and the host read used to choose group
+storage size from the forward path, without changing per-sample group counts.
+Custom callers without metadata use the original on-device layout calculation.
+Readback validity predicates are still evaluated on every bridge; the successful
+forward reads their combined result once. Invalid inputs still raise an error.
+
+Sampling in eval/no-grad mode can reuse original atom c/p and the shared G1
+condition encoding for one `sample()` call, including its final refinement. The
+cache is an explicit local object, is rejected in training or for another model /
+batch / G1 setting, and is never retained on the module. No coordinates, lattice,
+periodic geometry, routing or group aggregates are reused between timesteps.
+
+`model.flow_model_args.execution.low_precision_pairs=true` is a separate
+experimental option: it keeps learned pair additions in AMP dtype rather than
+promoting them to FP32 through masks and bond embeddings. It is OFF in both
+profiles until server accuracy and memory measurements justify enabling it.
 
 The reference implementation remains selectable for execution regression tests;
 this does not restore obsolete G1 architectures.
@@ -65,7 +90,23 @@ this does not restore obsolete G1 architectures.
 there is no silent dropping of pair bias, mask or bias gradients. Native SDPA is
 already used by the old code, so merely calling SDPA is not an optimization claim.
 Profile the actual CUDA kernels with PyTorch 2.6 on the server before choosing a
-backend. The optional xformers attention implementation is left available.
+backend. Decoder padding masks use a broadcast (B,1,1,N) representation rather
+than a materialized (B,H,N,N) tensor. Pair-biased attention keeps its learned bias,
+and xformers keeps its required mask layout.
+
+The isolated diagnostic below measures forward/backward, checks all gradients
+including pair bias, and records actual attention operators and CUDA kernel names.
+It compares fused/separate Q/K/V/gate projections in FP32/BF16 across backends.
+Unsupported cases are reported as failures. Add `--compile` to measure regional
+Inductor compilation; its warmup cost is reported separately.
+
+```bash
+python scripts/benchmark_attention.py --batch 32 --atoms 200 --pair-dim 128
+python scripts/benchmark_attention.py --batch 32 --atoms 200 --pair-dim 0 --heads 4
+```
+
+Output is a new `logs/attention_*.json` file. This single-operator diagnostic does
+not establish a whole-model or end-to-end training speedup.
 
 ## Benchmark on the server
 
@@ -102,13 +143,32 @@ speedup. Complete training/validation/save runs must be measured separately befo
 claiming a halved total training time. Large structures in stage 3 must be covered;
 200 batches are not evidence about the largest batch in the dataset.
 
+## Inference profiles
+
+`src/predict.py` also accepts `execution=math` or `execution=optimized`. Only runtime
+options are applied to the loaded model; architecture and weights still come from
+the checkpoint, and `predict_args.g1_enabled=null` keeps its G1 setting. For an old
+G1 checkpoint, add `data.prepare_g1_metadata=true` to prepare layouts on the CPU:
+the ordinary model config defaults to G1 disabled even when the checkpoint has G1.
+Without this override the on-device fallback is correct but less efficient.
+
+Use `execution=math` to retain the original precision in an existing FP32 evaluation
+protocol. The optimized profile selects BF16, so record that precision change and
+use the same protocol when comparing baseline and G1. Existing prediction directory
+naming is unchanged; use a new run directory when comparing profiles to avoid
+mixing raw prediction files. Reapplying a profile also removes disabled regional
+compilation wrappers without renaming checkpoint parameters.
+
 ## Correctness and reporting
 
 Run `python -m pytest tests -q`. New checks cover independent affine pair gradients,
 full Flow/G1 outputs and parameter gradients, an AdamW update, checkpoint keys,
 masked/non-unit readback, geometry NaN masking, BF16 finite backward, dynamic
-execution profiles and compile checkpoint names. Reference and math outputs are
-compared within explicit floating-point tolerances, not claimed bit-identical.
+execution profiles and compile checkpoint names. Additional tests cover per-branch
+AMP gradients and shared storage, broadcast masks, CPU-prepared layouts, compact
+batch feature/RNG equivalence, sampling-cache lifetimes, and prediction overrides.
+Reference and math outputs are compared within explicit floating-point tolerances,
+not claimed bit-identical.
 
 Do not claim GPU speed/memory goals from CPU tests or saved-tensor counts. For
 scientific comparisons, train baseline and G1 with the same selected precision and

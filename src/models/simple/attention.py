@@ -61,6 +61,7 @@ class AttentionPairBias(nn.Module):
         self.inf = inf
         self.fused_qkvg = False
         self.native_sdpa = False
+        self.broadcast_masks = False
         self.sdpa_backend = "auto"
 
         self.initial_norm = initial_norm
@@ -175,19 +176,22 @@ class AttentionPairBias(nn.Module):
         mask: Bool['b n'], 
         pair_bias: Optional[Float['b n n c_z']] = None,
         pair_normalized: bool = False,
+        pair_copy: Optional[Tensor] = None,
     ) -> Float['b h n n']:
 
         B, N = mask.shape
         
         # Attention mask broadcasted to (b, 1, 1, n)
         attn_mask = (1 - mask[:, None, None, :].float()) * -self.inf
+        if self.broadcast_masks and not self.use_pair_bias and self.attention_fn != self._xformers_attention:
+            return attn_mask
         attn_mask = attn_mask.expand(B, self.num_heads, N, N)
 
         # (Optional) Add pair bias
         if self.use_pair_bias:
             assert pair_bias is not None, "pair_bias must be provided if use_pair_bias is True"
             if pair_normalized:
-                z_bias = project_normalized_pairs(pair_bias, self.proj_z[0], self.proj_z[1])
+                z_bias = project_normalized_pairs(pair_bias, self.proj_z[0], self.proj_z[1], pair_copy)
                 z_bias = self.proj_z[2](z_bias)
             else:
                 z_bias = self.proj_z(pair_bias) # Shape (b, h, n, n)
@@ -201,6 +205,7 @@ class AttentionPairBias(nn.Module):
         mask: Tensor,
         z: Optional[Tensor] = None,
         pair_normalized: bool = False,
+        pair_copy: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Forward pass.
@@ -220,7 +225,7 @@ class AttentionPairBias(nn.Module):
         q, k, v, g = self.project_qkvg(s)
 
         # Attention mask
-        attn_mask = self._create_attn_mask(mask, z, pair_normalized)
+        attn_mask = self._create_attn_mask(mask, z, pair_normalized, pair_copy)
 
         # Attention computation
         o = self.attention_fn(q, k, v, attn_mask)

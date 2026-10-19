@@ -107,12 +107,17 @@ class G1Bridges(nn.Module):
             error_msgs,
         )
 
+    def encode_condition(self, feats):
+        first = self.bridges[str(self.insert_after[0])]
+        return first.encode_condition(feats)
+
     def prepare(
         self,
         feats: Mapping[str, Tensor],
         x_t: Tensor,
         l_t: Tensor,
         multiplicity: int = 1,
+        *, c_cond: Tensor | None = None,
     ) -> dict[str, G1Context]:
         """Encode conditions once, plus current expanded noisy geometry.
 
@@ -128,8 +133,9 @@ class G1Bridges(nn.Module):
             raise ValueError("G1 noisy state must match the multiplicity-expanded atom mask")
         contexts = {}
         shared = None
-        first = self.bridges[str(self.insert_after[0])]
-        c_cond = repeat_batch(first.encode_condition(feats), multiplicity,
+        if c_cond is None:
+            c_cond = self.encode_condition(feats)
+        c_cond = repeat_batch(c_cond, multiplicity,
                               enabled=getattr(self, "avoid_repeat_copies", False))
         layouts = {}
         geometry_layouts = {}
@@ -145,7 +151,14 @@ class G1Bridges(nn.Module):
             capacity = selector.max_groups
             if type(selector) is AtomCountGroups:
                 if capacity not in layouts:
-                    layouts[capacity] = selector.prepare(mask)
+                    kwargs = {}
+                    if getattr(self, "prepared_layouts", False) and "g1_atom_counts" in feats:
+                        kwargs = dict(
+                            atom_counts=repeat_batch(feats["g1_atom_counts"], multiplicity,
+                                                    enabled=getattr(self, "avoid_repeat_copies", False)),
+                            max_atoms=feats["g1_batch_max_atoms"],
+                        )
+                    layouts[capacity] = selector.prepare(mask, **kwargs)
                 layout = layouts[capacity]
             else:
                 layout = selector.prepare(mask)

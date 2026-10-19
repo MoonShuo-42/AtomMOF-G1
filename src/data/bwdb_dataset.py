@@ -22,10 +22,12 @@ class BWDBDataset(torch.utils.data.Dataset):
         max_num_atoms: Optional[int] = None,
         random_transform: bool = False,
         optimal_transport: bool = False,
+        compact_batch: bool = False,
     ):
         super().__init__()
         self.lmdb_path = Path(lmdb_path)
         self.featurizer = featurizer
+        self.compact_batch = compact_batch
         self.prior_sampler = prior_sampler
         self.sample_limit = sample_limit
         self.max_num_atoms = max_num_atoms
@@ -145,7 +147,10 @@ class BWDBDataset(torch.utils.data.Dataset):
         txn = self._get_txn()
 
         raw_data = get_data(txn, key)
-        processed_data = self.featurizer.process(raw_data)
+        processed_data = (
+            self.featurizer.process(raw_data, include_token_maps=False)
+            if self.compact_batch else self.featurizer.process(raw_data)
+        )
 
         # Center and augment data
         # TODO: Determine proper augmentation method

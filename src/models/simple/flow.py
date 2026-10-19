@@ -6,6 +6,8 @@ from lightning.pytorch.utilities import rank_zero_info
 
 from src.models.execution import configure_execution
 from src.models.execution.ops import repeat_batch
+from src.models.execution.validation import deferred_tensor_checks
+from src.models.execution.conditioning import SamplingCondition
 from src.models.loss.mic_dist import mic_pairwise_dist
 from src.models.energy import AtomicOverlapEnergy, MLIPEnergy
 from src.models.simple.layers import AtomAttentionEncoder, AtomAttentionDecoder, TokenTransformer
@@ -130,14 +132,29 @@ class FlowModule(nn.Module):
         atom_feats = torch.bmm(atom_to_token, token_feats)
         return atom_feats
 
-    def forward(self, r_noisy, l_noisy, times, feats, multiplicity=1):
+    def prepare_sampling_conditions(self, feats):
+        """Never retain this cache on the module or reuse it across sample() calls."""
+        if self.training or torch.is_grad_enabled():
+            raise RuntimeError("Sampling conditions require eval mode with gradients disabled")
+        atom = self.atom_encoder.condition_features(feats)
+        condition = self.g1_bridges.encode_condition(feats) if self._g1_enabled else None
+        return SamplingCondition(id(self), feats, self._g1_enabled, atom, condition)
+
+    def forward(self, r_noisy, l_noisy, times, feats, multiplicity=1, static_condition=None):
+        if static_condition is not None:
+            if self.training or torch.is_grad_enabled():
+                raise RuntimeError("Static sampling cache cannot be used in training")
+            if (static_condition.owner != id(self) or static_condition.features is not feats
+                    or static_condition.g1_enabled != self._g1_enabled):
+                raise ValueError("Sampling conditions belong to a different model, batch or G1 setting")
         # Encoder
         atom_single, atom_pair = self.atom_encoder(
             x_t=r_noisy, 
             l_t=l_noisy, 
             t=times, 
             feats=feats, 
-            multiplicity=multiplicity
+            multiplicity=multiplicity,
+            static_condition=None if static_condition is None else static_condition.atom,
         )
 
         # Atom -> Token (# TODO: Add aggregation logic)
@@ -147,7 +164,10 @@ class FlowModule(nn.Module):
         # Context is local to this call: no stale geometry across sampling steps.
         trunk_kwargs = {}
         if self._g1_enabled:
-            contexts = self.g1_bridges.prepare(feats, r_noisy, l_noisy, multiplicity)
+            contexts = self.g1_bridges.prepare(
+                feats, r_noisy, l_noisy, multiplicity,
+                c_cond=None if static_condition is None else static_condition.g1_condition,
+            )
 
             def after_layer(layer_index, hidden):
                 return self.g1_bridges(layer_index, hidden, times, contexts)
@@ -155,14 +175,15 @@ class FlowModule(nn.Module):
             trunk_kwargs["after_layer"] = after_layer
 
         # Trunk
-        token_single = self.token_transformer(
-            x=token_single, 
-            z=token_pair,
-            t=times, 
-            feats=feats, 
-            multiplicity=multiplicity,
-            **trunk_kwargs,
-        )
+        with deferred_tensor_checks(self.execution_options["defer_validation"]):
+            token_single = self.token_transformer(
+                x=token_single,
+                z=token_pair,
+                t=times,
+                feats=feats,
+                multiplicity=multiplicity,
+                **trunk_kwargs,
+            )
 
         # Token -> Atom (# TODO: Add broadcasting logic)
         atom_single = atom_single + self.token_to_atom_trans(token_single)
@@ -520,6 +541,16 @@ class AtomFlowMatching(Module):
         coord_trajectory = [atom_coords_t] if return_trajectory else None
         lattice_trajectory = [lattice_t] if return_trajectory else None
 
+        # Conditions are unchanged within this evaluation solve; current geometry
+        # is still recomputed by every network call. Nothing survives sample().
+        cache_conditions = (self.flow_model.execution_options["cache_sampling_conditions"]
+                            and not self.flow_model.training)
+        if cache_conditions:
+            network_condition_kwargs = dict(network_condition_kwargs)
+            network_condition_kwargs["static_condition"] = self.flow_model.prepare_sampling_conditions(
+                network_condition_kwargs["feats"]
+            )
+
         ### ODE Solver Loop (Euler's Method)
         for i in range(num_steps):
             t = timesteps[i]
@@ -529,7 +560,7 @@ class AtomFlowMatching(Module):
             pred_atom_coords_1, pred_lattice_1 = self.preconditioned_network_forward(
                 noised_atom_coords=atom_coords_t,
                 noised_lattice=lattice_t,
-                time=t.item(),
+                time=t.expand(batch_size) if cache_conditions else t.item(),
                 training=False,
                 network_condition_kwargs=dict(
                     multiplicity=multiplicity,
@@ -617,7 +648,7 @@ class AtomFlowMatching(Module):
 
                 # Compute score and drift
                 score_coords = self.get_score_from_velocity(
-                    flow_coords, atom_coords_t, t.item(), atom_mask
+                    flow_coords, atom_coords_t, t if cache_conditions else t.item(), atom_mask
                 )
                 drift = flow_coords + 0.5 * g2 * score_coords
 

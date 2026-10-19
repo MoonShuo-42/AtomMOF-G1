@@ -25,7 +25,7 @@ class Featurizer:
                 )[0]
         return ref_pos
 
-    def process(self, data: Structure) -> Dict[str, torch.Tensor]:
+    def process(self, data: Structure, *, include_token_maps: bool = True) -> Dict[str, torch.Tensor]:
         ref_pos_list, ref_element_list, ref_charge_list, ref_chirality_list = [], [], [], []
         block_index_list, block_type_list = [], []
         bond_index_list, bond_type_list = [], []
@@ -73,8 +73,12 @@ class Featurizer:
             bond_types = np.zeros((0,), dtype=int)
 
         # Atom-token mapping (TODO: Implement proper tokenization)
-        atom_to_token = np.eye(ref_pos.shape[0])
-        token_to_rep_atom = np.eye(ref_pos.shape[0])
+        token_maps = {}
+        if include_token_maps:
+            token_maps = {
+                "atom_to_token": torch.from_numpy(np.eye(ref_pos.shape[0])).float(),
+                "token_to_rep_atom": torch.from_numpy(np.eye(ref_pos.shape[0])).float(),
+            }
 
         # Convert to PyTorch tensors
         ref_pos = torch.from_numpy(ref_pos).float()
@@ -85,8 +89,6 @@ class Featurizer:
         block_type = torch.from_numpy(block_type).long()
         bond_indices = torch.from_numpy(bond_indices).long()
         bond_types = torch.from_numpy(bond_types).long()
-        atom_to_token = torch.from_numpy(atom_to_token).float()
-        token_to_rep_atom = torch.from_numpy(token_to_rep_atom).float()
 
         # Apply augmentations to reference positions
         mask = torch.ones_like(ref_element).bool()
@@ -101,8 +103,7 @@ class Featurizer:
             "block_type": block_type,               # (num_atoms,)
             "bond_indices": bond_indices,           # (2, num_bonds)
             "bond_types": bond_types,               # (num_bonds,)
-            "atom_to_token": atom_to_token,         # (num_atoms, num_tokens)
-            "token_to_rep_atom": token_to_rep_atom, # (num_tokens, num_atoms)
+            **token_maps,
 
             # Ground-truth data
             'cart_coords': torch.from_numpy(data.cart_coords).float(),

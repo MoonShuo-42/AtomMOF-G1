@@ -16,7 +16,41 @@ def normalize_pairs(z: Tensor, norm: nn.LayerNorm) -> Tensor:
         return F.layer_norm(value, norm.normalized_shape, eps=norm.eps)
 
 
-def project_normalized_pairs(z: Tensor, norm: nn.LayerNorm, projection: nn.Linear) -> Tensor:
+class _SharedCast(torch.autograd.Function):
+    """Share cast storage, but return each branch's gradient in the source dtype.
+
+    Letting branches use one ordinary BF16 cast node would accumulate their
+    gradients in BF16. These separate identity-in-backward nodes preserve the
+    original FP32 fan-in while their forward outputs alias the same storage.
+    """
+
+    @staticmethod
+    def forward(ctx, source: Tensor, converted: Tensor):
+        ctx.source_dtype = source.dtype
+        return converted
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.to(ctx.source_dtype), None
+
+
+def pair_projection_copy(z: Tensor, enabled: bool) -> Tensor | None:
+    """One detached storage copy; _SharedCast supplies its full gradient path."""
+    if not enabled or not torch.is_autocast_enabled(z.device.type) or z.dtype != torch.float32:
+        return None
+    dtype = torch.get_autocast_dtype(z.device.type)
+    if dtype not in (torch.float16, torch.bfloat16):
+        return None
+    with torch.no_grad():
+        return z.to(dtype)
+
+
+def project_normalized_pairs(
+    z: Tensor,
+    norm: nn.LayerNorm,
+    projection: nn.Linear,
+    projection_copy: Tensor | None = None,
+) -> Tensor:
     """W(gamma*z_hat+beta)+b, without materializing gamma*z_hat+beta.
 
     Effective weights are constructed afresh and remain connected to autograd.
@@ -29,6 +63,8 @@ def project_normalized_pairs(z: Tensor, norm: nn.LayerNorm, projection: nn.Linea
         if norm.bias is not None:
             offset = F.linear(norm.bias.to(z.dtype), weight)
             bias = offset if bias is None else bias + offset
+    if projection_copy is not None:
+        z = _SharedCast.apply(z, projection_copy)
     return F.linear(z, effective, bias)
 
 
