@@ -1,4 +1,4 @@
-"""Regression checks for shared AMP storage, data layouts and sampling caches."""
+"""Regression checks for full-precision data layouts and sampling caches."""
 from copy import deepcopy
 from pathlib import Path
 
@@ -8,17 +8,11 @@ from test_execution import MATH
 from test_g1_integration import bridge_config, feats, flow_args, inputs, loss, perturb
 
 from src.models.execution import configure_execution
-from src.models.execution.ops import (
-    normalize_pairs,
-    pair_projection_copy,
-    project_normalized_pairs,
-)
 from src.models.simple.flow import FlowModule
 from src.models.simple.transformers import DiT
 
 V2 = {
     **MATH,
-    "pair_cast_reuse": True,
     "broadcast_masks": True,
     "defer_validation": True,
     "prepared_layouts": True,
@@ -34,67 +28,19 @@ def one_thread():
     torch.set_num_threads(before)
 
 
-def test_amp_shared_projection_preserves_each_branch_fp32_gradient():
-    torch.manual_seed(81)
-    x = torch.randn(2, 5, 5, 7, requires_grad=True)
-    layers = [(torch.nn.LayerNorm(7), torch.nn.Linear(7, 3)) for _ in range(24)]
-    for norm, proj in layers:
-        with torch.no_grad():
-            norm.weight.normal_()
-            norm.bias.normal_()
-    with torch.autocast("cpu", dtype=torch.bfloat16):
-        z = normalize_pairs(x, layers[0][0])
-        cached = pair_projection_copy(z, True)
-        old = [project_normalized_pairs(z, n, p) for n, p in layers]
-        new = [project_normalized_pairs(z, n, p, cached) for n, p in layers]
-    for a, b in zip(old, new):
-        torch.testing.assert_close(a, b, rtol=0, atol=0)
-    variables = (x, *(p for n, proj in layers for m in (n, proj) for p in m.parameters()))
-    ga = torch.autograd.grad(
-        sum(y.float().square().sum() for y in old), variables, retain_graph=True
-    )
-    gb = torch.autograd.grad(sum(y.float().square().sum() for y in new), variables)
-    for a, b in zip(ga, gb):
-        torch.testing.assert_close(a, b, rtol=0, atol=0)
-
-
-def test_amp_pair_storage_is_shared_across_all_24_layers():
-    model = DiT(depth=24, heads=2, dim=8, dim_pair=7, attention_impl="pytorch")
-    configure_execution(model, {**V2, "native_sdpa": True})
-    x, z = torch.randn(2, 5, 8), torch.randn(2, 5, 5, 7, requires_grad=True)
-    saved = []
-
-    def pack(t):
-        if t.numel() == z.numel() and t.shape[-1] == 7:
-            saved.append(t)
-        return t
-
-    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t), torch.autocast(
-        "cpu", dtype=torch.bfloat16
-    ):
-        out = model(x, torch.rand(2), torch.ones(2, 5), z)
-    low = {t.untyped_storage().data_ptr() for t in saved if t.dtype == torch.bfloat16}
-    assert len(low) == 1, len(low)
-    out.float().square().sum().backward()
-    assert torch.isfinite(z.grad).all()
-
-
-@pytest.mark.parametrize("amp", [False, True])
-def test_decoder_broadcast_mask_outputs_and_gradients(amp):
+def test_decoder_broadcast_mask_outputs_and_gradients():
     from src.models.simple.attention import AttentionPairBias
 
     torch.manual_seed(9)
     a = AttentionPairBias(16, None, 4, attention_impl="pytorch")
-    a.native_sdpa = amp
     b = deepcopy(a)
     b.broadcast_masks = True
     mask = torch.tensor([[1, 1, 0], [1, 1, 1]])
     assert b._create_attn_mask(mask).shape == (2, 1, 1, 3)
     x = torch.randn(2, 3, 16, requires_grad=True)
     y = x.detach().clone().requires_grad_()
-    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=amp):
-        oa = a(x, mask)
-        ob = b(y, mask)
+    oa = a(x, mask)
+    ob = b(y, mask)
     torch.testing.assert_close(oa, ob, rtol=0, atol=0)
     oa.float().square().sum().backward()
     ob.float().square().sum().backward()
@@ -103,8 +49,7 @@ def test_decoder_broadcast_mask_outputs_and_gradients(amp):
 
 
 @pytest.mark.parametrize("g1", [False, True])
-@pytest.mark.parametrize("amp", [False, True])
-def test_refinements_full_model_outputs_gradients_and_keys(g1, amp):
+def test_refinements_full_model_outputs_gradients_and_keys(g1):
     torch.manual_seed(93)
     from src.data.execution_features import prepare_execution_layouts
 
@@ -116,21 +61,17 @@ def test_refinements_full_model_outputs_gradients_and_keys(g1, amp):
     # the same path twice.
     opts = {
         **MATH,
-        "pair_cast_reuse": False,
         "broadcast_masks": False,
         "defer_validation": False,
         "prepared_layouts": False,
         "cache_sampling_conditions": False,
-        "native_sdpa": amp,
-        "mixed_precision": amp,
     }
     configure_execution(a, opts)
     configure_execution(b, {**opts, **V2})
     data = inputs(2)
     prepare_execution_layouts(data["feats"])
-    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=amp):
-        oa = a(**data)
-        ob = b(**data)
+    oa = a(**data)
+    ob = b(**data)
     assert a.state_dict().keys() == b.state_dict().keys()
     for key in oa:
         torch.testing.assert_close(oa[key], ob[key], rtol=0, atol=0)
@@ -235,8 +176,7 @@ def test_compact_featurizer_and_collator_preserve_features_and_rng():
 
 @pytest.mark.parametrize("g1", [False, True])
 @pytest.mark.parametrize("sde", [False, True])
-@pytest.mark.parametrize("amp", [False, True])
-def test_sampling_cache_reuses_only_static_conditions(g1, sde, amp):
+def test_sampling_cache_reuses_only_static_conditions(g1, sde):
     from unittest.mock import patch
 
     from src.models.simple.flow import AtomFlowMatching
@@ -248,9 +188,9 @@ def test_sampling_cache_reuses_only_static_conditions(g1, sde, amp):
     b = deepcopy(a)
     configure_execution(
         a.flow_model,
-        {**V2, "native_sdpa": amp, "mixed_precision": amp, "cache_sampling_conditions": False},
+        {**V2, "cache_sampling_conditions": False},
     )
-    configure_execution(b.flow_model, {**V2, "native_sdpa": amp, "mixed_precision": amp})
+    configure_execution(b.flow_model, V2)
     data = feats()
     kwargs = dict(
         atom_mask=data["atom_pad_mask"],
@@ -277,11 +217,10 @@ def test_sampling_cache_reuses_only_static_conditions(g1, sde, amp):
         "condition_features",
         wraps=b.flow_model.atom_encoder.condition_features,
     ) as new:
-        with torch.autocast("cpu", dtype=torch.bfloat16, enabled=amp):
-            torch.manual_seed(18)
-            oa = a.sample(**kwargs)
-            torch.manual_seed(18)
-            ob = b.sample(**kwargs)
+        torch.manual_seed(18)
+        oa = a.sample(**kwargs)
+        torch.manual_seed(18)
+        ob = b.sample(**kwargs)
         assert old.call_count == 4 and new.call_count == 1
         for key in oa:
             if isinstance(oa[key], torch.Tensor):
@@ -308,7 +247,7 @@ def test_sampling_cache_rejected_in_training_and_for_another_batch():
         m(**{**data, "feats": dict(data["feats"])}, static_condition=cache)
 
 
-def test_amp_shared_cast_with_checkpointing_and_regional_compile():
+def test_fp32_normalization_with_checkpointing_and_regional_compile():
     from src.models.simple.transformers import DiT
 
     m = DiT(
@@ -319,30 +258,13 @@ def test_amp_shared_cast_with_checkpointing_and_regional_compile():
         attention_impl="pytorch",
         activation_checkpointing=True,
     )
-    configure_execution(
-        m, {**V2, "native_sdpa": True, "compile_blocks": True, "compile_backend": "eager"}
-    )
+    configure_execution(m, {**V2, "compile_blocks": True, "compile_backend": "eager"})
     x = torch.randn(2, 4, 8, requires_grad=True)
     z = torch.randn(2, 4, 4, 7, requires_grad=True)
-    with torch.autocast("cpu", dtype=torch.bfloat16):
-        y = m(x, torch.rand(2), torch.ones(2, 4), z)
+    y = m(x, torch.rand(2), torch.ones(2, 4), z)
+    assert y.dtype == torch.float32
     y.float().square().sum().backward()
     assert torch.isfinite(z.grad).all() and all(p.grad is not None for p in m.parameters())
-
-
-def test_optional_low_precision_pair_features_remain_finite():
-    m = FlowModule(**flow_args(), g1=bridge_config())
-    perturb(m)
-    configure_execution(
-        m, {**V2, "native_sdpa": True, "mixed_precision": True, "low_precision_pairs": True}
-    )
-    data = inputs()
-    with torch.autocast("cpu", dtype=torch.bfloat16):
-        _, p = m.atom_encoder.condition_features(data["feats"])
-        assert p.dtype == torch.bfloat16
-        y = m(**data)
-    loss(y).backward()
-    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in m.parameters())
 
 
 @pytest.mark.parametrize("pair_dim", [0, 7])
@@ -362,7 +284,6 @@ def test_attention_diagnostic_measures_gradients_without_claiming_cpu_vram(pair_
         dim=16,
         heads=4,
         pair_dim=pair_dim,
-        amp=True,
         fused=True,
         backend="math",
         warmup=1,
@@ -372,6 +293,7 @@ def test_attention_diagnostic_measures_gradients_without_claiming_cpu_vram(pair_
     assert result["all_gradients_finite"] and result["peak_allocated_bytes"] is None
     assert result["pair_bias_gradient_checked"] == bool(pair_dim)
     assert result["attention_operators"]
+    assert result["precision"] == "32-true"
 
 
 def test_execution_reconfiguration_removes_compiled_wrappers():
@@ -403,3 +325,23 @@ def test_execution_reconfiguration_removes_compiled_wrappers():
     for key in expected:
         torch.testing.assert_close(expected[key], actual[key], rtol=5e-5, atol=2e-6)
     assert tuple(model.state_dict()) == state
+
+
+@pytest.mark.parametrize(
+    "name", ["pair_cast_reuse", "low_precision_pairs", "native_sdpa", "mixed_precision"]
+)
+def test_removed_precision_flags_are_rejected(name):
+    with pytest.raises(ValueError, match="Unknown execution options"):
+        configure_execution(torch.nn.Linear(2, 2), {name: True})
+
+
+@pytest.mark.parametrize("profile", ["math", "optimized"])
+def test_prediction_config_retains_fp32_and_checkpoint_architecture(profile):
+    from hydra import compose, initialize_config_dir
+
+    config_dir = str(Path(__file__).resolve().parents[1] / "configs")
+    with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
+        cfg = compose(config_name="predict", overrides=["data=bwdb", f"execution={profile}"])
+    assert cfg.trainer.precision == "32-true"
+    assert cfg.predict_args.g1_enabled is None
+    assert cfg.model.flow_model_args.execution.pair_norm_reuse

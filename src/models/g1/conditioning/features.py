@@ -89,10 +89,7 @@ class AtomConditionFeatures(nn.Module):
         p = self.embed_atompair_ref_pos(d)
         p = p + self.embed_atompair_ref_dist(d_norm)
         p = p + self.embed_atompair_mask(same_block)
-        bonds = self.embed_bond_feats(feats["bond_types"][b, i, j])
-        if getattr(self, "low_precision_pairs", False) and p.dtype in (torch.float16, torch.bfloat16):
-            bonds = bonds.to(p.dtype)
-        p = p + bonds
+        p = p + self.embed_bond_feats(feats["bond_types"][b, i, j])
         p = p + self.c_to_p_trans_q(c)[b, i]
         p = p + self.c_to_p_trans_k(c)[b, j]
         return c, p + self.p_mlp(p)

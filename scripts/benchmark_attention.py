@@ -28,7 +28,6 @@ def measure_case(
     dim,
     heads,
     pair_dim,
-    amp,
     fused,
     backend,
     warmup,
@@ -38,7 +37,6 @@ def measure_case(
 ):
     torch.manual_seed(42)
     model = AttentionPairBias(dim, pair_dim or None, heads, attention_impl="pytorch").to(device)
-    model.native_sdpa = True
     model.fused_qkvg = fused
     model.broadcast_masks = True
     model.sdpa_backend = backend
@@ -63,9 +61,8 @@ def measure_case(
         x.grad = None
         if z is not None:
             z.grad = None
-        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
-            out = model(x, mask, z)
-            value = out.float().square().mean()
+        out = model(x, mask, z)
+        value = out.square().mean()
         value.backward()
         return value
 
@@ -110,6 +107,7 @@ def measure_case(
         warmup_seconds=warmup_seconds,
         peak_allocated_bytes=peak,
         all_gradients_finite=True,
+        precision="32-true",
         pair_bias_gradient_checked=bool(pair_dim),
         attention_operators=operators,
         cuda_kernels=kernels,
@@ -149,42 +147,39 @@ def main():
         p.error("Output already exists")
     torch.set_float32_matmul_precision("high")
     records = []
-    for amp in (False, True):
-        for fused in (False, True):
-            for backend in args.backends:
-                label = dict(
-                    precision="bf16" if amp else "fp32", fused_qkvg=fused, backend=backend
+    for fused in (False, True):
+        for backend in args.backends:
+            label = dict(precision="32-true", fused_qkvg=fused, backend=backend)
+            try:
+                result = measure_case(
+                    device=device,
+                    batch=args.batch,
+                    atoms=args.atoms,
+                    dim=args.dim,
+                    heads=args.heads,
+                    pair_dim=args.pair_dim,
+                    fused=fused,
+                    backend=backend,
+                    warmup=args.warmup,
+                    iterations=args.iterations,
+                    compile_backend="inductor" if args.compile else None,
                 )
-                try:
-                    result = measure_case(
-                        device=device,
-                        batch=args.batch,
-                        atoms=args.atoms,
-                        dim=args.dim,
-                        heads=args.heads,
-                        pair_dim=args.pair_dim,
-                        amp=amp,
-                        fused=fused,
-                        backend=backend,
-                        warmup=args.warmup,
-                        iterations=args.iterations,
-                        compile_backend="inductor" if args.compile else None,
-                    )
-                    label.update(status="ok", **result)
-                except RuntimeError as error:
-                    label.update(status="failed", reason=str(error))
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
-                records.append(label)
-                print(
-                    json.dumps({k: v for k, v in label.items() if k != "cuda_kernels"}), flush=True
-                )
+                label.update(status="ok", **result)
+            except RuntimeError as error:
+                label.update(status="failed", reason=str(error))
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+            records.append(label)
+            print(json.dumps({k: v for k, v in label.items() if k != "cuda_kernels"}), flush=True)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("x", encoding="utf-8") as f:
         json.dump(
             dict(
                 scope="single-attention forward/backward; excludes optimizer, DDP and full model",
                 torch_version=torch.__version__,
+                float32_matmul_precision=torch.get_float32_matmul_precision(),
+                cuda_matmul_allow_tf32=torch.backends.cuda.matmul.allow_tf32,
+                cudnn_allow_tf32=torch.backends.cudnn.allow_tf32,
                 device=str(device),
                 gpu_name=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
                 settings={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},

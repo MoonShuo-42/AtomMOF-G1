@@ -10,17 +10,13 @@ def configure_execution(model, options: Mapping | None = None):
     cfg = dict(options or {})
     defaults = dict(
         pair_norm_reuse=False,
-        pair_cast_reuse=False,
         broadcast_masks=False,
         defer_validation=False,
         prepared_layouts=False,
         cache_sampling_conditions=False,
-        low_precision_pairs=False,
         fused_qkvg=False,
-        native_sdpa=False,
         sdpa_backend="auto",
         fold_readback=False,
-        mixed_precision=False,
         compile_blocks=False,
         compile_pair_features=False,
         compile_backend="inductor",
@@ -45,19 +41,15 @@ def configure_execution(model, options: Mapping | None = None):
     for module in model.modules():
         module.avoid_repeat_copies = defaults["avoid_repeat_copies"]
         module.prepared_layouts = defaults["prepared_layouts"]
-        module.low_precision_pairs = defaults["low_precision_pairs"]
         if isinstance(module, AttentionPairBias):
             module.fused_qkvg = defaults["fused_qkvg"]
-            module.native_sdpa = defaults["native_sdpa"]
             module.broadcast_masks = defaults["broadcast_masks"]
             module.sdpa_backend = defaults["sdpa_backend"]
         if isinstance(module, DiT):
             module.pair_norm_reuse = defaults["pair_norm_reuse"]
-            module.pair_cast_reuse = defaults["pair_cast_reuse"]
         if isinstance(module, AtomReadback):
             module.fold_values = defaults["fold_readback"]
         if module.__class__.__module__.startswith("src.models.g1."):
-            module.mixed_precision = defaults["mixed_precision"]
             module.geometry_layout_reuse = defaults["geometry_layout_reuse"]
     from src.models.g1.conditioning.features import AtomConditionFeatures
     from src.models.simple.layers import AtomAttentionEncoder

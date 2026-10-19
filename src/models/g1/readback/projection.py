@@ -3,7 +3,6 @@
 from typing import NamedTuple
 
 import torch
-from src.models.execution.ops import content_autocast
 from torch import Tensor, nn
 
 from .utils import compute_dtype, linear, positive_int
@@ -36,7 +35,7 @@ class AtomResidualUpdate(nn.Module):
         if any(x.device != H.device for x in (readback, atom_mask, self.output_projection.weight)):
             raise ValueError("residual inputs and parameters must share a device")
         dtype = compute_dtype(H, readback, self.output_projection.weight)
-        with content_autocast(self, H):
+        with torch.autocast(device_type=H.device.type, enabled=False):
             H = torch.where(atom_mask.bool()[..., None], H.to(dtype), 0)
             readback = torch.where(atom_mask.bool()[..., None], readback.to(dtype), 0)
             delta = linear(readback, self.output_projection)

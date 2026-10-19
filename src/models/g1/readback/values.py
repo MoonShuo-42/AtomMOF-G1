@@ -1,7 +1,6 @@
 """Relation-conditioned value for every atom/group pair."""
 
 import torch
-from src.models.execution.ops import content_autocast
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -62,7 +61,7 @@ class RelationConditionedValue(nn.Module):
             raise ValueError("content and value parameters must share a device")
         geometry_valid = valid & available_geometry(geometry_ok, H)[:, None, None]
         dtype = compute_dtype(H, S_plus, features, self.atom_projection.weight)
-        with content_autocast(self, H):
+        with torch.autocast(device_type=H.device.type, enabled=False):
             H = torch.where(atom_mask.bool()[..., None], H.to(dtype), 0)
             S_plus = torch.where(group_mask.bool()[..., None], S_plus.to(dtype), 0)
             features = torch.where(geometry_valid[..., None], features.to(dtype), 0)
@@ -97,7 +96,7 @@ class RelationConditionedValue(nn.Module):
             raise TypeError("weights must be floating-point")
         geometry_valid = valid & available_geometry(geometry_ok, H)[:, None, None]
         dtype = compute_dtype(H, S_plus, features, weights, self.atom_projection.weight)
-        with content_autocast(self, H):
+        with torch.autocast(device_type=H.device.type, enabled=False):
             safe_H = torch.where(atom_mask.bool()[..., None], H.to(dtype), 0)
             safe_S = torch.where(group_mask.bool()[..., None], S_plus.to(dtype), 0)
             safe_features = torch.where(geometry_valid[..., None], features.to(dtype), 0)

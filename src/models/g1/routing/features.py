@@ -1,7 +1,6 @@
 """Fuse current hidden, conditional, geometric and time features into router keys."""
 
 import torch
-from src.models.execution.ops import content_autocast
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -86,14 +85,14 @@ class RouterQueryEncoder(nn.Module):
     ) -> Tensor:
         """Return (B,N,key_dim); all padding keys and their input gradients are zero."""
         features = self.build_inputs(h, c, rho, time_embedding, geometry_ok, atom_mask)
-        # Feature construction remains FP32; the execution policy may enable AMP
-        # for the learned projections. Router normalization below remains FP32.
+        # rho contains high-order contractions. Keep this small MLP in >=FP32,
+        # even under AMP or when the enclosing model's parameters use half precision.
         dtype = features.dtype
-        with content_autocast(self, h):
+        with torch.autocast(device_type=h.device.type, enabled=False):
             hidden = F.silu(F.linear(features, self.fc1.weight.to(dtype), self.fc1.bias.to(dtype)))
             keys = F.linear(hidden, self.fc2.weight.to(dtype), self.fc2.bias.to(dtype))
             keys = F.layer_norm(
-                keys.to(dtype),
+                keys,
                 self.norm.normalized_shape,
                 self.norm.weight.to(dtype),
                 self.norm.bias.to(dtype),

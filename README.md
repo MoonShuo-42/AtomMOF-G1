@@ -515,8 +515,9 @@ Dense mathematical references live only in tests/reference_g1_condition.py.
 ### Whole-model execution profiles
 
 The optional `execution=math` and `execution=optimized` training profiles preserve
-model architecture and checkpoint parameter names. The optimized profile uses
-BF16 content operations; geometry keeps its existing precision. Both baseline and
-G1 are supported. See [implementation and benchmark instructions](src/models/execution/README.md).
+model architecture, checkpoint parameter names and baseline calculation precision.
+Both profiles use FP32 (`32-true`) and retain the existing baseline TF32 policy.
+The optimized profile adds fused AdamW, DDP bucket views and persistent data
+workers; it does not lower precision. Both baseline and G1 are supported. See [implementation and benchmark instructions](src/models/execution/README.md).
 The 2x training-speed and 50% peak-memory targets require server measurements;
 local correctness tests are not evidence that these targets have been achieved.

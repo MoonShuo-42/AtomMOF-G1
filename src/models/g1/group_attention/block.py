@@ -4,7 +4,6 @@ import math
 from typing import NamedTuple
 
 import torch
-from src.models.execution.ops import content_autocast
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -45,7 +44,7 @@ class GroupAttentionBlock(nn.Module):
         if S.device != self.fc1.weight.device:
             raise ValueError("S and block parameters must share a device")
         dtype = compute_dtype(S, geometry_bias, self.fc1.weight)
-        with content_autocast(self, S):
+        with torch.autocast(device_type=S.device.type, enabled=False):
             valid = group_mask.bool()[..., None]
             content = torch.where(valid, S.to(dtype), 0)
             attended = self.attention(layer_norm(content, self.norm1), geometry_bias, group_mask)

@@ -34,9 +34,20 @@ def summarize(runs):
             for p in sorted((Path(run["directory"]) / "performance").glob("rank*_epoch*.json"))
         ]
         if not rows or any(
-            not row["measured_seconds"] or not row["batches_sha256"] for row in rows
+            not row["measured_seconds"]
+            or not row["batches_sha256"]
+            or any(
+                key not in row
+                for key in (
+                    "precision",
+                    "float32_matmul_precision",
+                    "cuda_matmul_allow_tf32",
+                    "cudnn_allow_tf32",
+                )
+            )
+            for row in rows
         ):
-            raise RuntimeError("Missing timing or batch-ID evidence; cannot compare")
+            raise RuntimeError("Missing timing, batch-ID or precision evidence; cannot compare")
         epochs = {
             e: sorted((x for x in rows if x["epoch"] == e), key=lambda x: x["rank"])
             for e in {x["epoch"] for x in rows}
@@ -73,6 +84,10 @@ def summarize(runs):
                         "batches_sha256",
                         "shapes_sha256",
                         "parameter_count",
+                        "precision",
+                        "float32_matmul_precision",
+                        "cuda_matmul_allow_tf32",
+                        "cudnn_allow_tf32",
                         "optimizer_updates",
                         "accumulate_grad_batches",
                         "total_batches",
@@ -201,7 +216,7 @@ def main():
                 f"hydra.run.dir={json.dumps(str(directory))}",
                 "extras.enforce_tags=false",
                 "extras.print_config=false",
-                f"++trainer.precision={'bf16-mixed' if profile=='optimized' else '32-true'}",
+                "++trainer.precision=32-true",
             ]
             if profile != "reference":
                 overrides.append(f"execution={profile}")

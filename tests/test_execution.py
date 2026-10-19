@@ -14,7 +14,6 @@ from src.models.simple.flow import FlowModule
 from src.models.simple.transformers import DiT
 
 MATH = dict(
-    pair_cast_reuse=True,
     broadcast_masks=True,
     defer_validation=True,
     prepared_layouts=True,
@@ -137,18 +136,40 @@ def test_shared_normalization_reduces_distinct_saved_pair_activations():
 
 
 @pytest.mark.parametrize("g1", [False, True])
-def test_bf16_complete_flow_loss_and_gradients_finite(g1):
+@pytest.mark.parametrize("profile", ["math", "optimized"])
+def test_complete_flow_retains_fp32_parameters_gradients_and_activations(g1, profile):
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.load(
+        Path(__file__).resolve().parents[1] / "configs/execution" / f"{profile}.yaml"
+    )
     model = FlowModule(**flow_args(), g1=bridge_config() if g1 else None)
     perturb(model)
-    configure_execution(model, {**MATH, "mixed_precision": True, "native_sdpa": True})
-    data = inputs()
-    with torch.autocast("cpu", dtype=torch.bfloat16):
-        out = model(**data)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    policy = torch.get_float32_matmul_precision()
+    configure_execution(model, cfg.model.flow_model_args.execution)
+    assert torch.get_float32_matmul_precision() == policy
+    assert model.state_dict().keys() == before.keys()
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+    dtypes = set()
+
+    def pack(tensor):
+        if tensor.is_floating_point():
+            dtypes.add(tensor.dtype)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        out = model(**inputs())
         total = loss(out)
     total.backward()
     assert torch.isfinite(total)
-    for name, p in model.named_parameters():
-        assert p.grad is not None and torch.isfinite(p.grad).all(), name
+    assert dtypes and dtypes <= {torch.float32, torch.float64}
+    assert all(t.dtype == torch.float32 for t in out.values())
+    for name, parameter in model.named_parameters():
+        assert parameter.dtype == torch.float32, name
+        assert parameter.grad is not None and parameter.grad.dtype == torch.float32, name
+        assert torch.isfinite(parameter.grad).all(), name
 
 
 @pytest.mark.parametrize("profile", ["math", "optimized"])
@@ -161,20 +182,19 @@ def test_hydra_execution_profile_composes_without_changing_training_budget(profi
     assert cfg.model.flow_model_args.execution.pair_norm_reuse
     assert cfg.trainer.max_epochs == 500 and cfg.trainer.accumulate_grad_batches == 2
     assert cfg.data.dynamic.max_batch_size == 32
+    assert cfg.trainer.precision == "32-true"
     if profile == "optimized":
-        assert cfg.trainer.precision == "bf16-mixed"
         assert cfg.trainer.strategy.gradient_as_bucket_view
 
 
-def test_native_sdpa_preserves_float64_and_bias_gradient():
+def test_sdpa_preserves_baseline_fp32_inputs_and_bias_gradient():
     from src.models.simple.attention import AttentionPairBias
 
-    a = AttentionPairBias(8, 7, 2, attention_impl="pytorch").double()
-    a.native_sdpa = True
-    s = torch.randn(2, 5, 8, dtype=torch.float64, requires_grad=True)
-    z = torch.randn(2, 5, 5, 7, dtype=torch.float64, requires_grad=True)
+    a = AttentionPairBias(8, 7, 2, attention_impl="pytorch")
+    s = torch.randn(2, 5, 8, dtype=torch.float32, requires_grad=True)
+    z = torch.randn(2, 5, 5, 7, dtype=torch.float32, requires_grad=True)
     out = a(s, torch.ones(2, 5), z)
-    assert out.dtype == torch.float64
+    assert out.dtype == torch.float32
     out.square().sum().backward()
     assert z.grad.abs().sum() > 0
     assert a.proj_z[0].weight.grad.abs().sum() > 0
@@ -255,8 +275,7 @@ class BenchmarkDataset:
         return {k: v[index % 2] for k, v in feats().items()}
 
 
-@pytest.mark.parametrize("amp", [False, True])
-def test_lightning_training_benchmark_callback_and_checkpoint(tmp_path, amp):
+def test_lightning_training_benchmark_callback_and_checkpoint(tmp_path):
     import json
 
     import lightning as L
@@ -268,7 +287,7 @@ def test_lightning_training_benchmark_callback_and_checkpoint(tmp_path, amp):
     from src.models.simplemof_module import SimpleMOFModule
 
     args = model_args(True)
-    args["flow_model_args"]["execution"] = {**MATH, "native_sdpa": amp, "mixed_precision": amp}
+    args["flow_model_args"]["execution"] = MATH
     model = SimpleMOFModule(**args)
     dataset = BenchmarkDataset()
     sampler = DynamicBatchSampler(
@@ -285,7 +304,7 @@ def test_lightning_training_benchmark_callback_and_checkpoint(tmp_path, amp):
         devices=1,
         max_epochs=1,
         accumulate_grad_batches=2,
-        precision="bf16-mixed" if amp else "32-true",
+        precision="32-true",
         logger=False,
         enable_checkpointing=False,
         enable_progress_bar=False,
@@ -336,7 +355,7 @@ def _optimized_ddp_worker(rank, init_file):
         model = FlowModule(
             **flow_args(),
             g1=bridge_config(),
-            execution={**MATH, "mixed_precision": True, "native_sdpa": True},
+            execution=MATH,
         )
         wrapped = DistributedDataParallel(
             model, gradient_as_bucket_view=True, find_unused_parameters=False
@@ -350,11 +369,13 @@ def _optimized_ddp_worker(rank, init_file):
             if rank == 1:
                 data["l_noisy"][0, 0] = -1
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast("cpu", dtype=torch.bfloat16):
-                value = loss(wrapped(**data))
+            value = loss(wrapped(**data))
             value.backward()
             assert all(
-                p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()
+                p.grad is not None
+                and p.grad.dtype == torch.float32
+                and torch.isfinite(p.grad).all()
+                for p in model.parameters()
             )
             optimizer.step()
         for p in model.parameters():
@@ -376,7 +397,17 @@ def test_optimized_two_rank_ddp_with_mixed_geometry_validity(tmp_path):
 
 @pytest.mark.parametrize(
     "mismatch",
-    [None, "optimizer_updates", "warmup_batches", "measured_batches", "measured_samples"],
+    [
+        None,
+        "optimizer_updates",
+        "warmup_batches",
+        "measured_batches",
+        "measured_samples",
+        "precision",
+        "float32_matmul_precision",
+        "cuda_matmul_allow_tf32",
+        "cudnn_allow_tf32",
+    ],
 )
 def test_benchmark_comparison_requires_equal_work_and_measured_gpu_memory(tmp_path, mismatch):
     import importlib.util
@@ -401,6 +432,10 @@ def test_benchmark_comparison_requires_equal_work_and_measured_gpu_memory(tmp_pa
             shapes_sha256="shape",
             batches_sha256="same",
             parameter_count=40,
+            precision="32-true",
+            float32_matmul_precision="high",
+            cuda_matmul_allow_tf32=True,
+            cudnn_allow_tf32=True,
             optimizer_updates=25,
             accumulate_grad_batches=4,
             total_batches=120,
@@ -410,7 +445,14 @@ def test_benchmark_comparison_requires_equal_work_and_measured_gpu_memory(tmp_pa
             peak_reserved_bytes=peak + 100,
         )
         if mismatch and profile == "optimized":
-            record[mismatch] -= 1
+            if mismatch == "precision":
+                record[mismatch] = "bf16-mixed"
+            elif mismatch == "float32_matmul_precision":
+                record[mismatch] = "highest"
+            elif mismatch in ("cuda_matmul_allow_tf32", "cudnn_allow_tf32"):
+                record[mismatch] = False
+            else:
+                record[mismatch] -= 1
         (folder / "rank0_epoch0.json").write_text(json.dumps(record))
         runs.append(dict(profile=profile, repeat=0, directory=str(folder.parent)))
     report = module.summarize(runs)[1]
@@ -462,3 +504,4 @@ def test_benchmark_dry_run_commands_compose_all_profiles(tmp_path, monkeypatch):
         assert cfg.data.max_num_atoms is None and cfg.trainer.accumulate_grad_batches == 4
         assert cfg.trainer.devices == 8 and cfg.data.dynamic.max_batch_size == 16
         assert not cfg.data.persistent_workers
+        assert cfg.trainer.precision == "32-true"
