@@ -46,10 +46,7 @@ class BlockPairAttention(AttentionPairBias):
         """Attend within blocks and return exactly zero at padded query rows."""
         batch_size, num_atoms, _ = s.shape
         s = self.norm_s(s)
-        q = self.proj_q(s).view(batch_size, num_atoms, self.num_heads, self.head_dim)
-        k = self.proj_k(s).view(batch_size, num_atoms, self.num_heads, self.head_dim)
-        v = self.proj_v(s).view(batch_size, num_atoms, self.num_heads, self.head_dim)
-        gate = self.proj_g(s).sigmoid()
+        q, k, v, gate = self.project_qkvg(s)
 
         # Mask AFTER adding pair bias: zeroing z would not mask the QK term.
         # LayerNorm/projection are pointwise over pairs. Scatter only H channels,

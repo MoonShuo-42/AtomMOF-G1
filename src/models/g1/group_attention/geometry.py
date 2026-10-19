@@ -1,6 +1,7 @@
 """37 invariant scalars from inter-group and both endpoint geometries, then bias."""
 
 import torch
+from src.models.execution.ops import content_autocast
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -91,7 +92,7 @@ class GroupGeometryBias(nn.Module):
         if Z.device != self.fc1.weight.device:
             raise ValueError("Z and bias parameters must share a device")
         dtype = compute_dtype(Z, self.fc1.weight)
-        with torch.autocast(device_type=Z.device.type, enabled=False):
+        with content_autocast(self, Z):
             features = self.features(
                 Z.to(dtype), group_mask, geometry_ok, internal_geometry=internal_geometry
             )

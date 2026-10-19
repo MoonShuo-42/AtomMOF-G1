@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from torch.nn import Module
 from lightning.pytorch.utilities import rank_zero_info
 
+from src.models.execution import configure_execution
+from src.models.execution.ops import repeat_batch
 from src.models.loss.mic_dist import mic_pairwise_dist
 from src.models.energy import AtomicOverlapEnergy, MLIPEnergy
 from src.models.simple.layers import AtomAttentionEncoder, AtomAttentionDecoder, TokenTransformer
@@ -29,6 +31,7 @@ class FlowModule(nn.Module):
         attention_impl,
         activation_checkpointing=False, 
         g1=None,
+        execution=None,
         # **kwargs
     ):
         super().__init__()
@@ -86,6 +89,8 @@ class FlowModule(nn.Module):
                 h_dim=token_s, depth=token_transformer_depth, **g1_args
             )
 
+        self.execution_options = configure_execution(self, execution)
+
     @property
     def g1_enabled(self):
         return self._g1_enabled
@@ -105,7 +110,7 @@ class FlowModule(nn.Module):
 
         # Aggregate
         atom_to_token = atom_to_token.float()
-        atom_to_token = atom_to_token.repeat_interleave(multiplicity, 0)
+        atom_to_token = repeat_batch(atom_to_token, multiplicity, enabled=getattr(self, "avoid_repeat_copies", False))
         atom_to_token_mean = atom_to_token / (
             atom_to_token.sum(dim=1, keepdim=True) + 1e-6
         )
@@ -121,7 +126,7 @@ class FlowModule(nn.Module):
         token_feats = self.token_to_atom_trans(token_single)
 
         # Broadcast
-        atom_to_token = atom_to_token.repeat_interleave(multiplicity, 0)
+        atom_to_token = repeat_batch(atom_to_token, multiplicity, enabled=getattr(self, "avoid_repeat_copies", False))
         atom_feats = torch.bmm(atom_to_token, token_feats)
         return atom_feats
 
@@ -205,6 +210,10 @@ class AtomFlowMatching(Module):
         self.synchronize_timesteps = synchronize_timesteps
 
     @property
+    def avoid_repeat_copies(self):
+        return self.flow_model.execution_options.get("avoid_repeat_copies", False)
+
+    @property
     def device(self):
         return next(self.flow_model.parameters()).device
 
@@ -255,10 +264,10 @@ class AtomFlowMatching(Module):
             times = torch.rand(batch_size * multiplicity, device=self.device)
 
         # Prepare data
-        atom_coords = feats["cart_coords"].repeat_interleave(multiplicity, 0)
-        lattice = feats["lattice"].repeat_interleave(multiplicity, 0)
-        atom_coords_0 = feats['cart_coords_0'].repeat_interleave(multiplicity, 0)
-        lattice_0 = feats['lattice_0'].repeat_interleave(multiplicity, 0)
+        atom_coords = repeat_batch(feats["cart_coords"], multiplicity, enabled=getattr(self, "avoid_repeat_copies", False))
+        lattice = repeat_batch(feats["lattice"], multiplicity, enabled=getattr(self, "avoid_repeat_copies", False))
+        atom_coords_0 = repeat_batch(feats['cart_coords_0'], multiplicity, enabled=getattr(self, "avoid_repeat_copies", False))
+        lattice_0 = repeat_batch(feats['lattice_0'], multiplicity, enabled=getattr(self, "avoid_repeat_copies", False))
         
         # Add noise
         noised_atom_coords = (1 - times[:, None, None]) * atom_coords_0 + times[:, None, None] * atom_coords
@@ -305,7 +314,7 @@ class AtomFlowMatching(Module):
         # Loss for Cartesian coordinates
         true_atom_coords = out_dict['aligned_true_atom_coords']
         pred_atom_coords = out_dict['denoised_atom_coords']
-        atom_mask = feats["atom_pad_mask"].repeat_interleave(multiplicity, 0)
+        atom_mask = repeat_batch(feats["atom_pad_mask"], multiplicity, enabled=getattr(self, "avoid_repeat_copies", False))
 
         coord_loss = loss_fn(pred_atom_coords, true_atom_coords, reduction='none')
         coord_loss = (coord_loss * atom_mask[..., None]).sum(dim=(1, 2)) / (atom_mask.sum(dim=1) + 1e-8)
@@ -482,11 +491,11 @@ class AtomFlowMatching(Module):
 
             # Parepare atom_types for potential
             steering_atom_types = network_condition_kwargs.get("feats", {}).get("ref_element", None)
-            steering_atom_types = steering_atom_types.repeat_interleave(multiplicity, 0) # Shape: [batch * multiplicity, num_atoms,]
+            steering_atom_types = repeat_batch(steering_atom_types, multiplicity, enabled=getattr(self, "avoid_repeat_copies", False)) # Shape: [batch * multiplicity, num_atoms,]
 
         ### Standard setup and initialization
         num_steps = default(num_sampling_steps, self.num_sampling_steps)
-        atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
+        atom_mask = repeat_batch(atom_mask, multiplicity, enabled=getattr(self, "avoid_repeat_copies", False))
         batch_size = atom_mask.shape[0]
         num_atoms = atom_mask.shape[1]
         timesteps = torch.linspace(0.0, 1.0, num_steps + 1, device=self.device)

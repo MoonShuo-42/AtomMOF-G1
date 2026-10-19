@@ -510,3 +510,13 @@ and the CPU/CUDA component benchmark in scripts/benchmark_g1_optimizations.py.
 Condition sharing and compact pairs are now unconditional: remove the former
 share_condition and condition_encoder.pair_mode overrides from training commands.
 Dense mathematical references live only in tests/reference_g1_condition.py.
+
+
+### Whole-model execution profiles
+
+The optional `execution=math` and `execution=optimized` training profiles preserve
+model architecture and checkpoint parameter names. The optimized profile uses
+BF16 content operations; geometry keeps its existing precision. Both baseline and
+G1 are supported. See [implementation and benchmark instructions](src/models/execution/README.md).
+The 2x training-speed and 50% peak-memory targets require server measurements;
+local correctness tests are not evidence that these targets have been achieved.

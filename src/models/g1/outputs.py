@@ -24,6 +24,7 @@ class G1Context(NamedTuple):
     geometry: GeometryOutput  # E, rho, geometry_ok
     atom_mask: Tensor  # (B,N), bool
     group_layout: GroupLayout  # required layout prepared for this atom mask and group policy
+    prepared_geometry: Tensor | None = None  # optional mask-safe (B,N*16,N), same lifetime as E
 
 
 class G1Intermediates(NamedTuple):

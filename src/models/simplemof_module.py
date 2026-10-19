@@ -180,7 +180,8 @@ class SimpleMOFModule(LightningModule):
         for loss_name, batch_loss in flow_loss_dict.items():
             # Stratified loss
             stratified_losses = stratify_loss_by_time(
-                batch_t=out['times'], batch_loss=batch_loss, loss_name=loss_name
+                batch_t=out['times'], batch_loss=batch_loss, loss_name=loss_name,
+                fast=self.structure_module.flow_model.execution_options.get("vectorized_metrics", False),
             )
             for k, v in stratified_losses.items():
                 self.log(f'train/{k}', v, batch_size=batch_size)
@@ -377,6 +378,7 @@ class SimpleMOFModule(LightningModule):
             params=self.trainer.model.parameters(), 
             lr=self.training_args.lr,
             weight_decay=self.training_args.weight_decay,
+            **({"fused": True} if self.training_args.get("fused_adam", False) else {}),
         )
 
         if self.training_args.lr_scheduler == "af3":

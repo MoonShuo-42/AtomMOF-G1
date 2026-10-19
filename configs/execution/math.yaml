@@ -1,0 +1,18 @@
+# @package _global_
+# Same architecture, algebraic rewrites only. Use execution=math.
+model:
+  flow_model_args:
+    execution:
+      pair_norm_reuse: true
+      fused_qkvg: true
+      native_sdpa: false
+      sdpa_backend: auto
+      fold_readback: true
+      geometry_layout_reuse: true
+      vectorized_metrics: true
+      avoid_repeat_copies: true
+      mixed_precision: false
+      compile_blocks: false
+      compile_pair_features: false
+      compile_backend: inductor
+      compile_dynamic: true

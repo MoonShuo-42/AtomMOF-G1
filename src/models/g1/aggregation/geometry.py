@@ -41,6 +41,7 @@ class GeometryAggregator(nn.Module):
         atom_mask: Tensor,
         group_mask: Tensor,
         geometry_ok: Tensor | None = None,
+        *, prepared_geometry: Tensor | None = None,
     ) -> GeometryAggregationOutput:
         """Return masked U and Z for dynamic K without changing membership weights.
 
@@ -69,8 +70,27 @@ class GeometryAggregator(nn.Module):
         pair_mask = valid_atoms[:, :, None] & valid_atoms[:, None, :]
         weight_mask = valid_groups[:, :, None] & valid_atoms[:, None, :]
         # Multiplying by zero is insufficient when padding contains NaN/Inf.
-        safe_E = torch.where(pair_mask[..., None], E, 0)
         safe_Pbar = torch.where(weight_mask, Pbar, 0)
-        U = self.atom_to_group(safe_E, safe_Pbar)
+        if prepared_geometry is None:
+            safe_E = torch.where(pair_mask[..., None], E, 0)
+            U = self.atom_to_group(safe_E, safe_Pbar)
+        else:
+            if prepared_geometry.shape != (batch, atoms * 16, atoms) or prepared_geometry.device != E.device:
+                raise ValueError("prepared_geometry must be (B,N*16,N) on E's device")
+            dtype = torch.float64 if torch.float64 in (prepared_geometry.dtype, Pbar.dtype) else torch.float32
+            with torch.autocast(device_type=E.device.type, enabled=False):
+                U = torch.bmm(prepared_geometry.to(dtype), safe_Pbar.to(dtype).transpose(1, 2))
+                U = U.reshape(batch, atoms, 16, groups).permute(0, 1, 3, 2)
         Z = self.group_to_group(U, safe_Pbar)
         return GeometryAggregationOutput(U, Z)
+
+
+def prepare_geometry_layout(E: Tensor, atom_mask: Tensor, geometry_ok: Tensor) -> Tensor:
+    """Mask once and arrange E as (B,N*16,N) for repeated batched GEMMs."""
+    if geometry_ok.ndim == 2:
+        geometry_ok = geometry_ok[:, 0]
+    valid = atom_mask.bool() & geometry_ok.bool()[:, None]
+    pair_mask = valid[:, :, None] & valid[:, None, :]
+    dtype = torch.float64 if E.dtype == torch.float64 else torch.float32
+    safe = torch.where(pair_mask[..., None], E.to(dtype), 0)
+    return safe.permute(0, 1, 3, 2).flatten(1, 2).contiguous()

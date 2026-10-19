@@ -133,7 +133,13 @@ class G1Module(nn.Module):
             mask,
             group_layout=context.group_layout,
         )
-        relations = self.aggregation(geo.E, routes.Pbar, mask, routes.group_mask, geo.geometry_ok)
+        if context.prepared_geometry is None:
+            relations = self.aggregation(geo.E, routes.Pbar, mask, routes.group_mask, geo.geometry_ok)
+        else:
+            relations = self.aggregation(
+                geo.E, routes.Pbar, mask, routes.group_mask, geo.geometry_ok,
+                prepared_geometry=context.prepared_geometry,
+            )
         internal = prepare_group_internal(relations.Z, routes.group_mask, geo.geometry_ok)
         groups = self.group_interaction(
             H,

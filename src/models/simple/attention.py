@@ -1,4 +1,7 @@
 import warnings
+from contextlib import nullcontext
+
+from src.models.execution.ops import project_normalized_pairs
 from typing import Optional, Literal
 
 import torch
@@ -56,6 +59,9 @@ class AttentionPairBias(nn.Module):
         self.num_heads = num_heads
         self.head_dim = c_s // num_heads
         self.inf = inf
+        self.fused_qkvg = False
+        self.native_sdpa = False
+        self.sdpa_backend = "auto"
 
         self.initial_norm = initial_norm
         if self.initial_norm:
@@ -93,6 +99,22 @@ class AttentionPairBias(nn.Module):
                 Rearrange("b ... h -> b h ..."),
             )
 
+    def project_qkvg(self, s: Tensor):
+        layers = (self.proj_q, self.proj_k, self.proj_v, self.proj_g)
+        if self.fused_qkvg:
+            weight = torch.cat([layer.weight for layer in layers], dim=0)
+            bias = None
+            if any(layer.bias is not None for layer in layers):
+                bias = torch.cat([
+                    layer.bias if layer.bias is not None else weight.new_zeros(layer.out_features)
+                    for layer in layers
+                ])
+            q, k, v, gate = F.linear(s, weight, bias).split(self.c_s, dim=-1)
+        else:
+            q, k, v, gate = (layer(s) for layer in layers)
+        shape = (*s.shape[:2], self.num_heads, self.head_dim)
+        return q.reshape(shape), k.reshape(shape), v.reshape(shape), gate.sigmoid()
+
     def _manual_attention(
         self, 
         q: Float['b n h d'], 
@@ -119,9 +141,20 @@ class AttentionPairBias(nn.Module):
         # Reshape for scaled_dot_product_attention: (b, n, h, d) -> (b, h, n, d)
         q, k, v = map(lambda t: rearrange(t, 'b n h d -> b h n d'), (q, k, v))
 
-        o = F.scaled_dot_product_attention(
-            q.float(), k.float(), v.float(), attn_mask=attn_mask.float()
-        ).to(v.dtype)
+        backend = self.sdpa_backend
+        context = nullcontext()
+        if backend != "auto":
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            selected = dict(math=SDPBackend.MATH, efficient=SDPBackend.EFFICIENT_ATTENTION,
+                            flash=SDPBackend.FLASH_ATTENTION, cudnn=SDPBackend.CUDNN_ATTENTION)
+            context = sdpa_kernel(selected[backend])
+        with context:
+            if self.native_sdpa:
+                o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask.to(q.dtype))
+            else:
+                o = F.scaled_dot_product_attention(
+                    q.float(), k.float(), v.float(), attn_mask=attn_mask.float()
+                ).to(v.dtype)
         
         # Transpose back to (b, n, h, d_h)
         return o.transpose(1, 2)
@@ -140,7 +173,8 @@ class AttentionPairBias(nn.Module):
     def _create_attn_mask(
         self, 
         mask: Bool['b n'], 
-        pair_bias: Optional[Float['b n n c_z']] = None
+        pair_bias: Optional[Float['b n n c_z']] = None,
+        pair_normalized: bool = False,
     ) -> Float['b h n n']:
 
         B, N = mask.shape
@@ -152,7 +186,11 @@ class AttentionPairBias(nn.Module):
         # (Optional) Add pair bias
         if self.use_pair_bias:
             assert pair_bias is not None, "pair_bias must be provided if use_pair_bias is True"
-            z_bias = self.proj_z(pair_bias) # Shape (b, h, n, n)
+            if pair_normalized:
+                z_bias = project_normalized_pairs(pair_bias, self.proj_z[0], self.proj_z[1])
+                z_bias = self.proj_z[2](z_bias)
+            else:
+                z_bias = self.proj_z(pair_bias) # Shape (b, h, n, n)
             attn_mask = attn_mask + z_bias
 
         return attn_mask.contiguous() # contiguous for xformers
@@ -162,6 +200,7 @@ class AttentionPairBias(nn.Module):
         s: Tensor,
         mask: Tensor,
         z: Optional[Tensor] = None,
+        pair_normalized: bool = False,
     ) -> Tensor:
         """
         Forward pass.
@@ -178,13 +217,10 @@ class AttentionPairBias(nn.Module):
 
         # Initial normalization and projections (common logic)
         s = self.norm_s(s)
-        q = self.proj_q(s).view(B, N, self.num_heads, self.head_dim)
-        k = self.proj_k(s).view(B, N, self.num_heads, self.head_dim)
-        v = self.proj_v(s).view(B, N, self.num_heads, self.head_dim)
-        g = self.proj_g(s).sigmoid()
+        q, k, v, g = self.project_qkvg(s)
 
         # Attention mask
-        attn_mask = self._create_attn_mask(mask, z)
+        attn_mask = self._create_attn_mask(mask, z, pair_normalized)
 
         # Attention computation
         o = self.attention_fn(q, k, v, attn_mask)

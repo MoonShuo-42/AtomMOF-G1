@@ -39,6 +39,7 @@ class AtomReadback(nn.Module):
         pool_eps: float = 1e-8,
     ):
         super().__init__()
+        self.fold_values = False
         self.geometry_features = ReadbackGeometryFeatures()
         self.geometry_bias = ReadbackGeometryBias(bias_hidden_dim, heads)
         self.attention = ReadbackAttention(h_dim, group_dim, heads, head_dim, pool_eps)
@@ -64,7 +65,12 @@ class AtomReadback(nn.Module):
         )
         bias = self.geometry_bias(features, atom_mask, group_mask, geometry_ok)
         weights = self.attention(H, S_plus, P, bias, atom_mask, group_mask)
-        values = self.value(H, S_plus, features, atom_mask, group_mask, geometry_ok)
-        readback = self.reduction(weights, values)
+        if self.fold_values:
+            readback = self.value.pooled(
+                H, S_plus, features, weights, atom_mask, group_mask, geometry_ok
+            )
+        else:
+            values = self.value(H, S_plus, features, atom_mask, group_mask, geometry_ok)
+            readback = self.reduction(weights, values)
         update = self.residual(H, readback, atom_mask)
         return AtomReadbackOutput(readback, update.delta_H, update.H_updated, bias, weights)

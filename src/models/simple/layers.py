@@ -7,6 +7,7 @@ from torch.nn.functional import one_hot
 
 import src.models.layers.initialize as init
 from src.data import const
+from src.models.execution.ops import repeat_batch
 from src.models.modules.utils import LinearNoBias
 from src.models.simple.transformers import DiT, PositionalEmbedder
 
@@ -72,14 +73,8 @@ class AtomAttentionEncoder(Module):
             activation_checkpointing=activation_checkpointing,
         )
 
-    def forward(
-        self, 
-        x_t, 
-        l_t, 
-        t, 
-        feats,
-        multiplicity=1
-    ):
+    def condition_features(self, feats):
+        """Static reference features, isolated for regional operator fusion."""
         B, N, _ = feats["ref_pos"].shape
         atom_mask = feats["atom_pad_mask"].bool()
 
@@ -143,12 +138,25 @@ class AtomAttentionEncoder(Module):
         p = p + self.c_to_p_trans_k(c.view(B, 1, N, c.shape[-1]))
         p = p + self.p_mlp(p)
         
+        return c, p
+
+    def forward(
+        self,
+        x_t,
+        l_t,
+        t,
+        feats,
+        multiplicity=1
+    ):
+        B, N, _ = feats["ref_pos"].shape
+        atom_mask = feats["atom_pad_mask"].bool()
+        c, p = self.condition_features(feats)
         q = c
 
         # Multiplicity for different versions
-        q = q.repeat_interleave(multiplicity, 0)
-        p = p.repeat_interleave(multiplicity, 0)
-        atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
+        q = repeat_batch(q, multiplicity, enabled=getattr(self, "avoid_repeat_copies", False))
+        p = repeat_batch(p, multiplicity, enabled=getattr(self, "avoid_repeat_copies", False))
+        atom_mask = repeat_batch(atom_mask, multiplicity, enabled=getattr(self, "avoid_repeat_copies", False))
 
         # Add noisy positions
         q = q + self.x_to_q_trans(x_t)
@@ -205,7 +213,7 @@ class AtomAttentionDecoder(Module):
         multiplicity=1
     ):
         atom_mask = feats["atom_pad_mask"]
-        atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
+        atom_mask = repeat_batch(atom_mask, multiplicity, enabled=getattr(self, "avoid_repeat_copies", False))
 
         x = self.atom_decoder(x, t, atom_mask)
 
@@ -263,7 +271,7 @@ class TokenTransformer(Module):
         after_layer=None,
     ):
         token_mask = feats["atom_pad_mask"] # TODO: Rename to token_pad_mask
-        token_mask = token_mask.repeat_interleave(multiplicity, 0)
+        token_mask = repeat_batch(token_mask, multiplicity, enabled=getattr(self, "avoid_repeat_copies", False))
 
         # Initialize single embeddings
         s_init = self.s_init(x)  # (batch_size, num_tokens, token_s)

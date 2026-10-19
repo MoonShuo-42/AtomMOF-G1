@@ -1,0 +1,4 @@
+# Training diagnostics only; benchmark launcher disables checkpoint writes.
+execution_benchmark:
+  _target_: src.callbacks.execution_benchmark.ExecutionBenchmark
+  warmup_batches: 20

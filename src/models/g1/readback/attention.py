@@ -3,6 +3,7 @@
 import math
 
 import torch
+from src.models.execution.ops import content_autocast
 from torch import Tensor, nn
 
 from .utils import compute_dtype, linear, positive_int, validate_content
@@ -59,7 +60,7 @@ class ReadbackAttention(nn.Module):
         if any(x.device != H.device for x in (P, geometry_bias, self.query_projection.weight)):
             raise ValueError("attention inputs and parameters must share a device")
         dtype = compute_dtype(H, S_plus, P, geometry_bias, self.query_projection.weight)
-        with torch.autocast(device_type=H.device.type, enabled=False):
+        with content_autocast(self, H):
             H = torch.where(atom_mask.bool()[..., None], H.to(dtype), 0)
             S_plus = torch.where(group_mask.bool()[..., None], S_plus.to(dtype), 0)
             prior = torch.where(valid, P.to(dtype).transpose(1, 2), 0)

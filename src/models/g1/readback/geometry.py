@@ -1,6 +1,7 @@
 """Target-group internal geometry, 24 invariant scalars and per-head readback bias."""
 
 import torch
+from src.models.execution.ops import content_autocast
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -81,7 +82,7 @@ class ReadbackGeometryBias(nn.Module):
             raise ValueError("features and bias parameters must share a device")
         valid = valid & available_geometry(geometry_ok, features)[:, None, None]
         dtype = compute_dtype(features, self.fc1.weight)
-        with torch.autocast(device_type=features.device.type, enabled=False):
+        with content_autocast(self, features):
             features = torch.where(valid[..., None], features.to(dtype), 0)
             bias = linear(F.silu(linear(features, self.fc1)), self.fc2)
             return bias.masked_fill(~valid[..., None], 0)

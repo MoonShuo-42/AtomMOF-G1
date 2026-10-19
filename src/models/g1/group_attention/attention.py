@@ -4,6 +4,7 @@ import math
 from typing import NamedTuple
 
 import torch
+from src.models.execution.ops import content_autocast
 from torch import Tensor, nn
 
 from .utils import compute_dtype, linear, positive_int, validate_groups
@@ -43,7 +44,7 @@ class GroupSelfAttention(nn.Module):
         if geometry_bias.device != S.device or self.qkv.weight.device != S.device:
             raise ValueError("S, geometry_bias and attention parameters must share a device")
         dtype = compute_dtype(S, geometry_bias, self.qkv.weight)
-        with torch.autocast(device_type=S.device.type, enabled=False):
+        with content_autocast(self, S):
             valid = group_mask.bool()
             pair_valid = valid[:, :, None] & valid[:, None, :]
             content = torch.where(valid[..., None], S.to(dtype), 0)

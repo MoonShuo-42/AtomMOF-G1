@@ -1,0 +1,32 @@
+# @package _global_
+# Same architecture and training workload, with opt-in BF16 content operations.
+# Keep sensitive geometry/search/normalization in FP32/FP64.
+# Compile is separately opt-in until measured on the actual dynamic shapes.
+trainer:
+  precision: bf16-mixed
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    bucket_cap_mb: 25
+    find_unused_parameters: false
+model:
+  flow_model_args:
+    execution:
+      pair_norm_reuse: true
+      fused_qkvg: true
+      native_sdpa: true
+      sdpa_backend: auto
+      fold_readback: true
+      geometry_layout_reuse: true
+      vectorized_metrics: true
+      avoid_repeat_copies: true
+      mixed_precision: true
+      compile_blocks: false
+      compile_pair_features: false
+      compile_backend: inductor
+      compile_dynamic: true
+  training_args:
+    fused_adam: true
+data:
+  persistent_workers: true
+  prefetch_factor: 2

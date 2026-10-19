@@ -106,6 +106,7 @@ class BWDBDataModule(LightningDataModule):
         num_workers: int = 4,
         prefetch_factor: int = 2,
         pin_memory: bool = True,
+        persistent_workers: bool = False,
         sampler: Optional[str] = None,
         dynamic: Optional[Dict] = None,
         predict_split: str = 'val',
@@ -122,6 +123,7 @@ class BWDBDataModule(LightningDataModule):
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor
         self.pin_memory = pin_memory
+        self.persistent_workers = persistent_workers
         self.sampler = sampler
         self.dynamic = dynamic
         self.predict_split = predict_split
@@ -219,6 +221,8 @@ class BWDBDataModule(LightningDataModule):
             shuffle=is_train if sampler is None and batch_sampler is None else False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers and self.num_workers > 0,
+            **({"prefetch_factor": self.prefetch_factor} if self.num_workers > 0 else {}),
         )
 
     def train_dataloader(self) -> DataLoader:

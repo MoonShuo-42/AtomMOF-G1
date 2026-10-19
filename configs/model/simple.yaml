@@ -26,6 +26,7 @@ flow_model_args:
   atom_decoder_heads: 4
   attention_impl: pytorch  # ["pytorch (default)", "manual", "xformers"]
   activation_checkpointing: false
+  execution: null
 
 ##### Training arguments #####
 
@@ -56,6 +57,7 @@ training_args:
   # Optimizer
   lr: 1e-4
   weight_decay: 0.0
+  fused_adam: false
 
   # Learning rate scheduler
   lr_scheduler: null # ["null (default)", "af3"]

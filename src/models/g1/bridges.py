@@ -14,6 +14,8 @@ from .outputs import G1Context
 from .routing import SoftRouter
 from .routing.groups import AtomCountGroups
 from .validation import validate_mask
+from .aggregation.geometry import prepare_geometry_layout
+from src.models.execution.ops import repeat_batch
 
 
 class G1Bridges(nn.Module):
@@ -120,14 +122,17 @@ class G1Bridges(nn.Module):
         """
         if type(multiplicity) is not int or multiplicity < 1:
             raise ValueError("multiplicity must be a positive integer")
-        mask = validate_mask(feats["atom_pad_mask"]).repeat_interleave(multiplicity, 0)
+        mask = repeat_batch(validate_mask(feats["atom_pad_mask"]), multiplicity,
+                            enabled=getattr(self, "avoid_repeat_copies", False))
         if x_t.shape != (*mask.shape, 3) or l_t.shape != (mask.shape[0], 6):
             raise ValueError("G1 noisy state must match the multiplicity-expanded atom mask")
         contexts = {}
         shared = None
         first = self.bridges[str(self.insert_after[0])]
-        c_cond = first.encode_condition(feats).repeat_interleave(multiplicity, 0)
+        c_cond = repeat_batch(first.encode_condition(feats), multiplicity,
+                              enabled=getattr(self, "avoid_repeat_copies", False))
         layouts = {}
+        geometry_layouts = {}
         for key, bridge in self.bridges.items():
             if not self.share_geometry or shared is None:
                 geo = bridge.geometry(x_t, l_t, mask)
@@ -144,7 +149,13 @@ class G1Bridges(nn.Module):
                 layout = layouts[capacity]
             else:
                 layout = selector.prepare(mask)
-            contexts[key] = G1Context(c_cond, geo, mask, layout)
+            prepared = None
+            if getattr(self, "geometry_layout_reuse", False):
+                geometry_key = id(geo)
+                if geometry_key not in geometry_layouts:
+                    geometry_layouts[geometry_key] = prepare_geometry_layout(geo.E, mask, geo.geometry_ok)
+                prepared = geometry_layouts[geometry_key]
+            contexts[key] = G1Context(c_cond, geo, mask, layout, prepared)
         return contexts
 
     def forward(

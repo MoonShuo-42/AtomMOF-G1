@@ -1,6 +1,7 @@
 """Relation-conditioned value for every atom/group pair."""
 
 import torch
+from src.models.execution.ops import content_autocast
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -61,7 +62,7 @@ class RelationConditionedValue(nn.Module):
             raise ValueError("content and value parameters must share a device")
         geometry_valid = valid & available_geometry(geometry_ok, H)[:, None, None]
         dtype = compute_dtype(H, S_plus, features, self.atom_projection.weight)
-        with torch.autocast(device_type=H.device.type, enabled=False):
+        with content_autocast(self, H):
             H = torch.where(atom_mask.bool()[..., None], H.to(dtype), 0)
             S_plus = torch.where(group_mask.bool()[..., None], S_plus.to(dtype), 0)
             features = torch.where(geometry_valid[..., None], features.to(dtype), 0)
@@ -74,3 +75,47 @@ class RelationConditionedValue(nn.Module):
             values = linear(F.silu(hidden), self.output_projection)
             values = values.masked_fill(~valid[..., None], 0)
             return values.reshape(*valid.shape, self.heads, self.head_dim)
+
+    def pooled(
+        self, H: Tensor, S_plus: Tensor, features: Tensor, weights: Tensor,
+        atom_mask: Tensor, group_mask: Tensor, geometry_ok: Tensor | None = None,
+    ) -> Tensor:
+        """Exact per-head reduction BEFORE the final linear projection.
+
+        Sum_k a_k(W_h SiLU(hidden_k)+b_h) =
+        W_h Sum_k a_k SiLU(hidden_k) + b_h Sum_k a_k.
+        The bias mass is retained for empty groups and padding, not assumed to be 1.
+        """
+        valid = validate_content(H, S_plus, atom_mask, group_mask, self.h_dim, self.group_dim)
+        validate_descriptors(features, valid)
+        batch, atoms, groups = valid.shape
+        if weights.shape != (batch, self.heads, atoms, groups):
+            raise ValueError("weights must be (B,heads,N,K)")
+        if weights.device != H.device or H.device != self.atom_projection.weight.device:
+            raise ValueError("weights, content and parameters must share a device")
+        if not weights.is_floating_point():
+            raise TypeError("weights must be floating-point")
+        geometry_valid = valid & available_geometry(geometry_ok, H)[:, None, None]
+        dtype = compute_dtype(H, S_plus, features, weights, self.atom_projection.weight)
+        with content_autocast(self, H):
+            safe_H = torch.where(atom_mask.bool()[..., None], H.to(dtype), 0)
+            safe_S = torch.where(group_mask.bool()[..., None], S_plus.to(dtype), 0)
+            safe_features = torch.where(geometry_valid[..., None], features.to(dtype), 0)
+            hidden = (
+                linear(safe_H, self.atom_projection)[:, :, None]
+                + linear(safe_S, self.group_projection)[:, None]
+                + linear(safe_features, self.geometry_projection)
+            )
+            hidden = F.silu(hidden + self.hidden_bias.to(hidden.dtype))
+            hidden = hidden.masked_fill(~valid[..., None], 0)
+            safe_weights = torch.where(valid[:, None], weights.to(dtype), 0)
+            pooled = torch.einsum("bhik,bikf->bihf", safe_weights, hidden)
+            projection = self.output_projection.weight.reshape(
+                self.heads, self.head_dim, hidden.shape[-1]
+            ).to(pooled.dtype)
+            result = torch.einsum("bihf,hdf->bihd", pooled, projection)
+            if self.output_projection.bias is not None:
+                bias = self.output_projection.bias.to(result.dtype).reshape(self.heads, self.head_dim)
+                mass = safe_weights.to(result.dtype).sum(-1).transpose(1, 2)
+                result = result + mass[..., None] * bias
+            return result.reshape(batch, atoms, self.heads * self.head_dim)
