@@ -29,6 +29,8 @@ class GeometryAggregator(nn.Module):
     removed before arithmetic; valid inputs must be finite.
     """
 
+    _execution_flags = {"aggregation_layout_reuse": "aggregation_layout_reuse"}
+
     def __init__(self):
         super().__init__()
         self.atom_to_group = AtomToGroupGeometry()

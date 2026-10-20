@@ -33,6 +33,11 @@ class PeriodicGeometry(nn.Module):
     and cells wherever the discrete validity/search decisions remain unchanged.
     """
 
+    _execution_flags = {
+        "packed_geometry": "packed_geometry",
+        "bucket_geometry_images": "bucket_geometry_images",
+    }
+
     def __init__(
         self,
         cutoff: float = 0.6,

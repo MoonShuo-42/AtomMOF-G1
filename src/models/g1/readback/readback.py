@@ -28,6 +28,8 @@ class AtomReadback(nn.Module):
     There is no additional normalization, FFN, time modulation or residual gate.
     """
 
+    _execution_flags = {"fold_values": "fold_readback"}
+
     def __init__(
         self,
         h_dim: int = 256,

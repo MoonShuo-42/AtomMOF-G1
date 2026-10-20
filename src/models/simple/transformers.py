@@ -148,6 +148,8 @@ AttentionImpl = Literal["manual", "pytorch", "xformers"]
 class DiTBlock(nn.Module):
     """A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning."""
 
+    _execution_compile_targets = {None: "compile_blocks"}
+
     def __init__(
         self, 
         heads, 
@@ -204,6 +206,11 @@ class DiTBlock(nn.Module):
 
 class DiT(nn.Module):
     """Transformer with DiT blocks"""
+
+    _execution_flags = {
+        "pair_norm_reuse": "pair_norm_reuse",
+        "pair_bias_chunk_size": "pair_bias_chunk_size",
+    }
 
     def __init__(
         self, 

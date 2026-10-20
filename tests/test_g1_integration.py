@@ -466,14 +466,21 @@ def test_two_rank_ddp_uses_all_parameters_with_shared_condition(tmp_path, checkp
     mp.spawn(_ddp_worker, args=(str(tmp_path / "gloo_init"), checkpoint), nprocs=2, join=True)
 
 
-@pytest.mark.parametrize("requested,expected", [(None, True), (False, False), (True, True)])
+@pytest.mark.parametrize(
+    "checkpoint_g1,requested,expected",
+    [(True, None, True), (True, False, False), (True, True, True),
+     (False, None, False), (False, False, False)],
+)
 @pytest.mark.parametrize("profile", [None, "math", "optimized"])
 def test_prediction_entry_honors_checkpoint_and_override(
-    tmp_path, monkeypatch, requested, expected, profile
+    tmp_path, monkeypatch, checkpoint_g1, requested, expected, profile
 ):
     import src.predict as entry
 
-    model = SimpleMOFModule(**model_args(True))
+    from src.data.bwdb_datamodule import BWDBDataModule
+    from src.data.feature.featurizer import Featurizer
+
+    model = SimpleMOFModule(**model_args(checkpoint_g1))
     ckpt = tmp_path / "run" / "checkpoints" / "model.ckpt"
     ckpt.parent.mkdir(parents=True)
     torch.save(
@@ -506,12 +513,20 @@ def test_prediction_entry_honors_checkpoint_and_override(
             Path(__file__).resolve().parents[1] / "configs" / "execution" / f"{profile}.yaml"
         )
         cfg.model = profile_config.model
+    else:
+        cfg.model = {"flow_model_args": {}}
+    # The ordinary config can disagree with the loaded checkpoint's architecture.
+    cfg.model.flow_model_args.g1 = {"enabled": not checkpoint_g1}
+    data = BWDBDataModule("unused", "bwdb", Featurizer(), None)
     seen = []
 
     class Trainer:
         def predict(self, loaded, **kwargs):
             flow = loaded.structure_module.flow_model
             assert flow.g1_enabled is expected
+            assert kwargs["datamodule"] is data
+            assert data.prepare_g1_metadata is (expected and profile is not None)
+            assert not data.prepare_g1_blocks  # shipped profiles leave packing off
             assert flow.execution_options["cache_sampling_conditions"] is (profile is not None)
             for key, value in model.state_dict().items():
                 torch.testing.assert_close(value, loaded.state_dict()[key], rtol=0, atol=0)
@@ -525,7 +540,7 @@ def test_prediction_entry_honors_checkpoint_and_override(
         if config.get("_target_") == "test.Trainer":
             return Trainer()
         if config.get("_target_") == "test.Data":
-            return object()
+            return data
         return original_instantiate(config, **kwargs)
 
     monkeypatch.setattr(entry.hydra.utils, "instantiate", instantiate_entry)

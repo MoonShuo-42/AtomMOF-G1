@@ -88,6 +88,8 @@ class ConditionEncoder(nn.Module):
     Parameters are newly initialized, not automatically loaded from small.ckpt.
     """
 
+    _execution_flags = {"packed_block_attention": "packed_block_attention"}
+
     def __init__(
         self,
         atom_s: int = 256,

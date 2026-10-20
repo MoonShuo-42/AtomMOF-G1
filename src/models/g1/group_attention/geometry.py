@@ -36,6 +36,8 @@ class GroupGeometryFeatures(nn.Module):
     This mathematical descriptor has no learned parameters.
     """
 
+    _execution_flags = {"packed_geometry": "packed_geometry"}
+
     def forward(
         self,
         Z: Tensor,

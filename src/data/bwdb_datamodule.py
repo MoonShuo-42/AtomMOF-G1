@@ -1,6 +1,5 @@
 from pathlib import Path
 from functools import partial
-from src.data.execution_features import prepare_execution_layouts
 from typing import List, Optional, Dict
 
 import torch
@@ -95,6 +94,8 @@ def collate_fn(batch: List[Dict[str, Tensor]], *, compact_batch=False, prepare_g
             final_batch[key] = torch.stack(tensor_list, dim=0)
 
     if prepare_g1_metadata or prepare_g1_blocks:
+        from src.data.execution_features import prepare_execution_layouts
+
         return prepare_execution_layouts(final_batch, prepare_blocks=prepare_g1_blocks)
     return final_batch
 
@@ -137,12 +138,29 @@ class BWDBDataModule(LightningDataModule):
         self.compact_batch = compact_batch
         self.prepare_g1_metadata = prepare_g1_metadata
         self.prepare_g1_blocks = prepare_g1_blocks
+        self._requested_g1_metadata = prepare_g1_metadata
+        self._requested_g1_blocks = prepare_g1_blocks
         self.sampler = sampler
         self.dynamic = dynamic
         self.predict_split = predict_split
 
         self.splits = list(key for key in self.batch_size.keys() if key != 'predict')
         self._datasets = {}
+
+    def configure_model_execution(self, *, g1_enabled: bool, execution):
+        """Resolve CPU layouts from the constructed/loaded model before setup.
+
+        Preserve explicit preparation requests when G1 is enabled. A disabled
+        branch never prepares G1 tensors, even if a profile requests packing.
+        Runtime model options also enable checkpoint-driven inference layouts.
+        """
+        self.prepare_g1_blocks = g1_enabled and (
+            self._requested_g1_blocks or execution.get("packed_block_attention", False)
+        )
+        self.prepare_g1_metadata = g1_enabled and (
+            self._requested_g1_metadata or self.prepare_g1_blocks
+            or execution.get("prepared_layouts", False)
+        )
 
     def setup(self, stage: Optional[str] = None):
         """Instantiate datasets for each split."""

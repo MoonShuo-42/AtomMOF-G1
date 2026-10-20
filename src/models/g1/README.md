@@ -38,6 +38,40 @@ H,S_plus,U,Z,P ── AtomReadback ── readback,delta_H,H_updated
 H 由外部主干提供。G1Bridges 默认在主干 DiT 第 6/12/18/24 层之后执行更新，
 通过默认关闭的配置开关控制；具体接入与训练/推理方式见第 8 节。
 
+### 与 AtomMOF 主干的边界
+
+G1 仍是可选的模块扩展。六个子模块及多桥调度位于 `src/models/g1/`，
+主干 `FlowModule` 只负责按开关构造桥、准备上下文并传入层后回调。
+DiT 的 `after_layer` 接口不包含路由、周期几何、U/Z 汇总或读回公式。
+
+- `model.flow_model_args.g1.enabled=false`：不导入或构造 G1，不注册 G1 参数，
+  不执行条件编码、几何搜索或桥更新；训练/推理入口同时关闭 G1 专用 CPU 布局准备。
+- `enabled=true`：主干在配置的层后调用 G1。四桥共享的是 G1 自己的
+  ConditionEncoder；它与原始 AtomMOF 的原子编码器不共享可学习参数。
+- G1 条件编码复用主干的 Attention/MLP 类和公共工具，这是代码复用。
+  公共执行策略由各组件声明其所需开关，不反向导入 G1 类。
+- 对已加载的 G1 checkpoint 使用 `predict_args.g1_enabled=false` 是推理消融：
+  保留 checkpoint 参数但跳过 G1 计算和专用数据准备；不能将其当成重新训练的 baseline。
+
+训练和推理入口在模型构造或加载完成后调用 `configure_data_execution`，
+以实际模型状态设置数据预处理。推理以 checkpoint、显式消融开关和运行时 execution
+配置为准，无需另行指定 `data.prepare_g1_metadata=true` 来修正默认训练配置的差异。
+自行调用 DataModule/Trainer 的脚本应在创建 DataLoader 前调用同一接口；
+没有预处理元数据的直接模型调用仍可使用设备端回退路径。
+
+`execution=math/optimized` 是可同时用于 baseline 和 G1 的实现优化开关，
+与是否加入 G1 相互独立。因此关闭 G1 表示使用 baseline 架构，不表示还原上游仓库
+每一行实现；参数、输入/输出接口与计算精度的对齐由回归测试检查。
+本次边界调整不改变模型公式、参数键/形状、训练样本、batch 预算或精度设置。
+
+隔离验证（2026-10-20，基于 `375d721` 的本地修改）：`python -m pytest tests -q`
+共 **434 项通过、4 条测试环境警告**。包括禁止导入整个 G1 包后的 baseline
+前向/反向、训练/推理入口的数据准备、checkpoint 开关与运行时配置不一致、
+六个子模块、编译开关重置、采样及双进程 Gloo DDP。
+另将修改前后的执行策略用于同权重的小模型，baseline/G1 两条路径的 CPU 输出和
+参数梯度逐项完全一致。small 参数量仍为 baseline 38,376,320、G1 40,525,216。
+这些是本地 CPU 正确性验证，不是本次改动的服务器加速或显存测量。
+
 ## 2. 本地文件与模块化方式
 
 | 文件 | 职责 |
@@ -49,6 +83,7 @@ H 由外部主干提供。G1Bridges 默认在主干 DiT 第 6/12/18/24 层之后
 | __init__.py | 对外导出 |
 | configs/g1/default.yaml（仓库根目录下） | 组合 configs/g1/ 下的六份子模块配置 |
 | tests/test_g1_module.py（仓库根目录下） | 封装与端到端测试 |
+| tests/test_g1_isolation.py（仓库根目录下） | baseline 无 G1 导入运行、数据准备与训练入口隔离验证 |
 
 六个子模块目录统一放在 src/models/g1/ 下，各自保持独立：
 [conditioning](conditioning/README.md)、[geometry](geometry/README.md)、

@@ -12,6 +12,7 @@ from omegaconf import DictConfig
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
+from src.models.execution import configure_data_execution
 from src.utils import (
     RankedLogger,
     extras,
@@ -53,6 +54,8 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         model = type(model).load_from_checkpoint(
             cfg.pretrained_ckpt_path, map_location="cpu", strict=False, **(model.hparams)
         )
+
+    configure_data_execution(datamodule, model.structure_module.flow_model)
 
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))

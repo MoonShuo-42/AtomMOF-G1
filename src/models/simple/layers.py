@@ -13,6 +13,9 @@ from src.models.simple.transformers import DiT, PositionalEmbedder
 
 
 class AtomAttentionEncoder(Module):
+
+    _execution_compile_targets = {"condition_features": "compile_pair_features"}
+
     def __init__(
         self, 
         atom_s, 
@@ -236,6 +239,9 @@ class AtomAttentionDecoder(Module):
 
 
 class TokenTransformer(Module):
+
+    _execution_compile_targets = {"_pair_features": "compile_token_pairs"}
+
     def __init__(
         self, 
         token_s, 

@@ -27,6 +27,8 @@ class G1Bridges(nn.Module):
     Shared geometry requires the same parameter-free PeriodicGeometry at each site.
     """
 
+    _execution_flags = {"geometry_layout_reuse": "geometry_layout_reuse"}
+
     def __init__(
         self,
         h_dim: int,

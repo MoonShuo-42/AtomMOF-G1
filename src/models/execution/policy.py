@@ -3,10 +3,6 @@ from collections.abc import Mapping
 
 
 def configure_execution(model, options: Mapping | None = None):
-    from src.models.g1.readback import AtomReadback
-    from src.models.simple.attention import AttentionPairBias
-    from src.models.simple.transformers import DiT, DiTBlock
-
     cfg = dict(options or {})
     defaults = dict(
         reuse_pair_buffer=False,
@@ -59,93 +55,31 @@ def configure_execution(model, options: Mapping | None = None):
     if not isinstance(defaults["compile_backend"], str):
         raise TypeError("execution.compile_backend must be a string")
 
-    # Plain attributes add neither parameters nor state_dict keys.
+    # Components declare their runtime flags and compile targets locally. The
+    # dispatcher imports neither the backbone nor an optional extension.
+    import torch
+
     for module in model.modules():
         for key in (
-            "reuse_pair_buffer",
-            "cache_time_features",
-            "aggregation_layout_reuse",
-            "packed_block_attention",
+            "reuse_pair_buffer", "cache_time_features", "avoid_repeat_copies",
+            "prepared_layouts", "fused_pair_features",
         ):
             setattr(module, key, defaults[key])
         module._time_frequencies = None
-        module.avoid_repeat_copies = defaults["avoid_repeat_copies"]
-        module.prepared_layouts = defaults["prepared_layouts"]
-        module.fused_pair_features = defaults["fused_pair_features"]
-        if isinstance(module, AttentionPairBias):
-            module.fused_qkvg = defaults["fused_qkvg"]
-            module.broadcast_masks = defaults["broadcast_masks"]
-            module.sdpa_backend = defaults["sdpa_backend"]
-        if isinstance(module, DiT):
-            module.pair_norm_reuse = defaults["pair_norm_reuse"]
-            module.pair_bias_chunk_size = defaults["pair_bias_chunk_size"]
-        if isinstance(module, AtomReadback):
-            module.fold_values = defaults["fold_readback"]
-        if module.__class__.__module__.startswith("src.models.g1."):
-            module.geometry_layout_reuse = defaults["geometry_layout_reuse"]
-            module.packed_geometry = defaults["packed_geometry"]
-            module.bucket_geometry_images = defaults["bucket_geometry_images"]
-    from src.models.g1.conditioning.features import AtomConditionFeatures
-    from src.models.simple.layers import AtomAttentionEncoder
-
-    for module in model.modules():
-        if isinstance(module, DiTBlock) and not defaults["compile_blocks"]:
-            module._compiled_call_impl = None
-        if (
-            isinstance(module, AtomConditionFeatures)
-            and not defaults["compile_pair_features"]
-        ):
-            module._compiled_call_impl = None
-        if isinstance(module, AtomAttentionEncoder):
-            original = getattr(
-                module.condition_features, "_torchdynamo_orig_callable", None
-            )
-            if original is not None:
-                module.condition_features = original
-
-    if defaults["compile_blocks"]:
-        for module in model.modules():
-            if isinstance(module, DiTBlock):
-                # Module.compile keeps the original state_dict, unlike wrapping in
-                # an OptimizedModule with an _orig_mod prefix. Search stays eager.
-                module.compile(
-                    backend=defaults["compile_backend"],
-                    dynamic=defaults["compile_dynamic"],
-                )
-    if defaults["compile_pair_features"]:
-        import torch
-
-        for module in model.modules():
-            if isinstance(module, AtomAttentionEncoder):
-                module.condition_features = torch.compile(
-                    module.condition_features,
-                    backend=defaults["compile_backend"],
-                    dynamic=defaults["compile_dynamic"],
-                )
-            elif isinstance(module, AtomConditionFeatures):
-                module.compile(
-                    backend=defaults["compile_backend"],
-                    dynamic=defaults["compile_dynamic"],
-                )
-    # Compile only continuous cores. Cutoff decisions and validation stay eager.
-    import torch
-    from src.models.g1.geometry.moments import PeriodicPairMoments
-    from src.models.g1.readback.values import RelationConditionedValue
-    from src.models.simple.layers import TokenTransformer
-
-    cores = (
-        (PeriodicPairMoments, "_reduce", "compile_geometry_moments"),
-        (RelationConditionedValue, "_pool_hidden", "compile_readback"),
-        (TokenTransformer, "_pair_features", "compile_token_pairs"),
-    )
-    for module in model.modules():
-        for cls, method, option in cores:
-            if isinstance(module, cls):
-                original = getattr(
-                    getattr(module, method),
-                    "_torchdynamo_orig_callable",
-                    getattr(module, method),
-                )
+        for attribute, option in getattr(module, "_execution_flags", {}).items():
+            setattr(module, attribute, defaults[option])
+        for method, option in getattr(module, "_execution_compile_targets", {}).items():
+            if method is None:
+                # Module.compile preserves parameter registration/checkpoint keys.
+                module._compiled_call_impl = None
+                if defaults[option]:
+                    module.compile(
+                        backend=defaults["compile_backend"],
+                        dynamic=defaults["compile_dynamic"],
+                    )
+            else:
+                current = getattr(module, method)
+                original = getattr(current, "_torchdynamo_orig_callable", current)
                 setattr(
                     module,
                     method,
@@ -153,9 +87,19 @@ def configure_execution(model, options: Mapping | None = None):
                         original,
                         backend=defaults["compile_backend"],
                         dynamic=defaults["compile_dynamic"],
-                    )
-                    if defaults[option]
-                    else original,
+                    ) if defaults[option] else original,
                 )
     model.execution_options = defaults
     return defaults
+
+
+def configure_data_execution(datamodule, flow_model):
+    """Bind optional CPU preparation to the effective model, before workers start.
+
+    In prediction, the checkpoint and ablation switch determine the architecture;
+    the unrelated default training config must not decide which layouts to build.
+    Custom datamodules without this optional interface remain supported.
+    """
+    configure = getattr(datamodule, "configure_model_execution", None)
+    if configure is not None:
+        configure(g1_enabled=flow_model.g1_enabled, execution=flow_model.execution_options)

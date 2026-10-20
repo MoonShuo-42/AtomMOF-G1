@@ -31,6 +31,8 @@ class AtomConditionFeatures(nn.Module):
     multiplied by the same-block mask. Attention applies its own hard mask.
     """
 
+    _execution_compile_targets = {None: "compile_pair_features"}
+
     def __init__(self, atom_s: int = 256, atom_z: int = 128):
         super().__init__()
         if atom_s <= 0 or atom_z <= 0:

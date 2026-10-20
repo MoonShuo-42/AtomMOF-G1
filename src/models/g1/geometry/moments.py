@@ -108,6 +108,8 @@ class PeriodicPairMoments(nn.Module):
     cubic cutoff w=(1-q)_+³, and beta=w/(sum(w)+delta). No learned parameters.
     """
 
+    _execution_compile_targets = {"_reduce": "compile_geometry_moments"}
+
     def __init__(
         self, cutoff: float = 0.6, radial_sigma: float = 0.2, delta: float = 0.1
     ):

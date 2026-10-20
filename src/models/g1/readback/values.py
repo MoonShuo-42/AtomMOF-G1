@@ -21,6 +21,8 @@ class RelationConditionedValue(nn.Module):
     materializing that 408-wide input. Returns (B,N,K,heads,head_dim).
     """
 
+    _execution_compile_targets = {"_pool_hidden": "compile_readback"}
+
     def __init__(
         self,
         h_dim: int = 256,

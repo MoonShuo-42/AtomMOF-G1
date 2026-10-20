@@ -50,6 +50,26 @@ rename checkpoint parameters. Geometry search stays eager. The benchmark
 `--compile` enables both regional options, and compilation/recompilation cost must
 be counted. The old whole-Flow `compile_model` option is not needed.
 
+## Component boundaries
+
+The execution dispatcher imports neither G1 classes nor backbone classes. Each
+component declares its own `_execution_flags` (attribute to option mapping) and
+`_execution_compile_targets` (method to option mapping; `None` denotes the whole
+module). These are class metadata, not parameters or persistent buffers. A new
+component can use an existing runtime option without adding a concrete class
+import or class-name check to the dispatcher. Reapplying a profile resets compile
+wrappers and flags; checkpoint keys and learned parameter ownership stay intact.
+
+Training and prediction bind optional data preparation to the effective Flow
+model via `configure_data_execution(datamodule, flow_model)` before DataLoader
+workers start. A disabled G1 branch produces no G1-specific metadata, including
+when packing was requested. An enabled branch preserves explicit preparation
+requests and also enables layouts required by `prepared_layouts` or
+`packed_block_attention`. Data modules without the optional
+`configure_model_execution` interface remain usable. Custom entry points should
+call the binding helper before constructing loaders; direct model callers without
+metadata retain the on-device fallback.
+
 ## Algebra and cache lifetimes
 
 The same pair tensor z enters every layer in a DiT stack. Only its parameter-free
@@ -302,10 +322,11 @@ large structures; 200 batches do not establish the largest dataset-wide peak.
 
 src/predict.py accepts both execution profiles with 32-true. Runtime options are
 applied to the loaded model while architecture and weights come from its
-checkpoint. `predict_args.g1_enabled=null` keeps the checkpoint G1 setting. For
-existing G1 checkpoints, add `data.prepare_g1_metadata=true` for CPU layouts:
-the ordinary model config defaults to G1 disabled even when the checkpoint has
-G1. Without metadata, the on-device fallback remains correct.
+checkpoint. `predict_args.g1_enabled=null` keeps the checkpoint G1 setting.
+CPU layout preparation follows that loaded model and the optional G1 override,
+not the ordinary training config's default G1 flag. With either execution profile,
+G1 checkpoints automatically get static metadata; baseline checkpoints and G1-off
+ablations do not. No extra `data.prepare_g1_metadata=true` override is required.
 
 Prediction directory names are unchanged; use a new run directory for profile
 comparisons to avoid mixing raw files. Reapplying a profile removes disabled

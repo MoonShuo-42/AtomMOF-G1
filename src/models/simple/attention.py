@@ -24,6 +24,12 @@ except ImportError:
 class AttentionPairBias(nn.Module):
     """Attention pair bias layer."""
 
+    _execution_flags = {
+        "fused_qkvg": "fused_qkvg",
+        "broadcast_masks": "broadcast_masks",
+        "sdpa_backend": "sdpa_backend",
+    }
+
     def __init__(
         self,
         c_s: int,

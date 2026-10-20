@@ -10,7 +10,7 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 from src.callbacks import PredictionWriter, InferenceTimer
 from src.models.simplemof_module import SimpleMOFModule
-from src.models.execution import configure_execution
+from src.models.execution import configure_data_execution, configure_execution
 from src.utils import RankedLogger, extras
 
 log = RankedLogger(__name__, rank_zero_only=True)
@@ -88,6 +88,8 @@ def predict(cfg: DictConfig):
     execution = OmegaConf.select(cfg, "model.flow_model_args.execution")
     if execution is not None:
         configure_execution(model.structure_module.flow_model, execution)
+
+    configure_data_execution(datamodule, model.structure_module.flow_model)
 
     # Create output directory
     base_name = set_dir_name(cfg)

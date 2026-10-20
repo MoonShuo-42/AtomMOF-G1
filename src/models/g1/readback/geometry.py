@@ -24,6 +24,8 @@ class ReadbackGeometryFeatures(nn.Module):
     Geometry is masked BEFORE high-order contractions, including padded atoms.
     """
 
+    _execution_flags = {"packed_geometry": "packed_geometry"}
+
     def forward(
         self,
         U: Tensor,
