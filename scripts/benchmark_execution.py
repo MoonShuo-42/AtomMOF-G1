@@ -25,7 +25,7 @@ STAGES = {
 }
 
 
-def summarize(runs):
+def summarize(runs, reference_profile="reference"):
     """Only compare complete, equal-work windows; never infer unmeasured VRAM."""
     summaries = []
     for run in runs:
@@ -66,7 +66,7 @@ def summarize(runs):
             peak_reserved_bytes=max(x["peak_reserved_bytes"] for x in rows),
         )
         summaries.append(entry)
-    reference = {x["repeat"]: x for x in summaries if x["profile"] == "reference"}
+    reference = {x["repeat"]: x for x in summaries if x["profile"] == reference_profile}
     for x in summaries:
         ref = reference.get(x["repeat"])
         if ref is None:
@@ -112,6 +112,35 @@ def summarize(runs):
     return summaries
 
 
+def profile_overrides(profile):
+    """Keep a same-work comparison against e509a4a operator execution.
+
+    Reference omits the config-group override: execution=null is not a valid
+    Hydra config-group value on the server's Hydra version.
+    """
+    if profile == "reference":
+        return []
+    if profile in ("math", "optimized"):
+        return [f"execution={profile}"]
+    options = {
+        "optimized_previous": dict(
+            pair_bias_chunk_size=1,
+            fused_pair_features=False,
+            packed_geometry=False,
+            joint_time_metrics=False,
+            bucket_geometry_images=False,
+        ),
+        "bucketed": dict(bucket_geometry_images=True),
+    }[profile]
+    return [
+        "execution=optimized",
+        *[
+            f"model.flow_model_args.execution.{key}={str(value).lower()}"
+            for key, value in options.items()
+        ],
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lmdb-dir", required=True, type=Path)
@@ -121,8 +150,25 @@ def main():
     parser.add_argument(
         "--profiles",
         nargs="+",
-        choices=["reference", "math", "optimized"],
+        choices=["reference", "math", "optimized_previous", "optimized", "bucketed"],
         default=["reference", "math", "optimized"],
+    )
+    parser.add_argument("--compare-to", choices=["reference", "optimized_previous"], default=None)
+    parser.add_argument(
+        "--batch-size", type=int, help="Override the per-GPU cap equally in all profiles"
+    )
+    parser.add_argument(
+        "--accumulate-grad-batches", type=int, help="Override accumulation equally in all profiles"
+    )
+    parser.add_argument(
+        "--compile-blocks",
+        action="store_true",
+        help="Compile only DiT blocks in optimized profile",
+    )
+    parser.add_argument(
+        "--compile-pair-features",
+        action="store_true",
+        help="Compile only pair features in optimized profile",
     )
     parser.add_argument("--batches", type=int, default=200, help="0 means a full epoch")
     parser.add_argument("--epochs", type=int, default=1)
@@ -138,7 +184,15 @@ def main():
         "--compile", action="store_true", help="Compile DiT blocks in optimized profile only"
     )
     args = parser.parse_args()
-    stage = STAGES[args.stage]
+    stage = dict(STAGES[args.stage])
+    for key, value in (("batch", args.batch_size), ("accum", args.accumulate_grad_batches)):
+        if value is not None:
+            if value < 1:
+                parser.error("batch size and accumulation must be positive")
+            stage[key] = value
+    if args.compare_to is not None and args.compare_to not in args.profiles:
+        parser.error("--compare-to must be included in --profiles")
+    args.compare_to = args.compare_to or "reference"
     if args.epochs < 1 or args.repeats < 1 or args.warmup < 1 or args.warmup % stage["accum"]:
         parser.error(
             "epochs/repeats positive; warmup must be positive and divisible by accumulation"
@@ -218,15 +272,12 @@ def main():
                 "extras.print_config=false",
                 "++trainer.precision=32-true",
             ]
-            if profile != "reference":
-                overrides.append(f"execution={profile}")
-            if profile == "optimized" and args.compile:
-                overrides.extend(
-                    [
-                        "model.flow_model_args.execution.compile_blocks=true",
-                        "model.flow_model_args.execution.compile_pair_features=true",
-                    ]
-                )
+            overrides.extend(profile_overrides(profile))
+            if profile == "optimized":
+                if args.compile or args.compile_blocks:
+                    overrides.append("model.flow_model_args.execution.compile_blocks=true")
+                if args.compile or args.compile_pair_features:
+                    overrides.append("model.flow_model_args.execution.compile_pair_features=true")
             command = [sys.executable, "-u", "src/train.py", *overrides]
             (directory / "command.json").write_text(json.dumps(command, indent=2))
             if args.dry_run:
@@ -257,7 +308,8 @@ def main():
         model=args.model,
         stage=args.stage,
         git_commit=commit,
-        runs=summarize(runs),
+        reference_profile=args.compare_to,
+        runs=summarize(runs, args.compare_to),
     )
     (output / "comparison.json").write_text(json.dumps(report, indent=2))
     print(f"Comparison: {output/'comparison.json'}")

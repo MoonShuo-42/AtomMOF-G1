@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.simple.attention import AttentionPairBias
-from src.models.execution.ops import normalize_pairs
+from src.models.execution.ops import normalize_pairs, project_pair_bias_group
 
 
 def modulate(x, shift, scale):
@@ -164,7 +164,7 @@ class DiTBlock(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x, c, mask, z=None, pair_normalized=False):
+    def forward(self, x, c, mask, z=None, pair_normalized=False, pair_projected=False):
         # Generate modulation parameters (shift, scale gate) from condition c
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
             c
@@ -172,7 +172,9 @@ class DiTBlock(nn.Module):
 
         # Attention block
         _x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = x + gate_msa.unsqueeze(1) * self.attn(s=_x, mask=mask, z=z, pair_normalized=pair_normalized)
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            s=_x, mask=mask, z=z, pair_normalized=pair_normalized, pair_projected=pair_projected
+        )
 
         # MLP block
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
@@ -197,6 +199,7 @@ class DiT(nn.Module):
 
         self.activation_checkpointing = activation_checkpointing
         self.pair_norm_reuse = False
+        self.pair_bias_chunk_size = 1
         self.t_embedder = TimestepEmbedder(dim)
         self.layers = nn.ModuleList([
             DiTBlock(
@@ -210,6 +213,25 @@ class DiT(nn.Module):
             for _ in range(depth)
         ])
 
+    def _project_pair_chunk(self, z, normalized, start):
+        """Batch independent projections sharing the same standardization."""
+        groups, projected = {}, {}
+        for index in range(start, min(start + self.pair_bias_chunk_size, len(self.layers))):
+            attn = self.layers[index].attn
+            if attn.use_pair_bias:
+                norm = attn.proj_z[0]
+                groups.setdefault((norm.normalized_shape, norm.eps), []).append(index)
+        for key, indices in groups.items():
+            if key not in normalized:
+                normalized[key] = normalize_pairs(z, self.layers[indices[0]].attn.proj_z[0])
+            projections = [
+                (self.layers[index].attn.proj_z[0], self.layers[index].attn.proj_z[1])
+                for index in indices
+            ]
+            biases = project_pair_bias_group(normalized[key], projections)
+            projected.update(zip((index + 1 for index in indices), biases))
+        return projected
+
     def forward(self, x, t, mask, z=None, *, after_layer=None):
         """
         Args:
@@ -221,7 +243,16 @@ class DiT(nn.Module):
         time_embed = self.t_embedder(t) # (B, D)
 
         normalized = {}
+        projected = {}
+        chunk_size = self.pair_bias_chunk_size
         for layer_index, layer in enumerate(self.layers, start=1):
+            # z stays fixed across the stack, even when G1 updates x. Only a
+            # bounded group of head-sized biases is materialized at a time.
+            if (
+                self.pair_norm_reuse and z is not None and chunk_size > 1
+                and (layer_index - 1) % chunk_size == 0
+            ):
+                projected = self._project_pair_chunk(z, normalized, layer_index - 1)
             reuse = self.pair_norm_reuse and z is not None and layer.attn.use_pair_bias
             pair = z
             if reuse:
@@ -230,12 +261,15 @@ class DiT(nn.Module):
                 if key not in normalized:
                     normalized[key] = normalize_pairs(z, norm)
                 pair = normalized[key]
+            is_projected = layer_index in projected
+            if is_projected:
+                pair = projected.pop(layer_index)
             if self.activation_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(
-                    layer, x, time_embed, mask, pair, reuse, use_reentrant=False
+                    layer, x, time_embed, mask, pair, reuse, is_projected, use_reentrant=False
                 )
             else:
-                x = layer(x, time_embed, mask, pair, reuse)
+                x = layer(x, time_embed, mask, pair, reuse, is_projected)
             if after_layer is not None:
                 x = after_layer(layer_index, x)
         return x

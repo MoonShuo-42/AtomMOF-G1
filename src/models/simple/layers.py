@@ -7,7 +7,7 @@ from torch.nn.functional import one_hot
 
 import src.models.layers.initialize as init
 from src.data import const
-from src.models.execution.ops import repeat_batch
+from src.models.execution.ops import project_pair_geometry, repeat_batch
 from src.models.modules.utils import LinearNoBias
 from src.models.simple.transformers import DiT, PositionalEmbedder
 
@@ -126,9 +126,15 @@ class AtomAttentionEncoder(Module):
         )
 
         # Initial pairwise embedding
-        p = self.embed_atompair_ref_pos(d) * v
-        p = p + self.embed_atompair_ref_dist(d_norm) * v
-        p = p + self.embed_atompair_mask(v) * v
+        if getattr(self, "fused_pair_features", False):
+            p = project_pair_geometry(
+                d, d_norm, v,
+                (self.embed_atompair_ref_pos, self.embed_atompair_ref_dist, self.embed_atompair_mask),
+            )
+        else:
+            p = self.embed_atompair_ref_pos(d) * v
+            p = p + self.embed_atompair_ref_dist(d_norm) * v
+            p = p + self.embed_atompair_mask(v) * v
 
         # Add bond features
         p = p + self.embed_bond_feats(feats["bond_types"])

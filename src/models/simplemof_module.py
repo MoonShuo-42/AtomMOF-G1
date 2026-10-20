@@ -15,7 +15,7 @@ from concurrent.futures import TimeoutError as PebbleTimeoutError
 from pymatgen.analysis.structure_matcher import StructureMatcher
 
 from src.models.loss.validation import find_best_match_rmsd
-from src.models.loss.utils import stratify_loss_by_time
+from src.models.loss.utils import stratify_loss_by_time, stratify_losses_by_time
 from src.models.simple.flow import AtomFlowMatching
 from src.models.optim.ema import EMA
 from src.models.optim.scheduler import AlphaFoldLRScheduler
@@ -177,14 +177,17 @@ class SimpleMOFModule(LightningModule):
         self.log('train/batch_size', batch_size)
 
         # Stratified loss logging
-        for loss_name, batch_loss in flow_loss_dict.items():
-            # Stratified loss
-            stratified_losses = stratify_loss_by_time(
-                batch_t=out['times'], batch_loss=batch_loss, loss_name=loss_name,
-                fast=self.structure_module.flow_model.execution_options.get("vectorized_metrics", False),
-            )
-            for k, v in stratified_losses.items():
-                self.log(f'train/{k}', v, batch_size=batch_size)
+        if self.structure_module.flow_model.execution_options.get("joint_time_metrics", False):
+            stratified_losses = stratify_losses_by_time(out['times'], flow_loss_dict)
+        else:
+            stratified_losses = {}
+            for loss_name, batch_loss in flow_loss_dict.items():
+                stratified_losses.update(stratify_loss_by_time(
+                    batch_t=out['times'], batch_loss=batch_loss, loss_name=loss_name,
+                    fast=self.structure_module.flow_model.execution_options.get("vectorized_metrics", False),
+                ))
+        for k, v in stratified_losses.items():
+            self.log(f'train/{k}', v, batch_size=batch_size)
 
         # Time
         step_time = time.time() - step_start_time

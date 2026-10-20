@@ -53,3 +53,45 @@ def build_geometry_plan(
     )
     image_slots = int(selected.counts.max().item()) if pairs.numel() else 0
     return GeometryPlan(pairs, selected, image_slots, geometry_ok)
+
+
+@torch.no_grad()
+def bucket_geometry_plan(plan: GeometryPlan) -> tuple[GeometryPlan, ...]:
+    """Reorder already accepted pairs into image-count buckets, never truncate.
+
+    A single histogram host read determines bucket sizes. Sorting/compaction
+    overhead is workload dependent, so this runtime option remains opt-in.
+    Completeness and whole-sample availability are decided BEFORE bucketing.
+    """
+    if plan.pairs.numel() == 0 or plan.image_slots <= 1:
+        return (plan,)
+    caps = []
+    cap = 1
+    while cap < plan.image_slots:
+        caps.append(cap)
+        cap *= 2
+    caps.append(plan.image_slots)
+    edges = plan.bounds.counts.new_tensor(caps)
+    buckets = torch.bucketize(plan.bounds.counts, edges)
+    sizes = torch.zeros(len(caps), dtype=torch.long, device=plan.pairs.device)
+    sizes.scatter_add_(0, buckets, torch.ones_like(buckets))
+    sizes = sizes.cpu().tolist()
+    if sum(size > 0 for size in sizes) == 1:
+        return (plan,)
+    order = buckets.argsort()
+    ordered_pairs = plan.pairs[order]
+    ordered_bounds = ImageBounds(*(value[order] for value in plan.bounds))
+    result, start = [], 0
+    for slots, size in zip(caps, sizes):
+        if size:
+            stop = start + size
+            result.append(
+                GeometryPlan(
+                    ordered_pairs[start:stop],
+                    ImageBounds(*(value[start:stop] for value in ordered_bounds)),
+                    slots,
+                    plan.geometry_ok,
+                )
+            )
+            start = stop
+    return tuple(result)

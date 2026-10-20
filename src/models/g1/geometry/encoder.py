@@ -11,7 +11,7 @@ from .chunking import geometry_chunk_size
 from .images import ImageBounds, PeriodicImageSearch
 from .lattice import lattice_parameters_to_cell, validate_cell
 from .moments import PeriodicPairMoments, scalarize_geometry
-from .planning import build_geometry_plan
+from .planning import bucket_geometry_plan, build_geometry_plan
 
 
 class GeometryOutput(NamedTuple):
@@ -159,35 +159,47 @@ class PeriodicGeometry(nn.Module):
         # Also connect entirely unavailable batches to finite zero input gradients.
         zero = (safe_coordinates * 0).sum() + (safe_cell * 0).sum()
         dense = coordinates.new_zeros((batch * atoms * atoms, 16)) + zero
-        chunks = []
-        chunk_size = geometry_chunk_size(
-            self.pair_chunk_size, self.image_chunk_size, plan.image_slots
+        plans = (
+            bucket_geometry_plan(plan)
+            if getattr(self, "bucket_geometry_images", False)
+            else (plan,)
         )
-        for start in range(0, plan.pairs.numel(), chunk_size):
-            stop = start + chunk_size
-            pairs = plan.pairs[start:stop]
-            bounds = ImageBounds(*(value[start:stop] for value in plan.bounds))
-            if (
-                self.activation_checkpointing
-                and torch.is_grad_enabled()
-                and (safe_coordinates.requires_grad or safe_cell.requires_grad)
-            ):
-                chunk = checkpoint(
-                    self._encode_pairs,
-                    safe_coordinates,
-                    safe_cell,
-                    pairs,
-                    bounds,
-                    plan.image_slots,
-                    use_reentrant=False,
-                )
-            else:
-                chunk = self._encode_pairs(
-                    safe_coordinates, safe_cell, pairs, bounds, plan.image_slots
-                )
-            chunks.append(chunk)
+        chunks, pair_chunks = [], []
+        for subplan in plans:
+            chunk_size = geometry_chunk_size(
+                self.pair_chunk_size, self.image_chunk_size, subplan.image_slots
+            )
+            for start in range(0, subplan.pairs.numel(), chunk_size):
+                stop = start + chunk_size
+                pairs = subplan.pairs[start:stop]
+                bounds = ImageBounds(*(value[start:stop] for value in subplan.bounds))
+                if (
+                    self.activation_checkpointing
+                    and torch.is_grad_enabled()
+                    and (safe_coordinates.requires_grad or safe_cell.requires_grad)
+                ):
+                    chunk = checkpoint(
+                        self._encode_pairs,
+                        safe_coordinates,
+                        safe_cell,
+                        pairs,
+                        bounds,
+                        subplan.image_slots,
+                        use_reentrant=False,
+                    )
+                else:
+                    chunk = self._encode_pairs(
+                        safe_coordinates, safe_cell, pairs, bounds, subplan.image_slots
+                    )
+                chunks.append(chunk)
+                pair_chunks.append(pairs)
         if chunks:
-            dense = dense.index_copy(0, plan.pairs, torch.cat(chunks))
+            # Scatter to the original dense pair order; sorting never changes
+            # atom identities, periodic images, cutoffs, or group assignment.
+            pairs = torch.cat(pair_chunks) if len(plans) > 1 else plan.pairs
+            dense = dense.index_copy(0, pairs, torch.cat(chunks))
         pair_features = dense.reshape(batch, atoms, atoms, 16)
-        rho = scalarize_geometry(pair_features.sum(dim=2))
+        rho = scalarize_geometry(
+            pair_features.sum(dim=2), packed=getattr(self, "packed_geometry", False)
+        )
         return GeometryOutput(pair_features, rho, plan.geometry_ok)

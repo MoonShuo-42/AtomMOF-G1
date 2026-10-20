@@ -1,0 +1,18 @@
+# Diagnostic only: instrumentation changes timing and allocation lifetimes.
+# Keep this separate from benchmark_execution.py throughput/memory runs.
+_target_: lightning.pytorch.profilers.PyTorchProfiler
+dirpath: "${paths.output_dir}/profiler"
+filename: execution
+record_module_names: true
+record_shapes: true
+profile_memory: true
+with_stack: false
+group_by_input_shapes: true
+export_to_chrome: true
+row_limit: 80
+schedule:
+  _target_: torch.profiler.schedule
+  wait: 20
+  warmup: 2
+  active: 3
+  repeat: 1

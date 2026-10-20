@@ -13,6 +13,7 @@ from torch.nn.functional import one_hot
 
 import src.models.layers.initialize as init
 from src.data import const
+from src.models.execution.ops import project_pair_geometry
 from src.models.modules.utils import LinearNoBias
 
 
@@ -86,9 +87,21 @@ class AtomConditionFeatures(nn.Module):
         d = positions[b, j] - positions[b, i]
         d_norm = 1 / (1 + torch.sum(d * d, dim=-1, keepdim=True))
         same_block = d.new_ones((pair_indices.numel(), 1))
-        p = self.embed_atompair_ref_pos(d)
-        p = p + self.embed_atompair_ref_dist(d_norm)
-        p = p + self.embed_atompair_mask(same_block)
+        if getattr(self, "fused_pair_features", False):
+            p = project_pair_geometry(
+                d,
+                d_norm,
+                same_block,
+                (
+                    self.embed_atompair_ref_pos,
+                    self.embed_atompair_ref_dist,
+                    self.embed_atompair_mask,
+                ),
+            )
+        else:
+            p = self.embed_atompair_ref_pos(d)
+            p = p + self.embed_atompair_ref_dist(d_norm)
+            p = p + self.embed_atompair_mask(same_block)
         p = p + self.embed_bond_feats(feats["bond_types"][b, i, j])
         p = p + self.c_to_p_trans_q(c)[b, i]
         p = p + self.c_to_p_trans_k(c)[b, j]

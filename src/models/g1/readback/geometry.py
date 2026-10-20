@@ -6,6 +6,7 @@ from torch import Tensor, nn
 
 from ..geometry import scalarize_geometry, unpack_second_moment
 from ..geometry.groups import GroupInternalGeometry, resolve_group_internal
+from ..geometry.moments import packed_matrix_trace
 from .utils import (
     available_geometry,
     compute_dtype,
@@ -47,13 +48,18 @@ class ReadbackGeometryFeatures(nn.Module):
             internal = resolve_group_internal(
                 Z.to(dtype), group_mask, geometry_ok, internal_geometry
             )
-            Q_U = unpack_second_moment(safe_U[..., 9:15])
-            chi_U = scalarize_geometry(safe_U, Q_U)
+            packed = getattr(self, "packed_geometry", False)
+            Q_U = None if packed else unpack_second_moment(safe_U[..., 9:15])
+            chi_U = scalarize_geometry(safe_U, Q_U, packed=packed)
             chi_internal = internal.scalars[:, None].expand_as(chi_U)
             v = safe_U[..., 6:9]
             Q_group = internal.second[:, None]
             direction = (v * (Q_group @ v.unsqueeze(-1)).squeeze(-1)).sum(-1)
-            trace = (Q_U * Q_group.transpose(-1, -2)).sum((-2, -1))
+            trace = (
+                packed_matrix_trace(safe_U[..., 9:15], Q_group)
+                if packed
+                else (Q_U * Q_group.transpose(-1, -2)).sum((-2, -1))
+            )
             features = torch.cat((chi_U, chi_internal, torch.stack((direction, trace), -1)), -1)
             return features.masked_fill(~valid[..., None], 0)
 

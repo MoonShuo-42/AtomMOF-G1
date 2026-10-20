@@ -172,6 +172,7 @@ class AttentionPairBias(nn.Module):
         mask: Bool['b n'], 
         pair_bias: Optional[Float['b n n c_z']] = None,
         pair_normalized: bool = False,
+        pair_projected: bool = False,
     ) -> Float['b h n n']:
 
         B, N = mask.shape
@@ -185,7 +186,9 @@ class AttentionPairBias(nn.Module):
         # (Optional) Add pair bias
         if self.use_pair_bias:
             assert pair_bias is not None, "pair_bias must be provided if use_pair_bias is True"
-            if pair_normalized:
+            if pair_projected:
+                z_bias = self.proj_z[2](pair_bias)
+            elif pair_normalized:
                 z_bias = project_normalized_pairs(pair_bias, self.proj_z[0], self.proj_z[1])
                 z_bias = self.proj_z[2](z_bias)
             else:
@@ -200,6 +203,7 @@ class AttentionPairBias(nn.Module):
         mask: Tensor,
         z: Optional[Tensor] = None,
         pair_normalized: bool = False,
+        pair_projected: bool = False,
     ) -> Tensor:
         """
         Forward pass.
@@ -219,7 +223,7 @@ class AttentionPairBias(nn.Module):
         q, k, v, g = self.project_qkvg(s)
 
         # Attention mask
-        attn_mask = self._create_attn_mask(mask, z, pair_normalized)
+        attn_mask = self._create_attn_mask(mask, z, pair_normalized, pair_projected)
 
         # Attention computation
         o = self.attention_fn(q, k, v, attn_mask)

@@ -21,7 +21,31 @@ def unpack_second_moment(packed: Tensor) -> Tensor:
     )
 
 
-def scalarize_geometry(geometry: Tensor, second_moment: Tensor | None = None) -> Tensor:
+def packed_quadratic(vector: Tensor, packed: Tensor) -> Tensor:
+    """v^T Q v for Q=[xx,yy,zz,xy,xz,yz], without (...,3,3)."""
+    x, y, z = vector.unbind(-1)
+    diagonal = (vector.square() * packed[..., :3]).sum(-1)
+    off_diagonal = (torch.stack((x * y, x * z, y * z), -1) * packed[..., 3:]).sum(-1)
+    return diagonal + 2 * off_diagonal
+
+
+def packed_matrix_trace(packed: Tensor, matrix: Tensor) -> Tensor:
+    """tr(Q M), retaining both off-diagonal terms even for nonsymmetric M."""
+    diagonal = (packed[..., :3] * matrix.diagonal(dim1=-2, dim2=-1)).sum(-1)
+    off_diagonal = torch.stack(
+        (
+            matrix[..., 0, 1] + matrix[..., 1, 0],
+            matrix[..., 0, 2] + matrix[..., 2, 0],
+            matrix[..., 1, 2] + matrix[..., 2, 1],
+        ),
+        -1,
+    )
+    return diagonal + (packed[..., 3:] * off_diagonal).sum(-1)
+
+
+def scalarize_geometry(
+    geometry: Tensor, second_moment: Tensor | None = None, *, packed: bool = False
+) -> Tensor:
     """chi([r(6),v(3),Q(6),D]) = [r,D,|v|²,trQ,tr(Q²),vᵀQv].
 
     Apply this AFTER aggregation, e.g. rho = chi(E.sum(dim=2)).
@@ -30,6 +54,19 @@ def scalarize_geometry(geometry: Tensor, second_moment: Tensor | None = None) ->
     if geometry.shape[-1] != 16:
         raise ValueError("geometry must have 16 channels")
     vector = geometry[..., 6:9]
+    if packed and second_moment is None:
+        # Explicit second_moment overrides must retain their existing semantics.
+        q = geometry[..., 9:15]
+        vector_norm = vector.square().sum(-1, keepdim=True)
+        trace = q[..., :3].sum(-1, keepdim=True)
+        trace_square = q[..., :3].square().sum(-1, keepdim=True) + 2 * q[..., 3:].square().sum(
+            -1, keepdim=True
+        )
+        quadratic = packed_quadratic(vector, q).unsqueeze(-1)
+        return torch.cat(
+            (geometry[..., :6], geometry[..., 15:16], vector_norm, trace, trace_square, quadratic),
+            -1,
+        )
     # A caller computing several descriptors can unpack Q just once.
     matrix = unpack_second_moment(geometry[..., 9:15]) if second_moment is None else second_moment
     if matrix.shape != (*geometry.shape[:-1], 3, 3):

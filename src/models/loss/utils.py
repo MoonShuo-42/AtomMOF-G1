@@ -54,3 +54,33 @@ def _time_labels(num_bins: int):
     # Match the original FP32 edge formatting exactly, entirely on the CPU.
     edges = torch.linspace(0, 1, num_bins + 1).tolist()
     return tuple(f"t=[{a:.2f},{b:.2f})" for a,b in zip(edges[:-1], edges[1:]))
+
+
+def stratify_losses_by_time(batch_t: Tensor, losses: Dict[str, Tensor], num_bins: int = 4):
+    """Share bin assignment/counts across losses without retaining their graphs."""
+    if not losses:
+        return {}
+    edges = torch.linspace(0, 1, num_bins + 1, device=batch_t.device)
+    indices = torch.bucketize(batch_t, edges).clamp(1, num_bins) - 1
+    counts = torch.zeros(num_bins, device=batch_t.device, dtype=torch.long)
+    counts.scatter_add_(0, indices, torch.ones_like(indices))
+    # Group by dtype so mixed-dtype external callers are not promoted/cast.
+    grouped = {}
+    for name, values in losses.items():
+        grouped.setdefault(values.dtype, []).append((name, values.detach()))
+    result = {}
+    for entries in grouped.values():
+        values = torch.stack([value for _, value in entries])
+        sums = values.new_zeros((len(entries), num_bins))
+        sums.scatter_add_(1, indices[None].expand(len(entries), -1), values)
+        means = (sums / counts.clamp_min(1)).masked_fill(counts == 0, float("nan"))
+        for (name, _), row in zip(entries, means.unbind()):
+            result.update(
+                (f"{name} {label}", value)
+                for label, value in zip(_time_labels(num_bins), row.unbind())
+            )
+    return {
+        f"{name} {label}": result[f"{name} {label}"]
+        for name in losses
+        for label in _time_labels(num_bins)
+    }

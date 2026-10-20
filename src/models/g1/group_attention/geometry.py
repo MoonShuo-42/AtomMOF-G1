@@ -6,6 +6,7 @@ from torch import Tensor, nn
 
 from ..geometry import scalarize_geometry, unpack_second_moment
 from ..geometry.groups import GroupInternalGeometry, resolve_group_internal
+from ..geometry.moments import packed_matrix_trace
 from .utils import compute_dtype, linear, positive_int
 
 
@@ -47,8 +48,9 @@ class GroupGeometryFeatures(nn.Module):
         with torch.autocast(device_type=Z.device.type, enabled=False):
             safe_Z = torch.where(pair_valid[..., None], Z.to(compute_dtype(Z)), 0)
             internal = resolve_group_internal(safe_Z, group_mask, geometry_ok, internal_geometry)
-            Q = unpack_second_moment(safe_Z[..., 9:15])
-            chi_pair = scalarize_geometry(safe_Z, Q)
+            packed = getattr(self, "packed_geometry", False)
+            Q = None if packed else unpack_second_moment(safe_Z[..., 9:15])
+            chi_pair = scalarize_geometry(safe_Z, Q, packed=packed)
             source_chi = internal.scalars[:, :, None, :].expand_as(chi_pair)
             target_chi = internal.scalars[:, None, :, :].expand_as(chi_pair)
             v = safe_Z[..., 6:9]
@@ -56,8 +58,12 @@ class GroupGeometryFeatures(nn.Module):
             Q_target = internal.second[:, None, :]
             source_direction = (v * (Q_source @ v.unsqueeze(-1)).squeeze(-1)).sum(-1)
             target_direction = (v * (Q_target @ v.unsqueeze(-1)).squeeze(-1)).sum(-1)
-            source_trace = (Q * Q_source.transpose(-1, -2)).sum((-2, -1))
-            target_trace = (Q * Q_target.transpose(-1, -2)).sum((-2, -1))
+            if packed:
+                source_trace = packed_matrix_trace(safe_Z[..., 9:15], Q_source)
+                target_trace = packed_matrix_trace(safe_Z[..., 9:15], Q_target)
+            else:
+                source_trace = (Q * Q_source.transpose(-1, -2)).sum((-2, -1))
+                target_trace = (Q * Q_target.transpose(-1, -2)).sum((-2, -1))
             cross = torch.stack(
                 (source_direction, target_direction, source_trace, target_trace), -1
             )

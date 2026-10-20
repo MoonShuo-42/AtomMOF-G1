@@ -7,11 +7,15 @@ normalization safeguards. No training data, epochs or accumulation are reduced.
 
 ## Profiles and precision
 
-- No execution override (`execution: null`): reference implementation.
+- Omit the execution CLI override: reference implementation. The YAML default is
+  `execution: null`; do not pass `execution=null` on the command line, because
+  Hydra parses that as an invalid config-group override.
 - `execution=math`: shared pair standardization, fused Q/K/V/gate projections,
   folded G1 readback, shared masked geometry layout, vectorized time-bin logging,
   broadcast decoder masks, reduced redundant copies, CPU-prepared static G1
   layouts, batched device checks and sampling-only static condition caching.
+  It also enables fused geometric pair projections, four-layer pair-bias
+  projection groups, packed symmetric-moment contractions and joint loss bins.
   Unused token maps and dense bond-index matrices are omitted from BWDB batches;
   the bond-type matrix is retained.
 - `execution=optimized`: the math profile plus fused AdamW, DDP gradient bucket
@@ -81,6 +85,80 @@ geometry, routing or group aggregates are cached across timesteps.
 The reference implementation remains selectable for execution regression tests;
 this does not restore obsolete G1 architectures. Floating-point operation order
 can still change rounding, so mathematical equivalence is not bitwise identity.
+
+## Operator controls
+
+Runtime options live under `model.flow_model_args.execution`. They change no
+learned parameter, checkpoint key or architecture configuration. New defaults in
+both math and optimized profiles are:
+
+| Option | Profile value | Work reduced |
+| --- | --- | --- |
+| `fused_pair_features` | `true` | Concatenate the existing position/distance/mask projection weights; one five-channel input projection replaces three wide projections in original AtomMOF and compact G1 conditioning. |
+| `pair_bias_chunk_size` | `4` | Several independent per-layer pair projections share one GEMM; each layer retains its own LayerNorm affine and head projection weights. Set to 1 for the previous per-layer path. Requires `pair_norm_reuse=true`. |
+| `packed_geometry` | `true` | Compute chi and pair/internal trace contractions directly from six symmetric Q entries, avoiding large pairwise 3x3 expansions. Small group-internal matrices and their existing directional contractions remain. |
+| `joint_time_metrics` | `true` | Assign time bins/counts once for all logged losses; preserve labels, empty-bin NaNs and loss dtypes. |
+| `bucket_geometry_images` | `false` | Optional grouping of already accepted pairs by image counts, with power-of-two storage caps and restoration of original pair order. |
+
+Pair projection groups respect differences in normalization epsilon. Grouping
+never shares learned weights or moves/removes G1 hooks. Projected biases are
+computed within the current forward and bounded to one group at a time; this
+trades additional head-sized intermediate storage for fewer GEMMs. Every bias
+and normalization parameter remains differentiable. Bond and single-conditioning
+terms are not restricted to same-block pairs in the original AtomMOF encoder.
+
+Packed contractions include both copies of off-diagonal entries. Explicitly
+supplied matrix overrides retain their semantics. Existing FP32/FP64 protection,
+padding and unavailable-geometry behavior are unchanged.
+
+Image buckets do not truncate, approximate or drop periodic images. Float64
+search, cutoff tests, the image cap, whole-sample rejection and coordinate/cell
+gradients are preserved. Sorting and a histogram host read add overhead, so
+bucketed execution needs its own CUDA measurement before adoption. In particular,
+a small-image-count batch may gain nothing. The existing compile flags remain
+false by default; there is no forced SDPA backend or precision reduction.
+
+## Compare the latest operators against the previous optimized implementation
+
+The launcher supports `optimized_previous` (operator settings used at e509a4a),
+`optimized` (current operators), and `bucketed` (current plus image buckets).
+This is an execution comparison; it does not load an older model architecture.
+
+For the user's stage-1 per-GPU batch 64, accumulation 1 experiment:
+
+```bash
+cd /data/ai4science/AtomMOF-G1
+export PROJECT_ROOT=/data/ai4science/AtomMOF-G1
+python scripts/benchmark_execution.py \
+  --lmdb-dir /data/ai4science/AtomMOF/AtomMOF-main/data/bwdb \
+  --model g1 --stage 1 --batch-size 64 --accumulate-grad-batches 1 \
+  --profiles optimized_previous optimized bucketed \
+  --compare-to optimized_previous \
+  --batches 0 --epochs 3 --warmup 20 --repeats 2
+```
+
+Run without the batch/accumulation overrides for the original stage budget.
+All compared profiles use the same batch cap, square budget, accumulation, data,
+precision and worker lifecycle. Reports retain per-rank full training segment
+time and peaks; comparison ratios use the measured post-warmup window. The
+launcher disables validation, checkpointing and W&B in all profiles. These
+results must not be presented as full training/validation/save wall time.
+
+To test regional compilation independently, use
+`--profiles optimized_previous optimized --compare-to optimized_previous` and add either
+`--compile-pair-features` or `--compile-blocks`. These flags affect only the
+optimized variant. `--compile` enables both. Account for compilation startup and
+shape recompilation; successful eager capture on CPU is not validation of CUDA
+Inductor performance or numerical behavior.
+
+For diagnosis separately, add `profiler=execution` to a short training command in
+a new output directory. It records module names, operator shapes and memory over
+three active profiler steps after 20 wait and 2 warmup steps, exporting per-rank
+traces under `profiler/`. Run enough batches to reach that window, and disable
+validation/checkpointing equally when comparing traces. Do not use instrumented
+timing or memory values for acceptance: profiling changes allocation lifetimes
+and adds overhead. Inspect actual CUDA kernels, device copies/synchronization,
+GEMM shapes, DataLoader gaps and DDP overlap before tuning those paths further.
 
 ## Attention diagnosis
 
