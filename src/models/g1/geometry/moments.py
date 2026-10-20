@@ -59,24 +59,44 @@ def scalarize_geometry(
         q = geometry[..., 9:15]
         vector_norm = vector.square().sum(-1, keepdim=True)
         trace = q[..., :3].sum(-1, keepdim=True)
-        trace_square = q[..., :3].square().sum(-1, keepdim=True) + 2 * q[..., 3:].square().sum(
-            -1, keepdim=True
-        )
+        trace_square = q[..., :3].square().sum(-1, keepdim=True) + 2 * q[
+            ..., 3:
+        ].square().sum(-1, keepdim=True)
         quadratic = packed_quadratic(vector, q).unsqueeze(-1)
         return torch.cat(
-            (geometry[..., :6], geometry[..., 15:16], vector_norm, trace, trace_square, quadratic),
+            (
+                geometry[..., :6],
+                geometry[..., 15:16],
+                vector_norm,
+                trace,
+                trace_square,
+                quadratic,
+            ),
             -1,
         )
     # A caller computing several descriptors can unpack Q just once.
-    matrix = unpack_second_moment(geometry[..., 9:15]) if second_moment is None else second_moment
+    matrix = (
+        unpack_second_moment(geometry[..., 9:15])
+        if second_moment is None
+        else second_moment
+    )
     if matrix.shape != (*geometry.shape[:-1], 3, 3):
         raise ValueError("second_moment must match geometry's leading dimensions")
     vector_norm = vector.square().sum(-1, keepdim=True)
     trace = matrix.diagonal(dim1=-2, dim2=-1).sum(-1, keepdim=True)
     trace_square = matrix.square().sum(dim=(-2, -1)).unsqueeze(-1)
-    quadratic = (vector * (matrix @ vector.unsqueeze(-1)).squeeze(-1)).sum(-1, keepdim=True)
+    quadratic = (vector * (matrix @ vector.unsqueeze(-1)).squeeze(-1)).sum(
+        -1, keepdim=True
+    )
     return torch.cat(
-        (geometry[..., :6], geometry[..., 15:16], vector_norm, trace, trace_square, quadratic),
+        (
+            geometry[..., :6],
+            geometry[..., 15:16],
+            vector_norm,
+            trace,
+            trace_square,
+            quadratic,
+        ),
         dim=-1,
     )
 
@@ -88,10 +108,14 @@ class PeriodicPairMoments(nn.Module):
     cubic cutoff w=(1-q)_+³, and beta=w/(sum(w)+delta). No learned parameters.
     """
 
-    def __init__(self, cutoff: float = 0.6, radial_sigma: float = 0.2, delta: float = 0.1):
+    def __init__(
+        self, cutoff: float = 0.6, radial_sigma: float = 0.2, delta: float = 0.1
+    ):
         super().__init__()
         if not all(math.isfinite(v) and v > 0 for v in (cutoff, radial_sigma, delta)):
-            raise ValueError("cutoff, radial_sigma and delta must be finite and positive")
+            raise ValueError(
+                "cutoff, radial_sigma and delta must be finite and positive"
+            )
         self.cutoff = cutoff
         self.radial_sigma = radial_sigma
         self.delta = delta
@@ -106,13 +130,19 @@ class PeriodicPairMoments(nn.Module):
             inside = image_mask & (
                 displacements.detach().double().square().sum(-1) < self.cutoff**2
             )
+        return self._reduce(displacements, inside)
+
+    def _reduce(self, displacements: Tensor, inside: Tensor) -> Tensor:
+        """Continuous reduction core; discrete FP64 cutoff stays outside compilation."""
         y = torch.where(inside[..., None], displacements / self.cutoff, 0)
         q = y.square().sum(-1)
         weights = (1 - q).clamp_min(0).pow(3) * inside
         strength = weights.sum(-1, keepdim=True)
         beta = weights / (strength + self.delta)
         centers = self.radial_centers.to(device=y.device, dtype=y.dtype)
-        radial = torch.exp(-0.5 * ((q[..., None] - centers) / self.radial_sigma).square())
+        radial = torch.exp(
+            -0.5 * ((q[..., None] - centers) / self.radial_sigma).square()
+        )
         radial = (beta[..., None] * radial).sum(-2)
         vector = (beta[..., None] * y).sum(-2)
         xx, yy, zz = y.unbind(-1)

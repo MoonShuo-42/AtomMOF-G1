@@ -31,7 +31,9 @@ def summarize(runs, reference_profile="reference"):
     for run in runs:
         rows = [
             json.loads(p.read_text())
-            for p in sorted((Path(run["directory"]) / "performance").glob("rank*_epoch*.json"))
+            for p in sorted(
+                (Path(run["directory"]) / "performance").glob("rank*_epoch*.json")
+            )
         ]
         if not rows or any(
             not row["measured_seconds"]
@@ -47,7 +49,9 @@ def summarize(runs, reference_profile="reference"):
             )
             for row in rows
         ):
-            raise RuntimeError("Missing timing, batch-ID or precision evidence; cannot compare")
+            raise RuntimeError(
+                "Missing timing, batch-ID or precision evidence; cannot compare"
+            )
         epochs = {
             e: sorted((x for x in rows if x["epoch"] == e), key=lambda x: x["rank"])
             for e in {x["epoch"] for x in rows}
@@ -98,7 +102,9 @@ def summarize(runs, reference_profile="reference"):
                 )
         x["equal_work_verified"] = bool(same)
         if same:
-            x["training_window_speedup"] = ref["seconds_per_batch"] / x["seconds_per_batch"]
+            x["training_window_speedup"] = (
+                ref["seconds_per_batch"] / x["seconds_per_batch"]
+            )
             x["peak_memory_ratio"] = (
                 x["peak_allocated_bytes"] / ref["peak_allocated_bytes"]
                 if ref["peak_allocated_bytes"]
@@ -124,11 +130,31 @@ def profile_overrides(profile):
         return [f"execution={profile}"]
     options = {
         "optimized_previous": dict(
+            reuse_pair_buffer=False,
+            cache_time_features=False,
+            aggregation_layout_reuse=False,
             pair_bias_chunk_size=1,
             fused_pair_features=False,
             packed_geometry=False,
             joint_time_metrics=False,
             bucket_geometry_images=False,
+        ),
+        "optimized_40ea": dict(
+            reuse_pair_buffer=False,
+            cache_time_features=False,
+            aggregation_layout_reuse=False,
+        ),
+        "packed": dict(packed_block_attention=True),
+        "compiled_operators": dict(
+            compile_geometry_moments=True,
+            compile_readback=True,
+            compile_token_pairs=True,
+        ),
+        "all_operators": dict(
+            packed_block_attention=True,
+            compile_geometry_moments=True,
+            compile_readback=True,
+            compile_token_pairs=True,
         ),
         "bucketed": dict(bucket_geometry_images=True),
     }[profile]
@@ -150,15 +176,33 @@ def main():
     parser.add_argument(
         "--profiles",
         nargs="+",
-        choices=["reference", "math", "optimized_previous", "optimized", "bucketed"],
+        choices=[
+            "reference",
+            "math",
+            "optimized_previous",
+            "optimized_40ea",
+            "optimized",
+            "bucketed",
+            "packed",
+            "compiled_operators",
+            "all_operators",
+        ],
         default=["reference", "math", "optimized"],
     )
-    parser.add_argument("--compare-to", choices=["reference", "optimized_previous"], default=None)
     parser.add_argument(
-        "--batch-size", type=int, help="Override the per-GPU cap equally in all profiles"
+        "--compare-to",
+        choices=["reference", "optimized_previous", "optimized_40ea", "optimized"],
+        default=None,
     )
     parser.add_argument(
-        "--accumulate-grad-batches", type=int, help="Override accumulation equally in all profiles"
+        "--batch-size",
+        type=int,
+        help="Override the per-GPU cap equally in all profiles",
+    )
+    parser.add_argument(
+        "--accumulate-grad-batches",
+        type=int,
+        help="Override accumulation equally in all profiles",
     )
     parser.add_argument(
         "--compile-blocks",
@@ -170,6 +214,12 @@ def main():
         action="store_true",
         help="Compile only pair features in optimized profile",
     )
+    for flag in ("compile-geometry-moments", "compile-readback", "compile-token-pairs"):
+        parser.add_argument(
+            f"--{flag}",
+            action="store_true",
+            help="Enable this core in optimized profile",
+        )
     parser.add_argument("--batches", type=int, default=200, help="0 means a full epoch")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=20)
@@ -178,14 +228,21 @@ def main():
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument(
-        "--dry-run", action="store_true", help="Write exact commands without starting training"
+        "--dry-run",
+        action="store_true",
+        help="Write exact commands without starting training",
     )
     parser.add_argument(
-        "--compile", action="store_true", help="Compile DiT blocks in optimized profile only"
+        "--compile",
+        action="store_true",
+        help="Compile DiT blocks in optimized profile only",
     )
     args = parser.parse_args()
     stage = dict(STAGES[args.stage])
-    for key, value in (("batch", args.batch_size), ("accum", args.accumulate_grad_batches)):
+    for key, value in (
+        ("batch", args.batch_size),
+        ("accum", args.accumulate_grad_batches),
+    ):
         if value is not None:
             if value < 1:
                 parser.error("batch size and accumulation must be positive")
@@ -193,13 +250,22 @@ def main():
     if args.compare_to is not None and args.compare_to not in args.profiles:
         parser.error("--compare-to must be included in --profiles")
     args.compare_to = args.compare_to or "reference"
-    if args.epochs < 1 or args.repeats < 1 or args.warmup < 1 or args.warmup % stage["accum"]:
+    if (
+        args.epochs < 1
+        or args.repeats < 1
+        or args.warmup < 1
+        or args.warmup % stage["accum"]
+    ):
         parser.error(
             "epochs/repeats positive; warmup must be positive and divisible by accumulation"
         )
     if args.batches and (args.batches <= args.warmup or args.batches % stage["accum"]):
-        parser.error("batches must exceed warmup and be divisible by accumulation, or be 0")
-    if not args.lmdb_dir.is_dir() or (args.checkpoint and not args.checkpoint.is_file()):
+        parser.error(
+            "batches must exceed warmup and be divisible by accumulation, or be 0"
+        )
+    if not args.lmdb_dir.is_dir() or (
+        args.checkpoint and not args.checkpoint.is_file()
+    ):
         parser.error("Dataset/checkpoint path does not exist")
     output = (
         args.output
@@ -209,11 +275,18 @@ def main():
     ).resolve()
     output.mkdir(parents=True, exist_ok=False)
     commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
     (output / "git_commit.txt").write_text(commit + "\n")
     env = dict(
-        os.environ, CUDA_VISIBLE_DEVICES=args.devices, PROJECT_ROOT=str(ROOT), HYDRA_FULL_ERROR="1"
+        os.environ,
+        CUDA_VISIBLE_DEVICES=args.devices,
+        PROJECT_ROOT=str(ROOT),
+        HYDRA_FULL_ERROR="1",
     )
     devices = len(args.devices.split(","))
     runs = []
@@ -275,9 +348,22 @@ def main():
             overrides.extend(profile_overrides(profile))
             if profile == "optimized":
                 if args.compile or args.compile_blocks:
-                    overrides.append("model.flow_model_args.execution.compile_blocks=true")
+                    overrides.append(
+                        "model.flow_model_args.execution.compile_blocks=true"
+                    )
                 if args.compile or args.compile_pair_features:
-                    overrides.append("model.flow_model_args.execution.compile_pair_features=true")
+                    overrides.append(
+                        "model.flow_model_args.execution.compile_pair_features=true"
+                    )
+                for option in (
+                    "compile_geometry_moments",
+                    "compile_readback",
+                    "compile_token_pairs",
+                ):
+                    if getattr(args, option):
+                        overrides.append(
+                            f"model.flow_model_args.execution.{option}=true"
+                        )
             command = [sys.executable, "-u", "src/train.py", *overrides]
             (directory / "command.json").write_text(json.dumps(command, indent=2))
             if args.dry_run:

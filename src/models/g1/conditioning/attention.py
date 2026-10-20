@@ -42,6 +42,7 @@ class BlockPairAttention(AttentionPairBias):
         z: Tensor,
         allowed_pairs: Tensor,
         pair_indices: Tensor,
+        block_layout=None,
     ) -> Tensor:
         """Attend within blocks and return exactly zero at padded query rows."""
         batch_size, num_atoms, _ = s.shape
@@ -53,11 +54,48 @@ class BlockPairAttention(AttentionPairBias):
         # never a dense (B,N,N,64/128) tensor. Padding diagonal bias can be zero:
         # a padded query reads only itself and its output is discarded.
         compact_bias = self.proj_z(z)  # (num_local_pairs, heads)
-        flat_bias = compact_bias.new_zeros((batch_size * num_atoms * num_atoms, self.num_heads))
+        if block_layout is not None:
+            output = self._packed_attention(q, k, v, compact_bias, block_layout)
+            output = self.proj_o(gate * output)
+            return output.masked_fill(~mask.bool().unsqueeze(-1), 0)
+        flat_bias = compact_bias.new_zeros(
+            (batch_size * num_atoms * num_atoms, self.num_heads)
+        )
         bias = flat_bias.index_copy(0, pair_indices, compact_bias)
-        bias = bias.view(batch_size, num_atoms, num_atoms, self.num_heads).permute(0, 3, 1, 2)
+        bias = bias.view(batch_size, num_atoms, num_atoms, self.num_heads).permute(
+            0, 3, 1, 2
+        )
         attn_bias = bias.masked_fill(~allowed_pairs[:, None], float("-inf"))
         output = self.attention_fn(q, k, v, attn_bias.contiguous())
         output = output.reshape(batch_size, num_atoms, self.c_s)
         output = self.proj_o(gate * output)
         return output.masked_fill(~mask.bool().unsqueeze(-1), 0)
+
+    def _packed_attention(self, q, k, v, compact_bias, layout):
+        """One attention call per length bucket, never one call per component."""
+        batch, atoms, heads, dim = q.shape
+        q_flat, k_flat, v_flat = (
+            x.reshape(batch * atoms, heads, dim) for x in (q, k, v)
+        )
+        rows, destinations = [], []
+        for bucket in layout:
+            indices, valid, pair_positions, pair_indices, output_positions = bucket
+            count, length = indices.shape
+            packed_q, packed_k, packed_v = (
+                x[indices] for x in (q_flat, k_flat, v_flat)
+            )
+            bias = compact_bias.new_zeros((count * length * length, heads))
+            bias = bias.index_copy(0, pair_positions, compact_bias[pair_indices])
+            bias = bias.reshape(count, length, length, heads).permute(0, 3, 1, 2)
+            # Every component has a real key. Padded queries are discarded later.
+            bias = bias.masked_fill(~valid[:, None, None, :], float("-inf"))
+            values = self.attention_fn(packed_q, packed_k, packed_v, bias.contiguous())
+            rows.append(values.reshape(-1, self.c_s)[output_positions])
+            destinations.append(indices.flatten()[output_positions])
+        output = q.new_zeros((batch * atoms, self.c_s))
+        if rows:
+            output = output.index_copy(0, torch.cat(destinations), torch.cat(rows))
+        else:
+            # All-padding batches still connect every projection for DDP.
+            output = output + (q.sum() + k.sum() + v.sum() + compact_bias.sum()) * 0
+        return output.reshape(batch, atoms, self.c_s)

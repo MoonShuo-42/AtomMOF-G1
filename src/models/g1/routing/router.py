@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import Tensor, nn
+from src.models.execution.time import shared_time_features
 
 from .features import RouterQueryEncoder
 from .groups import AtomCountGroups, GroupLayout
@@ -58,13 +59,28 @@ class SoftRouter(nn.Module):
         """Return P/Pbar (B,K_batch,N), mass/group_mask, and per-sample group_counts."""
         if h.ndim != 3 or atom_mask.shape != h.shape[:2]:
             raise ValueError("h must be (B,N,D) and atom_mask must be (B,N)")
+        time_input = t
         if t.ndim == 2 and t.shape[-1] == 1:
             t = t[:, 0]
         if t.shape != (h.shape[0],) or t.device != h.device:
             raise ValueError("t must be (B,) or (B,1) on h's device")
+
         # All-padding samples must remain safe even if their unused t is nonfinite.
-        safe_t = torch.where(atom_mask.bool().any(-1), t, 0)
-        encoded_time = self.time_embedding(safe_t)
+        def encode_time():
+            safe_t = torch.where(atom_mask.bool().any(-1), t, 0)
+            return self.time_embedding(safe_t)
+
+        if (
+            getattr(self, "cache_time_features", False)
+            and type(self.time_embedding) is FourierTimeEmbedding
+        ):
+            encoded_time = shared_time_features(
+                ("g1", self.time_embedding.dim, self.time_embedding.frequency_divisor),
+                (time_input, atom_mask),
+                encode_time,
+            )
+        else:
+            encoded_time = encode_time()
         return self.route_with_time_embedding(
             h, c, rho, encoded_time, geometry_ok, atom_mask, group_layout=group_layout
         )
@@ -98,7 +114,9 @@ class SoftRouter(nn.Module):
             or group_layout.counts.shape != (atom_mask.shape[0],)
             or group_layout.counts.device != atom_mask.device
         ):
-            raise ValueError("group_layout must match atom_mask and this router's capacity")
+            raise ValueError(
+                "group_layout must match atom_mask and this router's capacity"
+            )
         logits = self.template_bank(keys, num_active=group_mask.shape[1])
         return normalize_assignments(
             logits,

@@ -16,6 +16,8 @@ normalization safeguards. No training data, epochs or accumulation are reduced.
   layouts, batched device checks and sampling-only static condition caching.
   It also enables fused geometric pair projections, four-layer pair-bias
   projection groups, packed symmetric-moment contractions and joint loss bins.
+  Token pair addition reuses a fresh temporary, fixed time features are reused
+  within one forward, and prepared U storage is contracted directly into Z.
   Unused token maps and dense bond-index matrices are omitted from BWDB batches;
   the bond-type matrix is retained.
 - `execution=optimized`: the math profile plus fused AdamW, DDP gradient bucket
@@ -94,6 +96,13 @@ both math and optimized profiles are:
 
 | Option | Profile value | Work reduced |
 | --- | --- | --- |
+| `reuse_pair_buffer` | `true` | Add the input pair tensor into the fresh single-to-pair sum, removing one full pair allocation without mutating inputs. |
+| `cache_time_features` | `true` | Cache fixed frequencies and reuse raw time features within one forward. The three original time MLPs and four routers remain independent. |
+| `aggregation_layout_reuse` | `true` | Compute Z directly from the prepared U storage before exposing the public U layout, avoiding the atom/group/channel copy. Requires the prepared geometry path for benefit. |
+| `packed_block_attention` | `false` | Run ConditionEncoder QK/softmax/value attention in same-component length buckets; restore original atom order. |
+| `compile_geometry_moments` | `false` | Compile only continuous periodic-moment reductions; FP64 cutoff decisions remain eager. |
+| `compile_readback` | `false` | Compile the folded relation-value and pooling core, with validation and masks outside. |
+| `compile_token_pairs` | `false` | Compile token pair construction and its original normalization/projection. |
 | `fused_pair_features` | `true` | Concatenate the existing position/distance/mask projection weights; one five-channel input projection replaces three wide projections in original AtomMOF and compact G1 conditioning. |
 | `pair_bias_chunk_size` | `4` | Several independent per-layer pair projections share one GEMM; each layer retains its own LayerNorm affine and head projection weights. Set to 1 for the previous per-layer path. Requires `pair_norm_reuse=true`. |
 | `packed_geometry` | `true` | Compute chi and pair/internal trace contractions directly from six symmetric Q entries, avoiding large pairwise 3x3 expansions. Small group-internal matrices and their existing directional contractions remain. |
@@ -118,7 +127,77 @@ bucketed execution needs its own CUDA measurement before adoption. In particular
 a small-image-count batch may gain nothing. The existing compile flags remain
 false by default; there is no forced SDPA backend or precision reduction.
 
-## Compare the latest operators against the previous optimized implementation
+## Time features, block packing and continuous-core compilation
+
+Time caches contain no learned projection outputs. A context-local cache lives
+for exactly one Flow forward, preserves time gradients and is cleared even on
+exceptions. G1 bridge checkpoint regions compute their own time features so
+backward recomputation does not depend on another bridge's graph. Fixed-frequency
+caches contain only constants, are keyed by device/calculation dtype/config,
+and never add state_dict entries. They remain safe after inference followed by
+training or module dtype/device changes.
+
+The packed attention option changes only the G1 condition encoder's attention
+execution. It keeps all same-component pairs and the original pair bias, feature
+gate, FFN, masks and parameters. Components from different samples are separate,
+even when block IDs match. CPU workers group components by power-of-two padded
+length (capped at N), with one batched attention call per bucket. Outputs scatter
+back into the original atom order. All-padding samples retain zero parameter
+gradient connections for DDP. `data.prepare_g1_blocks` follows the execution
+switch in both profiles. Direct callers without prepared metadata use a CPU
+fallback, which can synchronize CUDA; worker preparation is preferred for speed.
+The metadata must be regenerated if atom order, mask or block membership changes.
+
+New compilation switches are independent of `compile_blocks` and
+`compile_pair_features`. Each wraps a bound continuous-core method without
+renaming parameters; disabling it removes the wrapper. The geometry search and
+FP64 inside-sphere decisions are never compiled. No SDPA backend, precision,
+cutoff, loss or model dimensions are changed. CPU `aot_eager` tests validate graph
+capture and compiled backward; they are not CUDA Inductor benchmarks.
+
+Packing and compilation stay opt-in pending GPU measurements. The baseline
+execution and all five new paths can be compared in one launcher run:
+
+```bash
+cd /data/ai4science/AtomMOF-G1
+export PROJECT_ROOT=/data/ai4science/AtomMOF-G1
+python scripts/benchmark_execution.py \
+  --lmdb-dir /data/ai4science/AtomMOF/AtomMOF-main/data/bwdb \
+  --model g1 --stage 1 --batch-size 64 --accumulate-grad-batches 1 \
+  --profiles optimized_40ea optimized packed compiled_operators all_operators \
+  --compare-to optimized_40ea \
+  --batches 0 --epochs 3 --warmup 20 --repeats 2
+```
+
+`optimized_40ea` reproduces the execution options of commit 40ea1df;
+`optimized` enables the three new default options; `packed` adds block attention;
+`compiled_operators` adds the three new compilation regions; `all_operators`
+combines both. These are execution variants of the same weights and architecture.
+`optimized_previous` still means the earlier e509a4a options, not 40ea1df.
+The user's 129.51-second result predates 40ea1df and is not a measurement of it.
+The launcher uses independent directories, records each command, and refuses
+comparisons with different workload hashes or precision flags. Compilation can
+increase startup/recompilation time or memory; include process_seconds and later
+epochs rather than reporting only a favorable steady window. No automatic
+fallback silently disables a failing compiled core.
+
+For an existing training command, `execution=optimized` enables the three default
+options. To attempt all five changes, additionally set:
+
+```bash
+model.flow_model_args.execution.packed_block_attention=true \
+model.flow_model_args.execution.compile_geometry_moments=true \
+model.flow_model_args.execution.compile_readback=true \
+model.flow_model_args.execution.compile_token_pairs=true
+```
+
+The isolated pair-addition test eliminates one B*N*N*token_z allocation. At
+B=64, N=200 and token_z=128 in FP32 this buffer is about 1.22 GiB. This is a local
+allocation reduction, not a promised 1.22 GiB reduction in whole-training peak.
+Packing savings depend on the actual component sizes; a single large component
+may add overhead without reducing attention work.
+
+## Compare against the earlier e509a4a implementation
 
 The launcher supports `optimized_previous` (operator settings used at e509a4a),
 `optimized` (current operators), and `bucketed` (current plus image buckets).

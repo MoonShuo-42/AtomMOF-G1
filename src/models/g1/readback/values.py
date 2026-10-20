@@ -55,7 +55,9 @@ class RelationConditionedValue(nn.Module):
         group_mask: Tensor,
         geometry_ok: Tensor | None = None,
     ) -> Tensor:
-        valid = validate_content(H, S_plus, atom_mask, group_mask, self.h_dim, self.group_dim)
+        valid = validate_content(
+            H, S_plus, atom_mask, group_mask, self.h_dim, self.group_dim
+        )
         validate_descriptors(features, valid)
         if H.device != self.atom_projection.weight.device:
             raise ValueError("content and value parameters must share a device")
@@ -76,8 +78,14 @@ class RelationConditionedValue(nn.Module):
             return values.reshape(*valid.shape, self.heads, self.head_dim)
 
     def pooled(
-        self, H: Tensor, S_plus: Tensor, features: Tensor, weights: Tensor,
-        atom_mask: Tensor, group_mask: Tensor, geometry_ok: Tensor | None = None,
+        self,
+        H: Tensor,
+        S_plus: Tensor,
+        features: Tensor,
+        weights: Tensor,
+        atom_mask: Tensor,
+        group_mask: Tensor,
+        geometry_ok: Tensor | None = None,
     ) -> Tensor:
         """Exact per-head reduction BEFORE the final linear projection.
 
@@ -85,7 +93,9 @@ class RelationConditionedValue(nn.Module):
         W_h Sum_k a_k SiLU(hidden_k) + b_h Sum_k a_k.
         The bias mass is retained for empty groups and padding, not assumed to be 1.
         """
-        valid = validate_content(H, S_plus, atom_mask, group_mask, self.h_dim, self.group_dim)
+        valid = validate_content(
+            H, S_plus, atom_mask, group_mask, self.h_dim, self.group_dim
+        )
         validate_descriptors(features, valid)
         batch, atoms, groups = valid.shape
         if weights.shape != (batch, self.heads, atoms, groups):
@@ -99,22 +109,31 @@ class RelationConditionedValue(nn.Module):
         with torch.autocast(device_type=H.device.type, enabled=False):
             safe_H = torch.where(atom_mask.bool()[..., None], H.to(dtype), 0)
             safe_S = torch.where(group_mask.bool()[..., None], S_plus.to(dtype), 0)
-            safe_features = torch.where(geometry_valid[..., None], features.to(dtype), 0)
-            hidden = (
-                linear(safe_H, self.atom_projection)[:, :, None]
-                + linear(safe_S, self.group_projection)[:, None]
-                + linear(safe_features, self.geometry_projection)
+            safe_features = torch.where(
+                geometry_valid[..., None], features.to(dtype), 0
             )
-            hidden = F.silu(hidden + self.hidden_bias.to(hidden.dtype))
-            hidden = hidden.masked_fill(~valid[..., None], 0)
             safe_weights = torch.where(valid[:, None], weights.to(dtype), 0)
-            pooled = torch.einsum("bhik,bikf->bihf", safe_weights, hidden)
-            projection = self.output_projection.weight.reshape(
-                self.heads, self.head_dim, hidden.shape[-1]
-            ).to(pooled.dtype)
-            result = torch.einsum("bihf,hdf->bihd", pooled, projection)
-            if self.output_projection.bias is not None:
-                bias = self.output_projection.bias.to(result.dtype).reshape(self.heads, self.head_dim)
-                mass = safe_weights.to(result.dtype).sum(-1).transpose(1, 2)
-                result = result + mass[..., None] * bias
-            return result.reshape(batch, atoms, self.heads * self.head_dim)
+            return self._pool_hidden(safe_H, safe_S, safe_features, safe_weights, valid)
+
+    def _pool_hidden(self, safe_H, safe_S, safe_features, safe_weights, valid):
+        """Continuous value/pooling core with unchanged projections and bias mass."""
+        batch, atoms = safe_H.shape[:2]
+        hidden = (
+            linear(safe_H, self.atom_projection)[:, :, None]
+            + linear(safe_S, self.group_projection)[:, None]
+            + linear(safe_features, self.geometry_projection)
+        )
+        hidden = F.silu(hidden + self.hidden_bias.to(hidden.dtype))
+        hidden = hidden.masked_fill(~valid[..., None], 0)
+        pooled = torch.einsum("bhik,bikf->bihf", safe_weights, hidden)
+        projection = self.output_projection.weight.reshape(
+            self.heads, self.head_dim, hidden.shape[-1]
+        ).to(pooled.dtype)
+        result = torch.einsum("bihf,hdf->bihd", pooled, projection)
+        if self.output_projection.bias is not None:
+            bias = self.output_projection.bias.to(result.dtype).reshape(
+                self.heads, self.head_dim
+            )
+            mass = safe_weights.to(result.dtype).sum(-1).transpose(1, 2)
+            result = result + mass[..., None] * bias
+        return result.reshape(batch, atoms, self.heads * self.head_dim)

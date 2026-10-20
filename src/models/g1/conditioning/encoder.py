@@ -62,9 +62,12 @@ class StaticConditionBlock(nn.Module):
         atom_mask: Tensor,
         allowed_pairs: Tensor,
         pair_indices: Tensor,
+        block_layout=None,
     ) -> Tensor:
         """Update atom features using static pair bias and ordinary residuals."""
-        x = x + self.attn(self.norm1(x), atom_mask, p, allowed_pairs, pair_indices)
+        x = x + self.attn(
+            self.norm1(x), atom_mask, p, allowed_pairs, pair_indices, block_layout
+        )
         x = x + self.mlp(self.norm2(x))
         return x.masked_fill(~atom_mask.bool().unsqueeze(-1), 0)
 
@@ -79,7 +82,8 @@ class ConditionEncoder(nn.Module):
     internal Transformer widths can be configured independently.
 
     forward(feats) computes only valid within-block pairs. Pair MLP
-    and pair projection remain compact; attention still uses dense per-head bias.
+    and pair projection remain compact; attention can use dense per-head bias
+    or CPU-planned component buckets through the execution policy.
     No noise, lattice, time, positional index embedding, or target is read.
     Parameters are newly initialized, not automatically loaded from small.ckpt.
     """
@@ -116,10 +120,14 @@ class ConditionEncoder(nn.Module):
         self.activation_checkpointing = activation_checkpointing
         self.features = AtomConditionFeatures(atom_s, atom_z)
         self.single_projection = (
-            nn.Identity() if atom_s == hidden_dim else nn.Linear(atom_s, hidden_dim, bias=False)
+            nn.Identity()
+            if atom_s == hidden_dim
+            else nn.Linear(atom_s, hidden_dim, bias=False)
         )
         self.pair_projection = (
-            nn.Identity() if atom_z == pair_dim else nn.Linear(atom_z, pair_dim, bias=False)
+            nn.Identity()
+            if atom_z == pair_dim
+            else nn.Linear(atom_z, pair_dim, bias=False)
         )
         self.blocks = nn.ModuleList(
             [
@@ -147,11 +155,16 @@ class ConditionEncoder(nn.Module):
         atom_mask: Tensor,
         allowed_pairs: Tensor,
         pair_indices: Tensor,
+        block_layout=None,
     ) -> Tensor:
         x = self.single_projection(c.masked_fill(~atom_mask.unsqueeze(-1), 0))
         p = self.pair_projection(p)
         for block in self.blocks:
-            if self.activation_checkpointing and self.training and torch.is_grad_enabled():
+            if (
+                self.activation_checkpointing
+                and self.training
+                and torch.is_grad_enabled()
+            ):
                 x = checkpoint(
                     block,
                     x,
@@ -159,16 +172,35 @@ class ConditionEncoder(nn.Module):
                     atom_mask,
                     allowed_pairs,
                     pair_indices,
+                    block_layout,
                     use_reentrant=False,
                 )
             else:
-                x = block(x, p, atom_mask, allowed_pairs, pair_indices)
+                x = block(x, p, atom_mask, allowed_pairs, pair_indices, block_layout)
         return self.output_projection(x).masked_fill(~atom_mask.unsqueeze(-1), 0)
 
     def forward(self, feats: Mapping[str, Tensor]) -> Tensor:
         """Read only original chemical/reference features; preserve atom ordering."""
         mask = feats["atom_pad_mask"].bool()
-        layout = (prepared_local_pairs(feats) if getattr(self, "prepared_layouts", False)
-                  else local_pair_layout(mask, feats["block_index"]))
+        layout = (
+            prepared_local_pairs(feats)
+            if getattr(self, "prepared_layouts", False)
+            else local_pair_layout(mask, feats["block_index"])
+        )
         c, p = self.features(feats, layout.indices)
-        return self._encode(c, p, mask, layout.allowed, layout.indices)
+        block_layout = None
+        if getattr(self, "packed_block_attention", False):
+            block_layout = feats.get("g1_block_layout")
+            if block_layout is None:
+                from src.data.block_layout import (
+                    prepare_block_layout,
+                    move_block_layout,
+                )
+
+                block_layout = prepare_block_layout(
+                    mask.detach().cpu(),
+                    feats["block_index"].detach().cpu(),
+                    layout.indices.detach().cpu(),
+                )
+                block_layout = move_block_layout(block_layout, mask.device)
+        return self._encode(c, p, mask, layout.allowed, layout.indices, block_layout)

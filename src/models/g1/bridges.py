@@ -7,6 +7,7 @@ import torch
 from hydra.utils import instantiate
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
+from src.models.execution.time import time_feature_scope
 
 from .geometry import PeriodicGeometry
 from .module import G1Module
@@ -184,5 +185,10 @@ class G1Bridges(nn.Module):
             return bridge.forward_with_context(hidden, times, prepared).H_updated
 
         if self.activation_checkpointing and self.training and torch.is_grad_enabled():
-            return checkpoint(update, H, t, context, use_reentrant=False)
+            def recomputable_update(hidden, times, prepared):
+                # Recompute must execute the same operations as its own forward;
+                # it cannot depend on another bridge's forward-local autograd cache.
+                with time_feature_scope(False):
+                    return update(hidden, times, prepared)
+            return checkpoint(recomputable_update, H, t, context, use_reentrant=False)
         return update(H, t, context)

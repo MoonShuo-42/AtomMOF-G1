@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from src.models.simple.attention import AttentionPairBias
 from src.models.execution.ops import normalize_pairs, project_pair_bias_group
+from src.models.execution.time import constant_frequencies, shared_time_features
 
 
 def modulate(x, shift, scale):
@@ -40,9 +41,29 @@ class TimestepEmbedder(nn.Module):
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
+    def _fixed_time_features(self, t):
+        dim = self.frequency_embedding_dim
+        half = dim // 2
+        frequencies = constant_frequencies(
+            self, (dim, t.device),
+            lambda: torch.exp(
+                -math.log(10000) * torch.arange(half, dtype=torch.float32) / half
+            ).to(device=t.device),
+        )
+        args = t[:, None].float() * frequencies[None]
+        result = torch.cat((args.cos(), args.sin()), dim=-1)
+        if dim % 2:
+            result = torch.cat((result, torch.zeros_like(result[:, :1])), dim=-1)
+        return result
+
     def forward(self, t):
         # t: Float['b] -> t_emb: Float['b d]
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_dim)
+        if getattr(self, "cache_time_features", False):
+            t_freq = shared_time_features(
+                ("dit", self.frequency_embedding_dim), (t,), lambda: self._fixed_time_features(t)
+            )
+        else:
+            t_freq = self.timestep_embedding(t, self.frequency_embedding_dim)
         t_emb = self.mlp(t_freq)
         return t_emb
     

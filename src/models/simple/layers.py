@@ -268,6 +268,14 @@ class TokenTransformer(Module):
             activation_checkpointing=activation_checkpointing
         )
 
+    def _pair_features(self, s_init, z):
+        pair = self.z_init_1(s_init)[:, :, None] + self.z_init_2(s_init)[:, None, :]
+        if getattr(self, "reuse_pair_buffer", False) and pair.dtype == z.dtype:
+            pair.add_(z)
+        else:
+            pair = z + pair
+        return self.z_mlp(pair)
+
     def forward(
         self,
         x,
@@ -283,14 +291,8 @@ class TokenTransformer(Module):
         # Initialize single embeddings
         s_init = self.s_init(x)  # (batch_size, num_tokens, token_s)
 
-        # Initialize pairwise embeddings
-        z_init = z + (
-            self.z_init_1(s_init)[:, :, None]
-            + self.z_init_2(s_init)[:, None, :]
-        ) # (batch_size, num_tokens, num_tokens, token_z)
-
         s = self.s_mlp(s_init)
-        z = self.z_mlp(z_init)
+        z = self._pair_features(s_init, z)
         if after_layer is None:
             x = self.token_transformer(s, t, token_mask, z)
         else:

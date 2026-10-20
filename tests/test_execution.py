@@ -14,6 +14,10 @@ from src.models.simple.flow import FlowModule
 from src.models.simple.transformers import DiT
 
 MATH = dict(
+    reuse_pair_buffer=True,
+    cache_time_features=True,
+    aggregation_layout_reuse=True,
+    packed_block_attention=True,
     broadcast_masks=True,
     defer_validation=True,
     prepared_layouts=True,
@@ -75,7 +79,9 @@ def test_full_flow_outputs_gradients_optimizer_step_and_checkpoint(g1, multiplic
         torch.testing.assert_close(a[key], b[key], rtol=5e-5, atol=2e-6)
     loss(a).backward()
     loss(b).backward()
-    for (name, p), (other, q) in zip(reference.named_parameters(), optimized.named_parameters()):
+    for (name, p), (other, q) in zip(
+        reference.named_parameters(), optimized.named_parameters()
+    ):
         assert name == other and (p.grad is None) == (q.grad is None)
         if p.grad is not None:
             torch.testing.assert_close(p.grad, q.grad, rtol=3e-4, atol=3e-6, msg=name)
@@ -172,7 +178,9 @@ def test_complete_flow_retains_fp32_parameters_gradients_and_activations(g1, pro
     assert all(t.dtype == torch.float32 for t in out.values())
     for name, parameter in model.named_parameters():
         assert parameter.dtype == torch.float32, name
-        assert parameter.grad is not None and parameter.grad.dtype == torch.float32, name
+        assert (
+            parameter.grad is not None and parameter.grad.dtype == torch.float32
+        ), name
         assert torch.isfinite(parameter.grad).all(), name
 
 
@@ -181,7 +189,8 @@ def test_hydra_execution_profile_composes_without_changing_training_budget(profi
     config_dir = str(Path(__file__).resolve().parents[1] / "configs")
     with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
         cfg = compose(
-            config_name="train", overrides=["experiment=g1_small_stage1", f"execution={profile}"]
+            config_name="train",
+            overrides=["experiment=g1_small_stage1", f"execution={profile}"],
         )
     assert cfg.model.flow_model_args.execution.pair_norm_reuse
     assert cfg.trainer.max_epochs == 500 and cfg.trainer.accumulate_grad_batches == 2
@@ -214,7 +223,9 @@ def test_vectorized_time_metrics_preserve_bins_empty_bins_and_labels(bins):
     optimized = stratify_loss_by_time(t, values, bins, "coord", fast=True)
     assert reference.keys() == optimized.keys()
     for key in reference:
-        torch.testing.assert_close(torch.as_tensor(reference[key]), optimized[key], equal_nan=True)
+        torch.testing.assert_close(
+            torch.as_tensor(reference[key]), optimized[key], equal_nan=True
+        )
         assert not optimized[key].requires_grad
 
 
@@ -241,7 +252,9 @@ def test_prepared_geometry_layout_masks_nan_and_preserves_both_gradients():
     new = aggregate(E, P, mask, group, ok, prepared_geometry=prepared)
     for a, b in zip(old, new):
         torch.testing.assert_close(a, b, rtol=1e-12, atol=1e-12)
-    ga = torch.autograd.grad(sum(x.square().sum() for x in old), (E, P), retain_graph=True)
+    ga = torch.autograd.grad(
+        sum(x.square().sum() for x in old), (E, P), retain_graph=True
+    )
     gb = torch.autograd.grad(sum(x.square().sum() for x in new), (E, P))
     for a, b in zip(ga, gb):
         torch.testing.assert_close(a, b, rtol=1e-11, atol=1e-11)
@@ -369,7 +382,7 @@ def _optimized_ddp_worker(rank, init_file):
             data = inputs()
             from src.data.execution_features import prepare_execution_layouts
 
-            prepare_execution_layouts(data["feats"])
+            prepare_execution_layouts(data["feats"], prepare_blocks=True)
             if rank == 1:
                 data["l_noisy"][0, 0] = -1
             optimizer.zero_grad(set_to_none=True)
@@ -396,7 +409,12 @@ def test_optimized_two_rank_ddp_with_mixed_geometry_validity(tmp_path):
 
     if not dist.is_available() or not dist.is_gloo_available():
         pytest.skip("Gloo unavailable")
-    mp.spawn(_optimized_ddp_worker, args=(str(tmp_path / "execution_gloo"),), nprocs=2, join=True)
+    mp.spawn(
+        _optimized_ddp_worker,
+        args=(str(tmp_path / "execution_gloo"),),
+        nprocs=2,
+        join=True,
+    )
 
 
 @pytest.mark.parametrize(
@@ -413,7 +431,9 @@ def test_optimized_two_rank_ddp_with_mixed_geometry_validity(tmp_path):
         "cudnn_allow_tf32",
     ],
 )
-def test_benchmark_comparison_requires_equal_work_and_measured_gpu_memory(tmp_path, mismatch):
+def test_benchmark_comparison_requires_equal_work_and_measured_gpu_memory(
+    tmp_path, mismatch
+):
     import importlib.util
     import json
 
@@ -503,9 +523,13 @@ def test_benchmark_dry_run_commands_compose_all_profiles(tmp_path, monkeypatch):
     assert len(files) == 3
     for file in files:
         command = json.loads(file.read_text())
-        with initialize_config_dir(config_dir=str(root / "configs"), version_base="1.3"):
+        with initialize_config_dir(
+            config_dir=str(root / "configs"), version_base="1.3"
+        ):
             cfg = compose(config_name="train", overrides=command[3:])
-        assert cfg.data.max_num_atoms is None and cfg.trainer.accumulate_grad_batches == 4
+        assert (
+            cfg.data.max_num_atoms is None and cfg.trainer.accumulate_grad_batches == 4
+        )
         assert cfg.trainer.devices == 8 and cfg.data.dynamic.max_batch_size == 16
         assert not cfg.data.persistent_workers
         assert cfg.trainer.precision == "32-true"

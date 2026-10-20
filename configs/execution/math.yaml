@@ -5,6 +5,13 @@ trainer:
 model:
   flow_model_args:
     execution:
+      reuse_pair_buffer: true
+      cache_time_features: true
+      aggregation_layout_reuse: true
+      packed_block_attention: false
+      compile_geometry_moments: false
+      compile_readback: false
+      compile_token_pairs: false
       pair_norm_reuse: true
       pair_bias_chunk_size: 4
       fused_pair_features: true
@@ -30,3 +37,4 @@ model:
 data:
   compact_batch: true
   prepare_g1_metadata: ${model.flow_model_args.g1.enabled}
+  prepare_g1_blocks: ${model.flow_model_args.execution.packed_block_attention}

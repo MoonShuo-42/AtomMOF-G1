@@ -8,6 +8,7 @@ from src.models.execution import configure_execution
 from src.models.execution.ops import repeat_batch
 from src.models.execution.validation import deferred_tensor_checks
 from src.models.execution.conditioning import SamplingCondition
+from src.models.execution.time import time_feature_scope
 from src.models.loss.mic_dist import mic_pairwise_dist
 from src.models.energy import AtomicOverlapEnergy, MLIPEnergy
 from src.models.simple.layers import AtomAttentionEncoder, AtomAttentionDecoder, TokenTransformer
@@ -141,6 +142,10 @@ class FlowModule(nn.Module):
         return SamplingCondition(id(self), feats, self._g1_enabled, atom, condition)
 
     def forward(self, r_noisy, l_noisy, times, feats, multiplicity=1, static_condition=None):
+        with time_feature_scope(self.execution_options["cache_time_features"]):
+            return self._forward(r_noisy, l_noisy, times, feats, multiplicity, static_condition)
+
+    def _forward(self, r_noisy, l_noisy, times, feats, multiplicity=1, static_condition=None):
         if static_condition is not None:
             if self.training or torch.is_grad_enabled():
                 raise RuntimeError("Static sampling cache cannot be used in training")

@@ -88,12 +88,20 @@ encoder.features.load_state_dict(
 
 ## 计算与验证
 
-当前唯一执行路径：先收集同构件有效原子对，再按原公式构造紧凑的
+特征构造路径：先收集同构件有效原子对，再按原公式构造紧凑的
 p(M,128)，经过原 pair MLP 和 128→64 投影，M=各样本各构件原子数平方之和。
 Transformer 内 pair LayerNorm 和 bias 投影也只在这些原子对上运行，
 最后散射为 (B,heads,N,N) 注意力偏置。避免分配 dense p 的 128/64 通道张量。
 
-attention 的 QK 和 softmax 仍是 dense N×N，不能把整层复杂度都算成 M。
+默认 attention 的 QK 和 softmax 仍是 dense N×N。
+可通过 `model.flow_model_args.execution.packed_block_attention=true` 改为按构件打包：
+CPU DataLoader 按构件长度分桶，每桶一次批量 attention，保留完整的构件内原子对，
+再按原子索引恢复输出。不同样本的同编号构件不会混在一起。
+Q/K/V、pair bias、feature gate、FFN、权重及计算精度不变；全 padding 仍保留零梯度连接。
+桶内有少量 padding，实际计算量以桶的补齐尺寸为准，不能直接等同于 M。
+该开关默认关闭，需在服务器比较真实构件分布下的收益；执行配置会同时准备 CPU 元数据。
+直接调用但缺少元数据时可在 CPU 构造布局，CUDA 输入会产生同步，适合作为正确性回退。
+详见 [执行优化](../../execution/README.md)。
 布局压紧每次条件编码包含一次 nonzero；训练不跨 optimizer step 缓存。
 dense 数学参考位于 tests/reference_g1_condition.py，仅供测试与组件基准对照，
 训练代码没有 dense 模式开关或外部 dense encode 入口。

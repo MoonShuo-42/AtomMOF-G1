@@ -9,6 +9,13 @@ def configure_execution(model, options: Mapping | None = None):
 
     cfg = dict(options or {})
     defaults = dict(
+        reuse_pair_buffer=False,
+        cache_time_features=False,
+        aggregation_layout_reuse=False,
+        packed_block_attention=False,
+        compile_geometry_moments=False,
+        compile_readback=False,
+        compile_token_pairs=False,
         pair_norm_reuse=False,
         pair_bias_chunk_size=1,
         fused_pair_features=False,
@@ -40,7 +47,10 @@ def configure_execution(model, options: Mapping | None = None):
             and type(value) is not bool
         ):
             raise TypeError(f"execution.{name} must be bool")
-    if type(defaults["pair_bias_chunk_size"]) is not int or defaults["pair_bias_chunk_size"] < 1:
+    if (
+        type(defaults["pair_bias_chunk_size"]) is not int
+        or defaults["pair_bias_chunk_size"] < 1
+    ):
         raise ValueError("execution.pair_bias_chunk_size must be a positive integer")
     if defaults["pair_bias_chunk_size"] > 1 and not defaults["pair_norm_reuse"]:
         raise ValueError("Grouped pair projections require pair_norm_reuse")
@@ -51,6 +61,14 @@ def configure_execution(model, options: Mapping | None = None):
 
     # Plain attributes add neither parameters nor state_dict keys.
     for module in model.modules():
+        for key in (
+            "reuse_pair_buffer",
+            "cache_time_features",
+            "aggregation_layout_reuse",
+            "packed_block_attention",
+        ):
+            setattr(module, key, defaults[key])
+        module._time_frequencies = None
         module.avoid_repeat_copies = defaults["avoid_repeat_copies"]
         module.prepared_layouts = defaults["prepared_layouts"]
         module.fused_pair_features = defaults["fused_pair_features"]
@@ -73,10 +91,15 @@ def configure_execution(model, options: Mapping | None = None):
     for module in model.modules():
         if isinstance(module, DiTBlock) and not defaults["compile_blocks"]:
             module._compiled_call_impl = None
-        if isinstance(module, AtomConditionFeatures) and not defaults["compile_pair_features"]:
+        if (
+            isinstance(module, AtomConditionFeatures)
+            and not defaults["compile_pair_features"]
+        ):
             module._compiled_call_impl = None
         if isinstance(module, AtomAttentionEncoder):
-            original = getattr(module.condition_features, "_torchdynamo_orig_callable", None)
+            original = getattr(
+                module.condition_features, "_torchdynamo_orig_callable", None
+            )
             if original is not None:
                 module.condition_features = original
 
@@ -86,7 +109,8 @@ def configure_execution(model, options: Mapping | None = None):
                 # Module.compile keeps the original state_dict, unlike wrapping in
                 # an OptimizedModule with an _orig_mod prefix. Search stays eager.
                 module.compile(
-                    backend=defaults["compile_backend"], dynamic=defaults["compile_dynamic"]
+                    backend=defaults["compile_backend"],
+                    dynamic=defaults["compile_dynamic"],
                 )
     if defaults["compile_pair_features"]:
         import torch
@@ -100,7 +124,38 @@ def configure_execution(model, options: Mapping | None = None):
                 )
             elif isinstance(module, AtomConditionFeatures):
                 module.compile(
-                    backend=defaults["compile_backend"], dynamic=defaults["compile_dynamic"]
+                    backend=defaults["compile_backend"],
+                    dynamic=defaults["compile_dynamic"],
+                )
+    # Compile only continuous cores. Cutoff decisions and validation stay eager.
+    import torch
+    from src.models.g1.geometry.moments import PeriodicPairMoments
+    from src.models.g1.readback.values import RelationConditionedValue
+    from src.models.simple.layers import TokenTransformer
+
+    cores = (
+        (PeriodicPairMoments, "_reduce", "compile_geometry_moments"),
+        (RelationConditionedValue, "_pool_hidden", "compile_readback"),
+        (TokenTransformer, "_pair_features", "compile_token_pairs"),
+    )
+    for module in model.modules():
+        for cls, method, option in cores:
+            if isinstance(module, cls):
+                original = getattr(
+                    getattr(module, method),
+                    "_torchdynamo_orig_callable",
+                    getattr(module, method),
+                )
+                setattr(
+                    module,
+                    method,
+                    torch.compile(
+                        original,
+                        backend=defaults["compile_backend"],
+                        dynamic=defaults["compile_dynamic"],
+                    )
+                    if defaults[option]
+                    else original,
                 )
     model.execution_options = defaults
     return defaults

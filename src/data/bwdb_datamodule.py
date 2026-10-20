@@ -16,7 +16,7 @@ from src.data.sampler import DynamicBatchSampler, OverfitSampler
 from src.data.prior.prior_sampler import PriorSampler
 
 
-def collate_fn(batch: List[Dict[str, Tensor]], *, compact_batch=False, prepare_g1_metadata=False) -> Dict[str, Tensor]:
+def collate_fn(batch: List[Dict[str, Tensor]], *, compact_batch=False, prepare_g1_metadata=False, prepare_g1_blocks=False) -> Dict[str, Tensor]:
     """
     Collates a batch of featurized Structure dictionaries for a Transformer.
     """
@@ -94,7 +94,9 @@ def collate_fn(batch: List[Dict[str, Tensor]], *, compact_batch=False, prepare_g
         if tensor_list: # Only stack if the key was present in at least one item
             final_batch[key] = torch.stack(tensor_list, dim=0)
 
-    return prepare_execution_layouts(final_batch) if prepare_g1_metadata else final_batch
+    if prepare_g1_metadata or prepare_g1_blocks:
+        return prepare_execution_layouts(final_batch, prepare_blocks=prepare_g1_blocks)
+    return final_batch
 
 
 class BWDBDataModule(LightningDataModule):
@@ -114,6 +116,7 @@ class BWDBDataModule(LightningDataModule):
         persistent_workers: bool = False,
         compact_batch: bool = False,
         prepare_g1_metadata: bool = False,
+        prepare_g1_blocks: bool = False,
         sampler: Optional[str] = None,
         dynamic: Optional[Dict] = None,
         predict_split: str = 'val',
@@ -133,6 +136,7 @@ class BWDBDataModule(LightningDataModule):
         self.persistent_workers = persistent_workers
         self.compact_batch = compact_batch
         self.prepare_g1_metadata = prepare_g1_metadata
+        self.prepare_g1_blocks = prepare_g1_blocks
         self.sampler = sampler
         self.dynamic = dynamic
         self.predict_split = predict_split
@@ -228,7 +232,7 @@ class BWDBDataModule(LightningDataModule):
             batch_size=batch_size if batch_sampler is None else 1,
             sampler=sampler,
             batch_sampler=batch_sampler,
-            collate_fn=partial(collate_fn, compact_batch=self.compact_batch, prepare_g1_metadata=self.prepare_g1_metadata),
+            collate_fn=partial(collate_fn, compact_batch=self.compact_batch, prepare_g1_metadata=self.prepare_g1_metadata, prepare_g1_blocks=self.prepare_g1_blocks),
             shuffle=is_train if sampler is None and batch_sampler is None else False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
