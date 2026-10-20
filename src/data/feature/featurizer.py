@@ -14,8 +14,18 @@ class Featurizer:
     def __init__(self):
         pass
 
-    def _apply_augmentations(self, ref_pos: torch.Tensor, block_index: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def _apply_augmentations(self, ref_pos: torch.Tensor, block_index: torch.Tensor, mask: torch.Tensor, *, block_slices=None) -> torch.Tensor:
         """Applies random augmentation to each block's local coordinates."""
+        if block_slices is not None:
+            # process() concatenates atoms in block order. Preserve exactly one
+            # augmentation call per nonempty block, including its RNG draws,
+            # while avoiding a full atom mask and gather/scatter for each block.
+            for start, stop in block_slices:
+                if torch.any(mask[start:stop]):
+                    ref_pos[start:stop] = center_random_augmentation(
+                        ref_pos[start:stop][None], mask[start:stop][None], centering=True
+                    )[0]
+            return ref_pos
         for i in range(torch.max(block_index) + 1):
             included = (block_index == i)
             if torch.sum(included) > 0 and torch.any(mask[included]):
@@ -29,6 +39,7 @@ class Featurizer:
         ref_pos_list, ref_element_list, ref_charge_list, ref_chirality_list = [], [], [], []
         block_index_list, block_type_list = [], []
         bond_index_list, bond_type_list = [], []
+        block_slices = []
 
         # Iterate over blocks to extract features
         current_atom_idx = 0
@@ -36,6 +47,8 @@ class Featurizer:
             num_atoms = block.atomic_numbers.shape[0]
             if num_atoms == 0:
                 continue
+
+            block_slices.append((current_atom_idx, current_atom_idx + num_atoms))
 
             # Atom-level features
             ref_pos_list.append(block.cart_coords)
@@ -92,7 +105,7 @@ class Featurizer:
 
         # Apply augmentations to reference positions
         mask = torch.ones_like(ref_element).bool()
-        ref_pos = self._apply_augmentations(ref_pos, block_index, mask)
+        ref_pos = self._apply_augmentations(ref_pos, block_index, mask, block_slices=block_slices)
 
         return {
             "ref_pos": ref_pos,                     # (num_atoms, 3)

@@ -5,6 +5,11 @@ from collections.abc import Mapping
 def configure_execution(model, options: Mapping | None = None):
     cfg = dict(options or {})
     defaults = dict(
+        head_first_pair_bias=False,
+        time_modulation_chunk_size=1,
+        g1_readback_fusion=False,
+        geometry_storage_reuse=False,
+        readback_chunk_size=0,
         reuse_pair_buffer=False,
         cache_time_features=False,
         aggregation_layout_reuse=False,
@@ -37,17 +42,23 @@ def configure_execution(model, options: Mapping | None = None):
     if unknown:
         raise ValueError(f"Unknown execution options: {sorted(unknown)}")
     defaults.update(cfg)
+    integer_options = {
+        "pair_bias_chunk_size": 1,
+        "time_modulation_chunk_size": 1,
+        "readback_chunk_size": 0,
+    }
     for name, value in defaults.items():
         if (
-            name not in ("sdpa_backend", "compile_backend", "pair_bias_chunk_size")
+            name not in {"sdpa_backend", "compile_backend", *integer_options}
             and type(value) is not bool
         ):
             raise TypeError(f"execution.{name} must be bool")
-    if (
-        type(defaults["pair_bias_chunk_size"]) is not int
-        or defaults["pair_bias_chunk_size"] < 1
-    ):
-        raise ValueError("execution.pair_bias_chunk_size must be a positive integer")
+    for name, minimum in integer_options.items():
+        if type(defaults[name]) is not int or defaults[name] < minimum:
+            kind = "positive" if minimum else "nonnegative"
+            raise ValueError(f"execution.{name} must be a {kind} integer")
+    if defaults["readback_chunk_size"] and not defaults["fold_readback"]:
+        raise ValueError("Chunked readback requires fold_readback")
     if defaults["pair_bias_chunk_size"] > 1 and not defaults["pair_norm_reuse"]:
         raise ValueError("Grouped pair projections require pair_norm_reuse")
     if defaults["sdpa_backend"] not in ("auto", "math", "efficient", "flash", "cudnn"):
@@ -61,8 +72,11 @@ def configure_execution(model, options: Mapping | None = None):
 
     for module in model.modules():
         for key in (
-            "reuse_pair_buffer", "cache_time_features", "avoid_repeat_copies",
-            "prepared_layouts", "fused_pair_features",
+            "reuse_pair_buffer",
+            "cache_time_features",
+            "avoid_repeat_copies",
+            "prepared_layouts",
+            "fused_pair_features",
         ):
             setattr(module, key, defaults[key])
         module._time_frequencies = None
@@ -87,7 +101,9 @@ def configure_execution(model, options: Mapping | None = None):
                         original,
                         backend=defaults["compile_backend"],
                         dynamic=defaults["compile_dynamic"],
-                    ) if defaults[option] else original,
+                    )
+                    if defaults[option]
+                    else original,
                 )
     model.execution_options = defaults
     return defaults

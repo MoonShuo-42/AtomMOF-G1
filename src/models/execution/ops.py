@@ -16,10 +16,37 @@ def normalize_pairs(z: Tensor, norm: nn.LayerNorm) -> Tensor:
         return F.layer_norm(value, norm.normalized_shape, eps=norm.eps)
 
 
+def project_pair_heads(z: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
+    """Project pair channels directly to B,H,N,M without an NH-to-HN copy.
+
+    The transpose of the flattened input is a view. Matmul produces the head
+    dimension before the pair dimensions, giving SDPA a unit final stride.
+    Existing weights remain registered on their original Linear modules.
+    """
+    batch, queries, keys, channels = z.shape
+    pairs = z.reshape(batch, queries * keys, channels).transpose(1, 2)
+    result = torch.matmul(weight, pairs)
+    if bias is not None:
+        result = result + bias[None, :, None]
+    return result.reshape(batch, weight.shape[0], queries, keys)
+
+
+def project_time_modulations(activated: Tensor, projections) -> tuple[Tensor, ...]:
+    """Group independent adaLN projections of a shared SiLU time embedding."""
+    projections = tuple(projections)
+    weight = torch.cat([layer.weight for layer in projections], dim=0)
+    bias = torch.cat([layer.bias for layer in projections], dim=0)
+    return F.linear(activated, weight, bias).split(
+        [layer.out_features for layer in projections], dim=-1
+    )
+
+
 def project_normalized_pairs(
     z: Tensor,
     norm: nn.LayerNorm,
     projection: nn.Linear,
+    *,
+    head_first: bool = False,
 ) -> Tensor:
     """W(gamma*z_hat+beta)+b, without materializing gamma*z_hat+beta.
 
@@ -33,10 +60,14 @@ def project_normalized_pairs(
         if norm.bias is not None:
             offset = F.linear(norm.bias.to(z.dtype), weight)
             bias = offset if bias is None else bias + offset
+    if head_first:
+        return project_pair_heads(z, effective, bias)
     return F.linear(z, effective, bias)
 
 
-def project_pair_bias_group(z: Tensor, layers) -> tuple[Tensor, ...]:
+def project_pair_bias_group(
+    z: Tensor, layers, *, head_first: bool = False
+) -> tuple[Tensor, ...]:
     """One GEMM for several independent LayerNorm-affine/linear projections.
 
     Only the parameter-free normalized input is shared. Concatenation retains
@@ -61,6 +92,8 @@ def project_pair_bias_group(z: Tensor, layers) -> tuple[Tensor, ...]:
                 for value, size in zip(biases, sizes)
             ]
         )
+    if head_first:
+        return project_pair_heads(z, torch.cat(weights), bias).split(sizes, dim=1)
     return F.linear(z, torch.cat(weights), bias).split(sizes, dim=-1)
 
 

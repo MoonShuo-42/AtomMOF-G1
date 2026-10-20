@@ -72,11 +72,11 @@ class GeometryAggregator(nn.Module):
             available = geometry_ok.bool()
         valid_atoms = atom_mask.bool() & available[:, None]
         valid_groups = group_mask.bool() & available[:, None]
-        pair_mask = valid_atoms[:, :, None] & valid_atoms[:, None, :]
         weight_mask = valid_groups[:, :, None] & valid_atoms[:, None, :]
         # Multiplying by zero is insufficient when padding contains NaN/Inf.
         safe_Pbar = torch.where(weight_mask, Pbar, 0)
         if prepared_geometry is None:
+            pair_mask = valid_atoms[:, :, None] & valid_atoms[:, None, :]
             safe_E = torch.where(pair_mask[..., None], E, 0)
             U = self.atom_to_group(safe_E, safe_Pbar)
         else:

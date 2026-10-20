@@ -73,8 +73,12 @@ class ReadbackAttention(nn.Module):
             k = linear(S_plus, self.key_projection).reshape(
                 batch, groups, self.heads, self.head_dim
             )
-            scores = torch.einsum("bihd,bkhd->bhik", q, k) / math.sqrt(self.head_dim)
-            scores = scores + bias.permute(0, 3, 1, 2) + (prior + self.pool_eps).log()[:, None]
-            scores = scores.masked_fill(~valid[:, None], float("-inf"))
-            scores = torch.where(valid.any(-1)[:, None, :, None], scores, 0)
-            return torch.softmax(scores, -1).masked_fill(~valid[:, None], 0)
+            return self._from_projected(q, k, prior, bias, valid)
+
+    def _from_projected(self, q, k, prior, bias, valid):
+        """Internal core for already validated, masked and projected content."""
+        scores = torch.einsum("bihd,bkhd->bhik", q, k) / math.sqrt(self.head_dim)
+        scores = scores + bias.permute(0, 3, 1, 2) + (prior + self.pool_eps).log()[:, None]
+        scores = scores.masked_fill(~valid[:, None], float("-inf"))
+        scores = torch.where(valid.any(-1)[:, None, :, None], scores, 0)
+        return torch.softmax(scores, -1).masked_fill(~valid[:, None], 0)

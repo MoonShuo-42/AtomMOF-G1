@@ -111,7 +111,15 @@ class G1Module(nn.Module):
             geo = self.geometry(x_t, l_t, mask)
         else:
             geo = self.geometry.from_cell(x_t, l_t, mask)
-        return G1Context(c_cond, geo, mask.clone(), self.router.group_selector.prepare(mask))
+        prepared = (
+            self.geometry.aggregation_layout(geo)
+            if type(self.geometry) is PeriodicGeometry
+            and getattr(self.geometry, "geometry_storage_reuse", False)
+            else None
+        )
+        return G1Context(
+            c_cond, geo, mask.clone(), self.router.group_selector.prepare(mask), prepared
+        )
 
     def forward_with_context(
         self,

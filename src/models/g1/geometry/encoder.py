@@ -35,6 +35,7 @@ class PeriodicGeometry(nn.Module):
 
     _execution_flags = {
         "packed_geometry": "packed_geometry",
+        "geometry_storage_reuse": "geometry_storage_reuse",
         "bucket_geometry_images": "bucket_geometry_images",
     }
 
@@ -130,6 +131,20 @@ class PeriodicGeometry(nn.Module):
             valid = torch.ones(x_t.shape[0], dtype=torch.bool, device=x_t.device)
             return self._compute(x_t, cell, mask, valid)
 
+    def aggregation_layout(self, output: GeometryOutput) -> Tensor:
+        """View this producer's masked E in contraction order, without a copy.
+
+        Only its own output is accepted by internal callers. Arbitrary external E
+        must still pass GeometryAggregator/prepare_geometry_layout masking.
+        """
+        if not getattr(self, "geometry_storage_reuse", False):
+            raise RuntimeError("Direct aggregation layout requires geometry_storage_reuse")
+        batch, atoms = output.E.shape[:2]
+        layout = output.E.permute(0, 1, 3, 2)
+        if not layout.is_contiguous():
+            raise ValueError("Geometry output does not have the producer's shared storage layout")
+        return layout.view(batch, atoms * 16, atoms)
+
     def _encode_pairs(
         self,
         coordinates: Tensor,
@@ -163,7 +178,12 @@ class PeriodicGeometry(nn.Module):
         plan = build_geometry_plan(safe_coordinates, safe_cell, mask, valid, self.image_search)
         # Also connect entirely unavailable batches to finite zero input gradients.
         zero = (safe_coordinates * 0).sum() + (safe_cell * 0).sum()
-        dense = coordinates.new_zeros((batch * atoms * atoms, 16)) + zero
+        reuse_storage = getattr(self, "geometry_storage_reuse", False)
+        # Build the layout consumed by four geometry GEMMs directly. The public
+        # (B,N,N,16) E is a view, with identical masked entries and gradients.
+        dense = coordinates.new_zeros(
+            (batch * atoms, 16, atoms) if reuse_storage else (batch * atoms * atoms, 16)
+        ) + zero
         plans = (
             bucket_geometry_plan(plan)
             if getattr(self, "bucket_geometry_images", False)
@@ -202,8 +222,17 @@ class PeriodicGeometry(nn.Module):
             # Scatter to the original dense pair order; sorting never changes
             # atom identities, periodic images, cutoffs, or group assignment.
             pairs = torch.cat(pair_chunks) if len(plans) > 1 else plan.pairs
-            dense = dense.index_copy(0, pairs, torch.cat(chunks))
-        pair_features = dense.reshape(batch, atoms, atoms, 16)
+            encoded = torch.cat(chunks)
+            if reuse_storage:
+                # Accepted pairs are unique. One differentiable indexed write
+                # avoids another full-sized zero/scatter destination allocation.
+                dense[pairs // atoms, :, pairs % atoms] = encoded
+            else:
+                dense = dense.index_copy(0, pairs, encoded)
+        pair_features = (
+            dense.reshape(batch, atoms, 16, atoms).permute(0, 1, 3, 2)
+            if reuse_storage else dense.reshape(batch, atoms, atoms, 16)
+        )
         rho = scalarize_geometry(
             pair_features.sum(dim=2), packed=getattr(self, "packed_geometry", False)
         )

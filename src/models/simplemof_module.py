@@ -146,12 +146,13 @@ class SimpleMOFModule(LightningModule):
             use_dist_schedule=self.training_args['use_dist_schedule']
         )
 
-        # Calculate total weighted loss
+        # The scalar reductions also feed logging; compute each only once.
+        mean_losses = {name: values.mean() for name, values in flow_loss_dict.items()}
         total_loss = (
-            self.training_args['coord_loss_weight'] * flow_loss_dict['coord_loss'].mean()
-            + self.training_args['lengths_loss_weight'] * flow_loss_dict['length_loss'].mean()
-            + self.training_args['angle_loss_weight'] * flow_loss_dict['angle_loss'].mean()
-            + self.training_args['dist_loss_weight'] * flow_loss_dict['dist_loss'].mean()
+            self.training_args['coord_loss_weight'] * mean_losses['coord_loss']
+            + self.training_args['lengths_loss_weight'] * mean_losses['length_loss']
+            + self.training_args['angle_loss_weight'] * mean_losses['angle_loss']
+            + self.training_args['dist_loss_weight'] * mean_losses['dist_loss']
         )
 
         # Loggings
@@ -159,8 +160,8 @@ class SimpleMOFModule(LightningModule):
         sync_dist = prefix == 'val'
 
         # Loss per component
-        for loss_name, batch_loss in flow_loss_dict.items():
-            self.log(f'{prefix}/{loss_name}', batch_loss.mean(), batch_size=batch_size, sync_dist=sync_dist)
+        for loss_name, mean_loss in mean_losses.items():
+            self.log(f'{prefix}/{loss_name}', mean_loss, batch_size=batch_size, sync_dist=sync_dist)
 
         # Total loss
         self.log(f'{prefix}/total_loss', total_loss, batch_size=batch_size, sync_dist=sync_dist)

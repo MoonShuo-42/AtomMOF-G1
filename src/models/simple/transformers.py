@@ -6,7 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.simple.attention import AttentionPairBias
-from src.models.execution.ops import normalize_pairs, project_pair_bias_group
+from src.models.execution.ops import (
+    normalize_pairs,
+    project_pair_bias_group,
+    project_time_modulations,
+)
 from src.models.execution.time import constant_frequencies, shared_time_features
 
 
@@ -187,16 +191,23 @@ class DiTBlock(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x, c, mask, z=None, pair_normalized=False, pair_projected=False):
+    def forward(
+        self, x, c, mask, z=None, pair_normalized=False, pair_projected=False,
+        pair_head_first=False, padding_bias=None, modulation=None,
+    ):
         # Generate modulation parameters (shift, scale gate) from condition c
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
-            c
-        ).chunk(6, dim=1)
+        if modulation is None:
+            modulation = self.adaLN_modulation(c)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(
+            6, dim=1
+        )
 
         # Attention block
         _x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = x + gate_msa.unsqueeze(1) * self.attn(
-            s=_x, mask=mask, z=z, pair_normalized=pair_normalized, pair_projected=pair_projected
+            s=_x, mask=mask, z=z, pair_normalized=pair_normalized,
+            pair_projected=pair_projected, pair_head_first=pair_head_first,
+            padding_bias=padding_bias,
         )
 
         # MLP block
@@ -210,6 +221,7 @@ class DiT(nn.Module):
     _execution_flags = {
         "pair_norm_reuse": "pair_norm_reuse",
         "pair_bias_chunk_size": "pair_bias_chunk_size",
+        "time_modulation_chunk_size": "time_modulation_chunk_size",
     }
 
     def __init__(
@@ -228,6 +240,7 @@ class DiT(nn.Module):
         self.activation_checkpointing = activation_checkpointing
         self.pair_norm_reuse = False
         self.pair_bias_chunk_size = 1
+        self.time_modulation_chunk_size = 1
         self.t_embedder = TimestepEmbedder(dim)
         self.layers = nn.ModuleList([
             DiTBlock(
@@ -248,15 +261,19 @@ class DiT(nn.Module):
             attn = self.layers[index].attn
             if attn.use_pair_bias:
                 norm = attn.proj_z[0]
-                groups.setdefault((norm.normalized_shape, norm.eps), []).append(index)
-        for key, indices in groups.items():
+                key = (norm.normalized_shape, norm.eps, attn.head_first_pair_bias)
+                groups.setdefault(key, []).append(index)
+        for (shape, eps, head_first), indices in groups.items():
+            key = (shape, eps)
             if key not in normalized:
                 normalized[key] = normalize_pairs(z, self.layers[indices[0]].attn.proj_z[0])
             projections = [
                 (self.layers[index].attn.proj_z[0], self.layers[index].attn.proj_z[1])
                 for index in indices
             ]
-            biases = project_pair_bias_group(normalized[key], projections)
+            biases = project_pair_bias_group(
+                normalized[key], projections, head_first=head_first
+            )
             projected.update(zip((index + 1 for index in indices), biases))
         return projected
 
@@ -272,8 +289,21 @@ class DiT(nn.Module):
 
         normalized = {}
         projected = {}
+        padding_biases = {}
+        modulations = {}
+        modulation_chunk = self.time_modulation_chunk_size
+        # Each layer retains its own learned projection; only this identical
+        # parameter-free activation is reused within the current stack call.
+        activated_time = F.silu(time_embed) if modulation_chunk > 1 else None
         chunk_size = self.pair_bias_chunk_size
         for layer_index, layer in enumerate(self.layers, start=1):
+            if modulation_chunk > 1 and (layer_index - 1) % modulation_chunk == 0:
+                stop = min(layer_index - 1 + modulation_chunk, len(self.layers))
+                values = project_time_modulations(
+                    activated_time,
+                    (self.layers[i].adaLN_modulation[1] for i in range(layer_index - 1, stop)),
+                )
+                modulations = dict(zip(range(layer_index, stop + 1), values))
             # z stays fixed across the stack, even when G1 updates x. Only a
             # bounded group of head-sized biases is materialized at a time.
             if (
@@ -292,12 +322,21 @@ class DiT(nn.Module):
             is_projected = layer_index in projected
             if is_projected:
                 pair = projected.pop(layer_index)
+            padding_bias = None
+            if layer.attn.head_first_pair_bias:
+                inf = layer.attn.inf
+                if inf not in padding_biases:
+                    padding_biases[inf] = (1 - mask[:, None, None, :].float()) * -inf
+                padding_bias = padding_biases[inf]
+            args = (
+                x, time_embed, mask, pair, reuse, is_projected,
+                is_projected and layer.attn.head_first_pair_bias,
+                padding_bias, modulations.pop(layer_index, None),
+            )
             if self.activation_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(
-                    layer, x, time_embed, mask, pair, reuse, is_projected, use_reentrant=False
-                )
+                x = torch.utils.checkpoint.checkpoint(layer, *args, use_reentrant=False)
             else:
-                x = layer(x, time_embed, mask, pair, reuse, is_projected)
+                x = layer(*args)
             if after_layer is not None:
                 x = after_layer(layer_index, x)
         return x

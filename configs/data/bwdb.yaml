@@ -24,6 +24,7 @@ batch_size:
 num_workers: 8
 prefetch_factor: 2
 pin_memory: true
+preallocate_collate: false
 
 ##### Sampler arguments #####
 sampler: dynamic # ["dynamic", "overfit", null]

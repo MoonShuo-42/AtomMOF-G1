@@ -169,7 +169,12 @@ class G1Bridges(nn.Module):
             if getattr(self, "geometry_layout_reuse", False):
                 geometry_key = id(geo)
                 if geometry_key not in geometry_layouts:
-                    geometry_layouts[geometry_key] = prepare_geometry_layout(geo.E, mask, geo.geometry_ok)
+                    geometry_layouts[geometry_key] = (
+                        bridge.geometry.aggregation_layout(geo)
+                        if type(bridge.geometry) is PeriodicGeometry
+                        and getattr(bridge.geometry, "geometry_storage_reuse", False)
+                        else prepare_geometry_layout(geo.E, mask, geo.geometry_ok)
+                    )
                 prepared = geometry_layouts[geometry_key]
             contexts[key] = G1Context(c_cond, geo, mask, layout, prepared)
         return contexts

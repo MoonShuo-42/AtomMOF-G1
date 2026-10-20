@@ -21,7 +21,14 @@ class RelationConditionedValue(nn.Module):
     materializing that 408-wide input. Returns (B,N,K,heads,head_dim).
     """
 
-    _execution_compile_targets = {"_pool_hidden": "compile_readback"}
+    _execution_flags = {
+        "readback_chunk_size": "readback_chunk_size",
+        "g1_readback_fusion": "g1_readback_fusion",
+    }
+    _execution_compile_targets = {
+        "_pool_hidden": "compile_readback",
+        "_pool_projected_core": "compile_readback",
+    }
 
     def __init__(
         self,
@@ -119,14 +126,35 @@ class RelationConditionedValue(nn.Module):
 
     def _pool_hidden(self, safe_H, safe_S, safe_features, safe_weights, valid):
         """Continuous value/pooling core with unchanged projections and bias mass."""
-        batch, atoms = safe_H.shape[:2]
-        hidden = (
-            linear(safe_H, self.atom_projection)[:, :, None]
-            + linear(safe_S, self.group_projection)[:, None]
-            + linear(safe_features, self.geometry_projection)
-        )
-        hidden = F.silu(hidden + self.hidden_bias.to(hidden.dtype))
-        hidden = hidden.masked_fill(~valid[..., None], 0)
+        atom = linear(safe_H, self.atom_projection)
+        group = linear(safe_S, self.group_projection)
+        atoms = safe_H.shape[1]
+        chunk_size = getattr(self, "readback_chunk_size", 0) or atoms
+        outputs = []
+        for start in range(0, atoms, chunk_size):
+            stop = min(start + chunk_size, atoms)
+            geometry = linear(safe_features[:, start:stop], self.geometry_projection)
+            outputs.append(self._pool_projected_core(
+                atom[:, start:stop], group, geometry,
+                safe_weights[:, :, start:stop], valid[:, start:stop],
+            ))
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=1)
+
+    def _pool_projected_core(self, atom, group, geometry, safe_weights, valid):
+        """Continuous core; chunking changes storage/launches, never recomputes activations."""
+        batch, atoms = atom.shape[:2]
+        if getattr(self, "g1_readback_fusion", False):
+            # Only mutate fresh intermediates. SiLU backward saves its input;
+            # zeroing its new output does not invalidate saved input versions.
+            hidden = atom[:, :, None] + group[:, None]
+            hidden.add_(geometry)
+            hidden.add_(self.hidden_bias.to(hidden.dtype))
+            hidden = F.silu(hidden)
+            hidden.masked_fill_(~valid[..., None], 0)
+        else:
+            hidden = atom[:, :, None] + group[:, None] + geometry
+            hidden = F.silu(hidden + self.hidden_bias.to(hidden.dtype))
+            hidden = hidden.masked_fill(~valid[..., None], 0)
         pooled = torch.einsum("bhik,bikf->bihf", safe_weights, hidden)
         projection = self.output_projection.weight.reshape(
             self.heads, self.head_dim, hidden.shape[-1]

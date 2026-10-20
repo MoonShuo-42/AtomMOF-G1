@@ -5,6 +5,12 @@ trainer:
 model:
   flow_model_args:
     execution:
+      head_first_pair_bias: true
+      time_modulation_chunk_size: 4
+      g1_readback_fusion: true
+      geometry_storage_reuse: true
+      # Optional atom chunks: measure forward/backward before enabling.
+      readback_chunk_size: 0
       reuse_pair_buffer: true
       cache_time_features: true
       aggregation_layout_reuse: true
@@ -36,5 +42,6 @@ model:
 
 data:
   compact_batch: true
+  preallocate_collate: true
   prepare_g1_metadata: ${model.flow_model_args.g1.enabled}
   prepare_g1_blocks: ${model.flow_model_args.execution.packed_block_attention}

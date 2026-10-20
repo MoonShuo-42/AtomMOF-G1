@@ -18,8 +18,13 @@ normalization safeguards. No training data, epochs or accumulation are reduced.
   projection groups, packed symmetric-moment contractions and joint loss bins.
   Token pair addition reuses a fresh temporary, fixed time features are reused
   within one forward, and prepared U storage is contracted directly into Z.
-  Unused token maps and dense bond-index matrices are omitted from BWDB batches;
-  the bond-type matrix is retained.
+  Head-first pair projection avoids the attention-bias layout copy; each DiT
+  stack shares SiLU(time) and groups its independent adaLN projections. G1
+  readback shares masks and fuses independent projections of the same inputs;
+  safe fresh temporaries are reused for its continuous hidden core. E and its
+  aggregation layout share storage. BWDB collation allocates final padded
+  batches directly. Unused token maps and dense bond-index matrices are omitted
+  from BWDB batches; the bond-type matrix is retained.
 - `execution=optimized`: the math profile plus fused AdamW, DDP gradient bucket
   views and persistent DataLoader workers. All learned computations use the same
   precision policy as the baseline; this profile does not enable mixed precision.
@@ -84,8 +89,12 @@ projection. Its output bias is multiplied by the actual attention mass, includin
 empty/padded rows. This is algebraically equivalent for arbitrary weights, and
 all original value parameters remain. Calculation stays at least FP32.
 
-G1 E is masked and arranged once as (B,N*16,N) in the current forward. Four bridges
-reuse this layout, but recompute their routing, U and Z. Dynamic geometry contexts
+With `geometry_storage_reuse`, the built-in PeriodicGeometry producer writes
+accepted pairs into (B,N,16,N) storage. Public E(B,N,N,16) and the aggregation
+view (B,N*16,N) alias that storage. Invalid atoms/cells already contain zeros.
+The generic public aggregation path still masks arbitrary supplied E (including
+masked NaN/Inf); a custom geometry producer cannot bypass that protection.
+Four bridges reuse this layout, but recompute their routing, U and Z. Dynamic geometry contexts
 are not reused across diffusion steps or optimizer updates. Coordinate and cell
 gradients remain connected. Geometry cutoffs, search precision, the 125-image cap
 and whole-sample fallback rules are unchanged.
@@ -116,6 +125,11 @@ both math and optimized profiles are:
 
 | Option | Profile value | Work reduced |
 | --- | --- | --- |
+| `head_first_pair_bias` | `true` | Project directly to head-first pair storage and reuse a stack-local padding bias. Keep SDPA stride requirements and the original backend policy. |
+| `time_modulation_chunk_size` | `4` | Compute SiLU(time) once per stack and batch independent adaLN Linear projections; 1 selects the original per-layer path. |
+| `g1_readback_fusion` | `true` | Share validated masks and fuse query/value, key/value and geometry-bias/value projections; reuse fresh continuous-core temporaries. |
+| `geometry_storage_reuse` | `true` | Store built-in periodic E and its aggregation layout in one allocation; retain public E shape and gradients. |
+| `readback_chunk_size` | `0` | Optional atom chunks in folded readback. 0 disables chunking; positive values require `fold_readback`. This bounds temporary work, not necessarily saved backward activations. |
 | `reuse_pair_buffer` | `true` | Add the input pair tensor into the fresh single-to-pair sum, removing one full pair allocation without mutating inputs. |
 | `cache_time_features` | `true` | Cache fixed frequencies and reuse raw time features within one forward. The three original time MLPs and four routers remain independent. |
 | `aggregation_layout_reuse` | `true` | Compute Z directly from the prepared U storage before exposing the public U layout, avoiding the atom/group/channel copy. Requires the prepared geometry path for benefit. |
@@ -146,6 +160,70 @@ gradients are preserved. Sorting and a histogram host read add overhead, so
 bucketed execution needs its own CUDA measurement before adoption. In particular,
 a small-image-count batch may gain nothing. The existing compile flags remain
 false by default; there is no forced SDPA backend or precision reduction.
+
+## Projection/layout fusion and data collation
+
+No parameter is replaced, merged, tied, detached or persistently cached. Wider
+GEMMs temporarily concatenate the original independent weights inside each
+forward. Gradients return to those same Parameters and optimizer states. The
+reference path remains selectable, and old checkpoints keep their keys/shapes.
+Different GEMM shapes and reduction orders can change floating-point rounding;
+this is not a precision-policy change or a promise of identical trajectories.
+
+Head-first projection keeps the existing final contiguity guard for SDPA and
+xformers; on the new path this guard is a no-op. Padding bias is reused only
+within one DiT call, grouped by the existing mask penalty. Time modulation is
+independent for every layer and every encoder/trunk/decoder stack. Layer hooks
+and G1 insertion points stay in their original order.
+
+Readback fuses only the built-in branches with compatible dtypes/devices. Custom
+submodules and mixed-dtype standalone calls fall back to the original public
+interfaces. Non-unit attention mass, output bias, unavailable geometry, padding
+and the per-head value reduction retain their meaning. `compile_readback`
+compiles the new projected continuous core as well as the standalone folded
+path. Atom chunks do not recompute activations; they can add launches and still
+save a similar total activation volume for backward. They remain opt-in.
+
+`data.preallocate_collate=true` is enabled in both math/optimized profiles.
+It changes CPU storage/copies only: samples, padding, dtype promotion, bonds,
+optional fields, sampler/RNG and the model-driven G1 preparation are preserved.
+The default BWDB configuration sets it to false. Construct-by-block coordinate
+augmentation uses contiguous slices with the same calls and RNG draws. Loss
+means are computed once and reused for logging. The public Lightning log calls,
+keys, empty-bin NaNs and accumulation/callback visibility are preserved; replacing
+these with `log_dict` would not eliminate per-metric logging and is not claimed
+as an optimization.
+
+The benchmark supports `optimized_30995` to disable this revision's five runtime
+options and preallocated collation in the current code. This is an operator
+ablation, not a checkout of historical source: unconditional loss-mean reuse and
+RNG-equivalent feature slicing are present in both sides. Use separate checkouts
+for a complete historical source comparison.
+
+Example same-work current-vs-previous-switch comparison on the server:
+
+```bash
+python scripts/benchmark_execution.py \
+  --lmdb-dir /data/ai4science/AtomMOF/AtomMOF-main/data/bwdb \
+  --model g1 --stage 1 --batch-size 64 --accumulate-grad-batches 1 \
+  --epochs 2 --batches 0 --repeats 1 \
+  --profiles optimized_30995 optimized --compare-to optimized_30995
+```
+
+Use stage 2 with batch 32/accumulation 2, and stage 3 with batch 32/accumulation 2;
+the existing square budgets remain 3,000,000/3,000,000/500,000. Repeat with
+`--model baseline`. The runner fixes worker lifecycle across both profiles for
+same-work/RNG comparison and disables validation/loggers for training-window
+measurement. This does not measure end-to-end formal training wall time.
+
+Optional paths can be measured separately using `--profiles optimized` followed
+by any of `compiled_readback`, `compiled_pair_features`, `compiled_token_pairs`,
+`compiled_blocks`, `compiled_geometry_moments`, `chunked_readback` (64 atoms),
+`packed`, or `bucketed`, with `--compare-to optimized`. Compilation, packing,
+image bucketing and chunking stay off by default until CUDA measurements show a
+benefit. Check first-epoch compilation cost as well as steady timing, selected
+SDPA backend, gradients and per-rank peak memory. No CPU microbenchmark is used
+to assert L40S throughput improvements.
 
 ## Time features, block packing and continuous-core compilation
 

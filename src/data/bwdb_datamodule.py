@@ -15,12 +15,20 @@ from src.data.sampler import DynamicBatchSampler, OverfitSampler
 from src.data.prior.prior_sampler import PriorSampler
 
 
-def collate_fn(batch: List[Dict[str, Tensor]], *, compact_batch=False, prepare_g1_metadata=False, prepare_g1_blocks=False) -> Dict[str, Tensor]:
+def collate_fn(batch: List[Dict[str, Tensor]], *, compact_batch=False, prepare_g1_metadata=False, prepare_g1_blocks=False, preallocate_collate=False) -> Dict[str, Tensor]:
     """
     Collates a batch of featurized Structure dictionaries for a Transformer.
     """
     if not batch:
         return {}
+
+    if preallocate_collate:
+        final_batch = _collate_preallocated(batch, compact_batch=compact_batch)
+        if prepare_g1_metadata or prepare_g1_blocks:
+            from src.data.execution_features import prepare_execution_layouts
+
+            return prepare_execution_layouts(final_batch, prepare_blocks=prepare_g1_blocks)
+        return final_batch
 
     # Define key types
     atom_keys_N = ['ref_element', 'ref_charge', 'ref_chirality', 'block_index', 'block_type']
@@ -100,6 +108,75 @@ def collate_fn(batch: List[Dict[str, Tensor]], *, compact_batch=False, prepare_g
     return final_batch
 
 
+def _stack_padded(items, max_atoms, *, square=False):
+    """Copy each present field directly into its final padded batch storage.
+
+    ``torch.stack`` promotes mixed input dtypes, so compute that same dtype
+    before allocating. Missing optional fields retain the reference behavior:
+    only samples containing that field contribute a row, in input order.
+    """
+    first = items[0]
+    dtype = first.dtype
+    for tensor in items[1:]:
+        dtype = torch.promote_types(dtype, tensor.dtype)
+    shape = (len(items), max_atoms)
+    shape += (max_atoms, *first.shape[2:]) if square else first.shape[1:]
+    result = torch.zeros(shape, dtype=dtype, device=first.device)
+    for row, tensor in enumerate(items):
+        if tensor.device != first.device:
+            raise RuntimeError("Collated tensors must be on the same device")
+        if square:
+            result[row, :tensor.shape[0], :tensor.shape[1]].copy_(tensor)
+        else:
+            result[row, :tensor.shape[0]].copy_(tensor)
+    return result
+
+
+def _collate_preallocated(batch, *, compact_batch):
+    """Equivalent CPU collation without per-sample padded/bond temporaries."""
+    max_atoms = max(data['ref_element'].shape[0] for data in batch)
+    batch_size = len(batch)
+    final_batch = {}
+    atom_keys = (
+        'ref_element', 'ref_charge', 'ref_chirality', 'block_index', 'block_type',
+        'ref_pos', 'cart_coords', 'frac_coords', 'cart_coords_0',
+    )
+    for key in atom_keys:
+        items = [data[key] for data in batch if key in data]
+        if items:
+            final_batch[key] = _stack_padded(items, max_atoms)
+    if not compact_batch:
+        for key in ('atom_to_token', 'token_to_rep_atom'):
+            items = [data[key] for data in batch if key in data]
+            if items:
+                final_batch[key] = _stack_padded(items, max_atoms, square=True)
+    for key in ('lattice', 'cell', 'lattice_0'):
+        items = [data[key] for data in batch if key in data]
+        if items:
+            final_batch[key] = torch.stack(items)
+
+    # Match the reference's default floating mask and int64 bond matrices.
+    mask = torch.zeros((batch_size, max_atoms))
+    bond_types = torch.zeros((batch_size, max_atoms, max_atoms), dtype=torch.long)
+    bond_indices = None if compact_batch else torch.zeros_like(bond_types)
+    for row, data in enumerate(batch):
+        mask[row, :data['ref_element'].shape[0]] = 1
+        indices, types = data['bond_indices'], data['bond_types']
+        if types.shape[0] > 0:
+            # Preserve the forward-then-reverse write order, including duplicate
+            # edges and directed inputs whose reverse may overwrite an entry.
+            if bond_indices is not None:
+                bond_indices[row, indices[0], indices[1]] = 1
+                bond_indices[row, indices[1], indices[0]] = 1
+            bond_types[row, indices[0], indices[1]] = types
+            bond_types[row, indices[1], indices[0]] = types
+    final_batch['atom_pad_mask'] = mask
+    final_batch['bond_types'] = bond_types
+    if bond_indices is not None:
+        final_batch['bond_indices'] = bond_indices
+    return final_batch
+
+
 class BWDBDataModule(LightningDataModule):
     def __init__(
         self,
@@ -121,6 +198,7 @@ class BWDBDataModule(LightningDataModule):
         sampler: Optional[str] = None,
         dynamic: Optional[Dict] = None,
         predict_split: str = 'val',
+        preallocate_collate: bool = False,
     ):
         super().__init__()
         self.lmdb_dir = lmdb_dir
@@ -136,6 +214,7 @@ class BWDBDataModule(LightningDataModule):
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers
         self.compact_batch = compact_batch
+        self.preallocate_collate = preallocate_collate
         self.prepare_g1_metadata = prepare_g1_metadata
         self.prepare_g1_blocks = prepare_g1_blocks
         self._requested_g1_metadata = prepare_g1_metadata
@@ -250,7 +329,7 @@ class BWDBDataModule(LightningDataModule):
             batch_size=batch_size if batch_sampler is None else 1,
             sampler=sampler,
             batch_sampler=batch_sampler,
-            collate_fn=partial(collate_fn, compact_batch=self.compact_batch, prepare_g1_metadata=self.prepare_g1_metadata, prepare_g1_blocks=self.prepare_g1_blocks),
+            collate_fn=partial(collate_fn, compact_batch=self.compact_batch, prepare_g1_metadata=self.prepare_g1_metadata, prepare_g1_blocks=self.prepare_g1_blocks, preallocate_collate=self.preallocate_collate),
             shuffle=is_train if sampler is None and batch_sampler is None else False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
