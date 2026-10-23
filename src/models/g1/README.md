@@ -378,6 +378,24 @@ Flow 已将当前坐标/晶格转换为 nm/radian，集成模式会校验该单�
 | 当前方案 G1 checkpoint | 保存四桥参数与 flow_model_args.g1，推理时自动恢复 |
 | baseline 权重初始化 G1 训练 | 启用 G1，并使用 pretrained_ckpt_path；主干尺寸应一致，新桥随机初始化 |
 | 继续 G1 训练 | 同样启用 G1、保留相同结构，使用 resume_ckpt_path 恢复优化器与训练进度 |
+| G1 扩大 K 后进入下一阶段 | 使用 pretrained_ckpt_path 和 pretrained_g1_expand_groups=true，仅扩展路由模板行，其他权重严格加载 |
+
+例如从 K 上限 32 的 stage-1 checkpoint 初始化 K 上限 64 的 stage-2，在第二阶段命令中设置：
+
+~~~bash
+model.flow_model_args.g1.module.router.max_groups=64 \
+pretrained_g1_expand_groups=true \
+pretrained_ckpt_path="$PRETRAINED_CKPT" \
+resume_ckpt_path=null
+~~~
+
+扩容只允许增大 max_groups，不允许缩小、缺失/多余权重、改变其他参数形状或 dtype。
+四座桥各自的 template_bank.weight 从 (32,32) 变为 (64,32)：前 32 行完整加载，
+后 32 行保留新模型按 seed 构造时的标准正态初始化。其他权重逐值恢复，随后新旧参数共同训练。
+small 默认四桥总参数量从 40,525,216 增至 40,529,312，仅新增 4,096 个参数。
+此操作不恢复上一阶段的优化器、调度器或 epoch；扩容开关与 resume_ckpt_path 不能同时使用。
+K 相同时不需要此开关；K=64 的新 checkpoint 保存新容量，后续同容量推理和断点续训照常加载。
+新增组会参与 softmax，保留旧权重不代表扩容后初始输出相同；实际 K 仍为 min(max_groups,N)。
 
 预测结构以 checkpoint 为准；命令中的 model 配置不覆盖其架构。
 预测时使用 predict_args.g1_enabled：
@@ -398,7 +416,7 @@ predict_args.g1_enabled=true
 程序调用可在 model.eval() 后使用 model.structure_module.flow_model.set_g1_enabled(False)。
 构造时关闭的模型不能在运行时凭空开启 G1；需要包含 G1 权重的模型。
 
-只维护当前 G1 架构和配置，不提供旧 G1 checkpoint 的自动迁移或旧结构恢复模式。
+只维护当前 G1 架构和配置；除上述显式 K 扩容外，不提供旧 G1 架构的自动迁移或恢复模式。
 原始 AtomMOF baseline 的加载、初始化 G1 训练和关闭开关保留。
 共享条件编码器的四组 state_dict 名称是同一套权重的别名；加载时检查它们一致，
 避免损坏或人工修改的 checkpoint 静默覆盖共享权重。
@@ -411,7 +429,7 @@ predict_args.g1_enabled=true
   输出 128 维，不注入当前噪声和时间调制。
 - 四桥固定共享一套 ConditionEncoder，一次 Flow forward 只编码一次。
 - Router、组交互和原子读回在各桥独立学习；每桥使用当前 H/t 重新计算。
-- K_b=min(32,N_b)，分组布局在同次前向内复用；不共享学习得到的 P/Pbar。
+- K_b=min(max_groups,N_b)，默认上限 32；分组布局在同次前向内复用，不共享学习得到的 P/Pbar。
 - 当前周期几何默认四桥复用；组内几何描述只在同一桥内的组交互和读回之间复用。
 - 默认主干、桥、条件编码器和几何模块均关闭激活重算。重算仍是可调的内存功能。
 

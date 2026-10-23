@@ -49,6 +49,8 @@ test: False
 # simply provide checkpoint path to resume training
 pretrained_ckpt_path: null
 resume_ckpt_path: null
+# Explicit G1 K expansion during stage transfer; never used for full-state resume.
+pretrained_g1_expand_groups: false
 
 # seed for random number generators in pytorch, numpy and python.random
 seed: 42

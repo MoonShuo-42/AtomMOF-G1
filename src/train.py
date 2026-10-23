@@ -40,6 +40,15 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     :param cfg: A DictConfig configuration composed by Hydra.
     :return: A tuple with metrics and dict with all instantiated objects.
     """
+    expand_g1 = cfg.get("pretrained_g1_expand_groups", False)
+    if type(expand_g1) is not bool:
+        raise ValueError("pretrained_g1_expand_groups must be a boolean")
+    if expand_g1 and (not cfg.get("pretrained_ckpt_path") or cfg.get("resume_ckpt_path")):
+        raise ValueError(
+            "pretrained_g1_expand_groups requires pretrained_ckpt_path and "
+            "resume_ckpt_path=null; resized optimizer state cannot be resumed"
+        )
+
     # set seed for random number generators in pytorch, numpy and python.random
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
@@ -51,9 +60,28 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     model: LightningModule = hydra.utils.instantiate(cfg.model)
     if cfg.get("pretrained_ckpt_path") and not cfg.get("resume_ckpt_path"):
         log.info(f"Loading pretrained weights from {cfg.pretrained_ckpt_path}")
-        model = type(model).load_from_checkpoint(
-            cfg.pretrained_ckpt_path, map_location="cpu", strict=False, **(model.hparams)
-        )
+        if expand_g1:
+            # Keep optional G1 code out of baseline and ordinary loading paths.
+            from src.models.g1.checkpoint import load_pretrained_with_group_expansion
+
+            expansions = load_pretrained_with_group_expansion(model, cfg.pretrained_ckpt_path)
+            for change in expansions:
+                log.info(
+                    f"G1 template expansion {change.key}: "
+                    f"K={change.old_groups} -> {change.new_groups}; "
+                    f"old rows restored exactly, {change.added_parameters} new parameters "
+                    "retain normal initialization"
+                )
+            log.info(
+                "G1 weights loaded strictly after expansion; optimizer, scheduler and "
+                "epoch counters start fresh. "
+                f"Added parameters: {sum(c.added_parameters for c in expansions)}; "
+                f"total parameters: {sum(p.numel() for p in model.parameters())}"
+            )
+        else:
+            model = type(model).load_from_checkpoint(
+                cfg.pretrained_ckpt_path, map_location="cpu", strict=False, **(model.hparams)
+            )
 
     configure_data_execution(datamodule, model.structure_module.flow_model)
 
