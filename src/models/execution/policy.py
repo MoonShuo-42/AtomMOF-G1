@@ -118,4 +118,9 @@ def configure_data_execution(datamodule, flow_model):
     """
     configure = getattr(datamodule, "configure_model_execution", None)
     if configure is not None:
-        configure(g1_enabled=flow_model.g1_enabled, execution=flow_model.execution_options)
+        # Both independent extensions use the same static within-block condition
+        # layout. Dynamic G1-New edges are always rebuilt on the current device.
+        configure(
+            g1_enabled=flow_model.g1_enabled or getattr(flow_model, "g1new_enabled", False),
+            execution=flow_model.execution_options,
+        )

@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - g1new_small_stage2
+  - _self_
+
+task_name: train_bwdb_g1new_small_stage3
+tags: [bwdb, g1new, small, stage3]
+data:
+  max_num_atoms: null
+  dynamic:
+    max_num_atoms_square: 500000

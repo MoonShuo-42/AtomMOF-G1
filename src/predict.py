@@ -41,6 +41,8 @@ def set_dir_name(cfg: DictConfig) -> str:
     # Keep legacy names by default; separate explicit G1 ablations from normal inference.
     if cfg.predict_args.get("g1_enabled") is not None:
         name_parts.append(f"g1-{cfg.predict_args.g1_enabled}")
+    if cfg.predict_args.get("g1new_enabled") is not None:
+        name_parts.append(f"g1new-{cfg.predict_args.g1new_enabled}")
     base_name = "_".join(name_parts)
     return base_name
 
@@ -83,6 +85,8 @@ def predict(cfg: DictConfig):
     model.eval()
     if cfg.predict_args.get("g1_enabled") is not None:
         model.structure_module.flow_model.set_g1_enabled(cfg.predict_args.g1_enabled)
+    if cfg.predict_args.get("g1new_enabled") is not None:
+        model.structure_module.flow_model.set_g1new_enabled(cfg.predict_args.g1new_enabled)
 
     # Optional runtime override; checkpoint architecture and learned weights stay intact.
     execution = OmegaConf.select(cfg, "model.flow_model_args.execution")

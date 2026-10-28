@@ -1,0 +1,95 @@
+"""G1-New v0: one local-environment residual, width 64, two shared rounds."""
+
+from collections.abc import Mapping
+
+import torch
+from torch import nn
+
+from .conditioning import ConditionEncoder
+from .environment import EnvironmentUpdate
+from .geometry import LocalGeometry
+from .layers import mlp
+from .readback import AtomReadback
+from .relations import RelationEncoder
+from .time import FourierTimeEmbedding
+
+
+class G1NewModule(nn.Module):
+    def __init__(
+        self,
+        h_dim=256,
+        width=64,
+        hidden_dim=128,
+        rounds=2,
+        edge_chunk_size=8192,
+        activation_checkpointing=True,
+        condition_encoder=None,
+        geometry=None,
+    ):
+        super().__init__()
+        for name, value in dict(
+            h_dim=h_dim,
+            width=width,
+            hidden_dim=hidden_dim,
+            rounds=rounds,
+            edge_chunk_size=edge_chunk_size,
+        ).items():
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if type(activation_checkpointing) is not bool:
+            raise TypeError("g1new.activation_checkpointing must be bool")
+        self.h_dim, self.width, self.rounds = h_dim, width, rounds
+        self.edge_chunk_size = edge_chunk_size
+        self.activation_checkpointing = activation_checkpointing
+        self.condition_encoder = (
+            condition_encoder if condition_encoder is not None else ConditionEncoder()
+        )
+        self.geometry = geometry if geometry is not None else LocalGeometry()
+        if not isinstance(self.condition_encoder, ConditionEncoder) or not isinstance(
+            self.geometry, LocalGeometry
+        ):
+            raise TypeError("g1new requires its static ConditionEncoder and LocalGeometry")
+        self.atom_norm = nn.LayerNorm(h_dim, eps=1e-6)
+        self.atom_projection = nn.Linear(h_dim, width)
+        self.condition_projection = nn.Linear(self.condition_encoder.output_dim, 32)
+        self.time_embedding = FourierTimeEmbedding(32)
+        self.atom_features = mlp(width + 64, hidden_dim, width)
+        self.environment = EnvironmentUpdate(width, hidden_dim)
+        self.relations = RelationEncoder(self.geometry.cutoff)
+        self.readback = AtomReadback(width, hidden_dim)
+        self.output_projection = nn.Linear(width, h_dim, bias=False)
+        nn.init.zeros_(self.output_projection.weight)
+
+    def encode_condition(self, feats: Mapping):
+        return self.condition_encoder(feats)
+
+    def forward(self, H, t, feats, edges, condition):
+        mask = feats["atom_pad_mask"].bool()
+        if H.shape != (*mask.shape, self.h_dim) or t.shape != (H.shape[0],):
+            raise ValueError("g1new expects H=(B,N,h_dim) and t=(B,)")
+        if H.dtype not in (torch.float32, torch.float64):
+            raise ValueError("g1new keeps FP32 precision; FP64 is supported for numerical tests")
+        with torch.autocast(device_type=H.device.type, enabled=False):
+            # Geometry-invalid rows cannot affect supported rows. Sanitize branch
+            # inputs before nonlinear operations; the backbone H is not modified.
+            active = mask & edges.geometry_ok[:, None]
+            safe_H = H.masked_fill(~active[..., None], 0)
+            c = condition.masked_fill(~active[..., None], 0)
+            a = self.atom_projection(self.atom_norm(safe_H))
+            c = self.condition_projection(c)
+            time = self.time_embedding(t)[:, None].expand(-1, H.shape[1], -1)
+            features = self.atom_features(torch.cat((a, c, time), -1))
+            features = features.masked_fill(~active[..., None], 0).flatten(0, 1)
+            checkpointing = self.activation_checkpointing and self.training
+            chi = self.relations(edges, self.edge_chunk_size, checkpointing)
+            state = self.environment.init(features[edges.anchors])
+            projected = self.environment.prepare(features, edges.anchors)
+            for _ in range(self.rounds):
+                state = self.environment(
+                    state, projected, edges, chi, self.edge_chunk_size, checkpointing
+                )
+            result = self.readback(
+                features, state, edges, chi, self.edge_chunk_size, checkpointing
+            )
+            delta = self.output_projection(result).reshape_as(H)
+            return (H + delta).masked_fill(~mask[..., None], 0)

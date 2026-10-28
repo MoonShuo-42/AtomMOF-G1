@@ -10,3 +10,5 @@ class SamplingCondition(NamedTuple):
     g1_enabled: bool
     atom: tuple[Tensor, Tensor]
     g1_condition: Tensor | None
+    g1new_enabled: bool = False
+    g1new_condition: Tensor | None = None

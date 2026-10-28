@@ -1,0 +1,12 @@
+# AtomMOF-small plus the independent G1-New v0 extension.
+defaults:
+  - simple
+  - _self_
+
+token_s: 256
+token_z: 128
+flow_model_args:
+  g1:
+    enabled: false
+  g1new:
+    enabled: true

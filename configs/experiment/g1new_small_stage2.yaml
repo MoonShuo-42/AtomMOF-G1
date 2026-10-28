@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - g1new_small_stage1
+  - _self_
+
+task_name: train_bwdb_g1new_small_stage2
+tags: [bwdb, g1new, small, stage2]
+trainer:
+  max_epochs: 100
+  accumulate_grad_batches: 2
+data:
+  max_num_atoms: 300
+  dynamic:
+    max_batch_size: 32

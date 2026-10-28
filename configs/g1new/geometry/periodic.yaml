@@ -1,0 +1,11 @@
+_target_: src.models.g1new.geometry.LocalGeometry
+cutoff: 0.8
+inner_cutoff: 0.6
+pair_chunk_size: 4096
+image_chunk_size: 65536
+# Exact-work guards per rank/forward, not neighbour truncation. Overflow raises.
+max_search_candidates: 32000000
+max_edges: 2000000
+min_cell_singular_value: 1.0e-6
+max_cell_condition: 1.0e6
+bounds_margin: 1.0e-9

@@ -1,0 +1,11 @@
+# Plain config while disabled: baseline/G1 do not instantiate G1-New.
+defaults:
+  - default@module
+  - _self_
+
+_target_: builtins.dict
+_recursive_: false
+enabled: false
+insert_after: 12
+module:
+  h_dim: ${model.token_s}

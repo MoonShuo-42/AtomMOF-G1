@@ -23,6 +23,8 @@ seed: 42
 predict_args:
   # null: checkpoint architecture; false: bypass G1; true: require trained G1 weights.
   g1_enabled: null
+  # Independent G1-New evaluation ablation; null follows the checkpoint.
+  g1new_enabled: null
   measure_time: false
   num_samples: 1
   sampling_steps: 10

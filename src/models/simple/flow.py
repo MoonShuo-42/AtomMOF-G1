@@ -35,6 +35,7 @@ class FlowModule(nn.Module):
         activation_checkpointing=False, 
         g1=None,
         execution=None,
+        g1new=None,
         # **kwargs
     ):
         super().__init__()
@@ -85,11 +86,25 @@ class FlowModule(nn.Module):
         self._g1_enabled = g1_args.pop("enabled", False)
         if type(self._g1_enabled) is not bool:
             raise TypeError("g1.enabled must be bool")
+        self.g1new_bridge = None
+        g1new_args = dict(g1new or {})
+        self._g1new_enabled = g1new_args.pop("enabled", False)
+        if type(self._g1new_enabled) is not bool:
+            raise TypeError("g1new.enabled must be bool")
+        if self._g1_enabled and self._g1new_enabled:
+            raise ValueError("G1 and G1-New are independent alternatives; enable only one")
         if self._g1_enabled:
             from src.models.g1.bridges import G1Bridges
 
             self.g1_bridges = G1Bridges(
                 h_dim=token_s, depth=token_transformer_depth, **g1_args
+            )
+
+        if self._g1new_enabled:
+            from src.models.g1new.bridge import G1NewBridge
+
+            self.g1new_bridge = G1NewBridge(
+                h_dim=token_s, depth=token_transformer_depth, **g1new_args
             )
 
         self.execution_options = configure_execution(self, execution)
@@ -107,6 +122,20 @@ class FlowModule(nn.Module):
         if self.training and enabled != self._g1_enabled:
             raise RuntimeError("Change G1 through the construction config for training/DDP")
         self._g1_enabled = enabled
+
+    @property
+    def g1new_enabled(self):
+        return self._g1new_enabled
+
+    def set_g1new_enabled(self, enabled: bool):
+        """Evaluation ablation; the checkpoint owns the trained architecture."""
+        if type(enabled) is not bool:
+            raise TypeError("G1-New switch must be bool")
+        if enabled and self.g1new_bridge is None:
+            raise ValueError("This model/checkpoint has no G1-New weights")
+        if self.training and enabled != self._g1new_enabled:
+            raise RuntimeError("Change G1-New through construction config for training/DDP")
+        self._g1new_enabled = enabled
 
     def _atom_to_token_single(self, atom_single, atom_to_token, multiplicity=1):
         atom_feats = self.atom_to_token_trans(atom_single)
@@ -139,7 +168,11 @@ class FlowModule(nn.Module):
             raise RuntimeError("Sampling conditions require eval mode with gradients disabled")
         atom = self.atom_encoder.condition_features(feats)
         condition = self.g1_bridges.encode_condition(feats) if self._g1_enabled else None
-        return SamplingCondition(id(self), feats, self._g1_enabled, atom, condition)
+        new_condition = self.g1new_bridge.encode_condition(feats) if self._g1new_enabled else None
+        return SamplingCondition(
+            id(self), feats, self._g1_enabled, atom, condition,
+            self._g1new_enabled, new_condition,
+        )
 
     def forward(self, r_noisy, l_noisy, times, feats, multiplicity=1, static_condition=None):
         with time_feature_scope(self.execution_options["cache_time_features"]):
@@ -150,8 +183,9 @@ class FlowModule(nn.Module):
             if self.training or torch.is_grad_enabled():
                 raise RuntimeError("Static sampling cache cannot be used in training")
             if (static_condition.owner != id(self) or static_condition.features is not feats
-                    or static_condition.g1_enabled != self._g1_enabled):
-                raise ValueError("Sampling conditions belong to a different model, batch or G1 setting")
+                    or static_condition.g1_enabled != self._g1_enabled
+                    or static_condition.g1new_enabled != self._g1new_enabled):
+                raise ValueError("Sampling conditions belong to a different model, batch or extension setting")
         # Encoder
         atom_single, atom_pair = self.atom_encoder(
             x_t=r_noisy, 
@@ -178,6 +212,17 @@ class FlowModule(nn.Module):
                 return self.g1_bridges(layer_index, hidden, times, contexts)
 
             trunk_kwargs["after_layer"] = after_layer
+
+        if self._g1new_enabled:
+            new_context = self.g1new_bridge.prepare(
+                feats, r_noisy, l_noisy, multiplicity,
+                condition=None if static_condition is None else static_condition.g1new_condition,
+            )
+
+            def after_new_layer(layer_index, hidden):
+                return self.g1new_bridge(layer_index, hidden, times, new_context)
+
+            trunk_kwargs["after_layer"] = after_new_layer
 
         # Trunk
         with deferred_tensor_checks(self.execution_options["defer_validation"]):

@@ -1,5 +1,6 @@
 defaults:
   - /g1@flow_model_args.g1: bridges
+  - /g1new@flow_model_args.g1new: bridge
   - _self_
 
 _target_: src.models.simplemof_module.SimpleMOFModule

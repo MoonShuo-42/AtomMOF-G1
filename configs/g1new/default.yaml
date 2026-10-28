@@ -1,0 +1,13 @@
+defaults:
+  - condition_encoder@condition_encoder: static
+  - geometry@geometry: periodic
+  - _self_
+
+_target_: src.models.g1new.G1NewModule
+h_dim: 256
+width: 64
+hidden_dim: 128
+rounds: 2
+edge_chunk_size: 8192
+# Only the new edge MLP activations are recomputed; backbone precision unchanged.
+activation_checkpointing: true

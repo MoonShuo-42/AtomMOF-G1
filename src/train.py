@@ -48,6 +48,16 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             "pretrained_g1_expand_groups requires pretrained_ckpt_path and "
             "resume_ckpt_path=null; resized optimizer state cannot be resumed"
         )
+    transfer_g1new = cfg.get("pretrained_g1new_transfer", False)
+    if type(transfer_g1new) is not bool:
+        raise ValueError("pretrained_g1new_transfer must be a boolean")
+    if transfer_g1new and (
+        expand_g1 or not cfg.get("pretrained_ckpt_path") or cfg.get("resume_ckpt_path")
+    ):
+        raise ValueError(
+            "G1-New transfer requires pretrained_ckpt_path, resume_ckpt_path=null, "
+            "and pretrained_g1_expand_groups=false"
+        )
 
     # set seed for random number generators in pytorch, numpy and python.random
     if cfg.get("seed"):
@@ -60,7 +70,15 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     model: LightningModule = hydra.utils.instantiate(cfg.model)
     if cfg.get("pretrained_ckpt_path") and not cfg.get("resume_ckpt_path"):
         log.info(f"Loading pretrained weights from {cfg.pretrained_ckpt_path}")
-        if expand_g1:
+        if transfer_g1new:
+            from src.models.g1new.checkpoint import load_g1new_pretrained
+
+            report = load_g1new_pretrained(model, cfg.pretrained_ckpt_path)
+            log.info(
+                f"G1-New explicit weights-only transfer: {report}; local environments "
+                "retain fresh initialization; optimizer/scheduler/epoch start fresh"
+            )
+        elif expand_g1:
             # Keep optional G1 code out of baseline and ordinary loading paths.
             from src.models.g1.checkpoint import load_pretrained_with_group_expansion
 
@@ -80,7 +98,10 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             )
         else:
             model = type(model).load_from_checkpoint(
-                cfg.pretrained_ckpt_path, map_location="cpu", strict=False, **(model.hparams)
+                cfg.pretrained_ckpt_path,
+                map_location="cpu",
+                strict=getattr(model.structure_module.flow_model, "g1new_enabled", False),
+                **(model.hparams),
             )
 
     configure_data_execution(datamodule, model.structure_module.flow_model)
