@@ -373,19 +373,65 @@ def test_zero_branches_work_with_two_rank_ddp(tmp_path):
     mp.spawn(_dense_ddp_worker, args=(str(tmp_path / "init"), str(path)), nprocs=2, join=True)
 
 
-def compose_dense():
+def compose_dense_cli():
     os.environ.setdefault("PROJECT_ROOT", str(Path(__file__).resolve().parents[1]))
     with initialize_config_dir(
         config_dir=str(Path(__file__).resolve().parents[1] / "configs"), version_base=None
     ):
         return compose(
             config_name="train",
-            overrides=["experiment=g1_small_stage2_dense", "execution=optimized"],
+            overrides=[
+                "data=bwdb",
+                "execution=optimized",
+                "trainer=ddp",
+                "trainer.devices=8",
+                "trainer.num_nodes=1",
+                "trainer.max_epochs=200",
+                "++trainer.precision=32-true",
+                "trainer.accumulate_grad_batches=2",
+                "++trainer.num_sanity_val_steps=0",
+                "data.sampler=dynamic",
+                "data.num_workers=8",
+                "data.max_num_atoms=300",
+                "data.dynamic.scaling=square",
+                "data.dynamic.max_num_atoms_square=3000000",
+                "data.dynamic.max_batch_size=32",
+                "data.dynamic.skip_too_big=false",
+                "data.sample_limit_dict.train=null",
+                "data.sample_limit_dict.val=1000",
+                "model.token_s=256",
+                "model.token_z=128",
+                "model.flow_model_args.token_transformer_heads=8",
+                "model.flow_model_args.activation_checkpointing=false",
+                "model.flow_model_args.g1.enabled=true",
+                "model.flow_model_args.g1.insert_after=[3,6,9,12,15,18,21,24]",
+                "model.flow_model_args.g1.module.router.max_groups=64",
+                "model.training_args.lr_scheduler=af3",
+                "model.training_args.max_lr=0.0001",
+                "model.training_args.lr_warmup_no_steps=10000",
+                "model.validation_args.sample_every_n_epochs=10",
+                "model.validation_args.num_workers=1",
+                "pretrained_g1_expand_groups=true",
+                "pretrained_g1_expand_bridges=true",
+                "pretrained_ckpt_path=stage1.ckpt",
+                "resume_ckpt_path=null",
+                "callbacks.model_checkpoint.monitor=null",
+                "callbacks.model_checkpoint.save_top_k=-1",
+                "callbacks.model_checkpoint.save_last=true",
+                "callbacks.model_checkpoint.save_weights_only=false",
+                "callbacks.model_checkpoint.every_n_epochs=100",
+                "callbacks.model_checkpoint.every_n_train_steps=null",
+                "callbacks.model_checkpoint.train_time_interval=null",
+                "callbacks.model_checkpoint.save_on_train_epoch_end=true",
+                "callbacks.model_checkpoint.auto_insert_metric_name=false",
+                'callbacks.model_checkpoint.filename="epoch_{epoch}-step_{step}"',
+                "seed=42",
+            ],
         )
 
 
-def test_experiment_config_and_periodic_checkpoints(tmp_path):
-    cfg = compose_dense()
+def test_cli_overrides_and_periodic_checkpoints(tmp_path):
+    cfg = compose_dense_cli()
     assert cfg.trainer.max_epochs == 200 and cfg.trainer.accumulate_grad_batches == 2
     assert cfg.trainer.devices == 8 and cfg.trainer.precision == "32-true"
     assert cfg.data.max_num_atoms == 300 and cfg.data.dynamic.max_num_atoms_square == 3000000

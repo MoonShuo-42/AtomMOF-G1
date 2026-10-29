@@ -440,21 +440,34 @@ K 保持不变时不要开启 `pretrained_g1_expand_groups`，增大 K 时同时
 内部参数开始获得任务梯度。没有新增门控、归一化、冻结策略或低精度路径。
 这保证加桥本身的初始恒等行为；K32→K64 仍会改变路由，不能声称与原始 K32 输出相同。
 
-预设 `experiment=g1_small_stage2_dense`：8 GPU、K64、位置 `[3,6,9,12,15,18,21,24]`，
-最多 300 原子、平方预算 3,000,000、B32/累积2、skip_too_big=false、seed42，
-LR 上限 1e-4、warmup 10,000 次优化器更新，Stage-2 新训练 200 轮。
-执行优化仍通过 `execution=optimized` 选择；baseline 和默认四桥配置不受影响。
+插入位置、K、训练轮数和保存间隔均由命令行控制，不新增专用实验配置文件。
+例如以现有 8 GPU、最多 300 原子、平方预算 3,000,000、B32/累积2、
+skip_too_big=false、seed42 的 Stage-2 完整命令为基础，设置下列参数。
+数据路径、small 模型尺寸、LR 上限 1e-4 和 warmup 10,000 次优化器更新等沿用原命令。
 
 ~~~bash
-python -u src/train.py \
-  experiment=g1_small_stage2_dense \
-  execution=optimized \
-  pretrained_ckpt_path="$STAGE1_CKPT" \
-  data.lmdb_dir="$LMDB_DIR" \
-  hydra.run.dir="$RUN_DIR"
+execution=optimized \
+model.flow_model_args.g1.enabled=true \
+model.flow_model_args.g1.insert_after='[3,6,9,12,15,18,21,24]' \
+model.flow_model_args.g1.module.router.max_groups=64 \
+pretrained_g1_expand_bridges=true \
+pretrained_g1_expand_groups=true \
+pretrained_ckpt_path="$STAGE1_CKPT" \
+resume_ckpt_path=null \
+trainer.max_epochs=200 \
+callbacks.model_checkpoint.monitor=null \
+callbacks.model_checkpoint.save_top_k=-1 \
+callbacks.model_checkpoint.save_last=true \
+callbacks.model_checkpoint.save_weights_only=false \
+callbacks.model_checkpoint.every_n_epochs=100 \
+callbacks.model_checkpoint.every_n_train_steps=null \
+callbacks.model_checkpoint.train_time_interval=null \
+callbacks.model_checkpoint.save_on_train_epoch_end=true \
+callbacks.model_checkpoint.auto_insert_metric_name=false \
+'callbacks.model_checkpoint.filename="epoch_{epoch}-step_{step}"'
 ~~~
 
-该预设保留第 100、200 轮的完整 checkpoint（epoch 字段分别为 99、199），
+上述保存参数保留第 100、200 轮的完整 checkpoint（epoch 字段分别为 99、199），
 `save_top_k=-1` 避免第 200 轮删除第 100 轮；`last.ckpt` 仅随这两个保存事件更新。
 优化器、调度器和 epoch 从头建立，不继承 Stage-1 状态。
 训练后的 checkpoint 已包含八桥配置和学到的投影；推理、严格重载及同结构断点续训
