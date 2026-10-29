@@ -375,10 +375,11 @@ Flow 已将当前坐标/晶格转换为 nm/radian，集成模式会校验该单�
 | 场景 | 行为 |
 | --- | --- |
 | 原 baseline checkpoint | 缺少 g1 配置时按关闭处理，严格加载原有权重 |
-| 当前方案 G1 checkpoint | 保存四桥参数与 flow_model_args.g1，推理时自动恢复 |
+| 当前方案 G1 checkpoint | 保存所有插入位置的参数与 flow_model_args.g1，推理时自动恢复 |
 | baseline 权重初始化 G1 训练 | 启用 G1，并使用 pretrained_ckpt_path；主干尺寸应一致，新桥随机初始化 |
 | 继续 G1 训练 | 同样启用 G1、保留相同结构，使用 resume_ckpt_path 恢复优化器与训练进度 |
 | G1 扩大 K 后进入下一阶段 | 使用 pretrained_ckpt_path 和 pretrained_g1_expand_groups=true，仅扩展路由模板行，其他权重严格加载 |
+| G1 增加插入位置后进入下一阶段 | 使用 pretrained_g1_expand_bridges=true，保留旧位置并对新增桥的残差输出投影零初始化，可同时显式扩大 K |
 
 例如从 K 上限 32 的 stage-1 checkpoint 初始化 K 上限 64 的 stage-2，在第二阶段命令中设置：
 
@@ -416,10 +417,52 @@ predict_args.g1_enabled=true
 程序调用可在 model.eval() 后使用 model.structure_module.flow_model.set_g1_enabled(False)。
 构造时关闭的模型不能在运行时凭空开启 G1；需要包含 G1 权重的模型。
 
-只维护当前 G1 架构和配置；除上述显式 K 扩容外，不提供旧 G1 架构的自动迁移或恢复模式。
+只维护当前 G1 架构和配置；除显式 K 扩容和下述插入位置扩展外，不提供旧 G1 架构的自动迁移或恢复模式。
 原始 AtomMOF baseline 的加载、初始化 G1 训练和关闭开关保留。
 共享条件编码器的四组 state_dict 名称是同一套权重的别名；加载时检查它们一致，
 避免损坏或人工修改的 checkpoint 静默覆盖共享权重。
+
+### 8.3 从 Stage-1 增加 G1 插入密度
+
+`pretrained_g1_expand_bridges=true` 只用于 `pretrained_ckpt_path` 权重迁移，
+要求 `resume_ckpt_path=null`。旧位置必须是新位置的严格子集，不能删除或移动旧桥；
+K 保持不变时不要开启 `pretrained_g1_expand_groups`，增大 K 时同时开启它。
+此入口针对原始 G1、CPU 构造及 `ema=false`，与 G1-New 迁移入口互斥。
+
+实现先按旧插入位置构造目标 K 的模型，完整加载旧权重并执行既有 K 扩容，
+再在独立的 PyTorch CPU RNG 上下文中构造更密的模型。原有位置新增模板行的初始化、
+迁移后的 CPU RNG 状态均与既有 K 扩容流程一致。旧权重和所有共享条件编码器别名完整复制；
+新增桥保持内部正常初始化，仅 `readback.residual.output_projection.weight` 置零。
+随后组装完整 state_dict 并严格加载，源 checkpoint 不会被修改。
+
+新增桥初始满足 `H_out = H + 0 * readback = H`（有效原子且中间值有限）。
+第一次反传时末端投影通常有非零梯度，前面的独立参数任务梯度为零；投影更新后，
+内部参数开始获得任务梯度。没有新增门控、归一化、冻结策略或低精度路径。
+这保证加桥本身的初始恒等行为；K32→K64 仍会改变路由，不能声称与原始 K32 输出相同。
+
+预设 `experiment=g1_small_stage2_dense`：8 GPU、K64、位置 `[3,6,9,12,15,18,21,24]`，
+最多 300 原子、平方预算 3,000,000、B32/累积2、skip_too_big=false、seed42，
+LR 上限 1e-4、warmup 10,000 次优化器更新，Stage-2 新训练 200 轮。
+执行优化仍通过 `execution=optimized` 选择；baseline 和默认四桥配置不受影响。
+
+~~~bash
+python -u src/train.py \
+  experiment=g1_small_stage2_dense \
+  execution=optimized \
+  pretrained_ckpt_path="$STAGE1_CKPT" \
+  data.lmdb_dir="$LMDB_DIR" \
+  hydra.run.dir="$RUN_DIR"
+~~~
+
+该预设保留第 100、200 轮的完整 checkpoint（epoch 字段分别为 99、199），
+`save_top_k=-1` 避免第 200 轮删除第 100 轮；`last.ckpt` 仅随这两个保存事件更新。
+优化器、调度器和 epoch 从头建立，不继承 Stage-1 状态。
+训练后的 checkpoint 已包含八桥配置和学到的投影；推理、严格重载及同结构断点续训
+不会再次 zero-init。续训时关闭两个迁移开关，并使用 `resume_ckpt_path`。
+
+~~~bash
+python -m pytest tests/test_g1_bridge_expansion.py tests/test_g1_checkpoint_expansion.py -q
+~~~
 
 ## 9. 当前架构与参数
 
@@ -443,6 +486,8 @@ predict_args.g1_enabled=true
 | G1 合计（共享条件 + 四套更新） | 2,148,896 |
 | 原始 AtomMOF small | 38,376,320 |
 | **AtomMOF small + G1** | **40,525,216** |
+| AtomMOF small + G1，四桥 K64 | 40,529,312 |
+| AtomMOF small + G1，八桥 K64（每三层插入） | 42,308,288 |
 
 当前训练接口不再提供 share_condition 或 condition_encoder.pair_mode 两个参数；
 四桥共享与紧凑 pair 已是唯一实现。不要在新命令中继续传入这两个配置键。

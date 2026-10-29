@@ -51,6 +51,9 @@ pretrained_ckpt_path: null
 resume_ckpt_path: null
 # Explicit G1 K expansion during stage transfer; never used for full-state resume.
 pretrained_g1_expand_groups: false
+# Add G1 insertion sites with zero residual outputs during weights-only transfer.
+# May be combined with expand_groups; never used for full-state resume.
+pretrained_g1_expand_bridges: false
 # Explicit baseline/legacy-G1 weights-only initialization of the NEW architecture.
 pretrained_g1new_transfer: false
 

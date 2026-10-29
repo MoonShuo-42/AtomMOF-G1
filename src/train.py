@@ -48,15 +48,24 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             "pretrained_g1_expand_groups requires pretrained_ckpt_path and "
             "resume_ckpt_path=null; resized optimizer state cannot be resumed"
         )
+    expand_bridges = cfg.get("pretrained_g1_expand_bridges", False)
+    if type(expand_bridges) is not bool:
+        raise ValueError("pretrained_g1_expand_bridges must be a boolean")
+    if expand_bridges and (not cfg.get("pretrained_ckpt_path") or cfg.get("resume_ckpt_path")):
+        raise ValueError(
+            "pretrained_g1_expand_bridges requires pretrained_ckpt_path and "
+            "resume_ckpt_path=null; use ordinary resume for an already expanded model"
+        )
     transfer_g1new = cfg.get("pretrained_g1new_transfer", False)
     if type(transfer_g1new) is not bool:
         raise ValueError("pretrained_g1new_transfer must be a boolean")
     if transfer_g1new and (
-        expand_g1 or not cfg.get("pretrained_ckpt_path") or cfg.get("resume_ckpt_path")
+        expand_g1 or expand_bridges
+        or not cfg.get("pretrained_ckpt_path") or cfg.get("resume_ckpt_path")
     ):
         raise ValueError(
             "G1-New transfer requires pretrained_ckpt_path, resume_ckpt_path=null, "
-            "and pretrained_g1_expand_groups=false"
+            "and pretrained_g1_expand_groups=false, pretrained_g1_expand_bridges=false"
         )
 
     # set seed for random number generators in pytorch, numpy and python.random
@@ -67,8 +76,22 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
-    model: LightningModule = hydra.utils.instantiate(cfg.model)
-    if cfg.get("pretrained_ckpt_path") and not cfg.get("resume_ckpt_path"):
+    if expand_bridges:
+        from src.models.g1.bridge_transfer import build_pretrained_with_bridge_expansion
+
+        model, report = build_pretrained_with_bridge_expansion(
+            cfg.model, cfg.pretrained_ckpt_path, expand_groups=expand_g1,
+        )
+        log.info(f"G1 bridge expansion from {cfg.pretrained_ckpt_path}: {report}")
+        log.info(
+            "Old-site weights and K expansion initialization preserved; new sites use "
+            "zero residual output projections and the trained shared condition encoder. "
+            "Optimizer, scheduler and epoch counters start fresh."
+        )
+    else:
+        model: LightningModule = hydra.utils.instantiate(cfg.model)
+    if (cfg.get("pretrained_ckpt_path") and not cfg.get("resume_ckpt_path")
+            and not expand_bridges):
         log.info(f"Loading pretrained weights from {cfg.pretrained_ckpt_path}")
         if transfer_g1new:
             from src.models.g1new.checkpoint import load_g1new_pretrained

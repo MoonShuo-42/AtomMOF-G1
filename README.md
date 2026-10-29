@@ -501,6 +501,11 @@ checkpointing. See the [G1 performance/configuration notes](src/models/g1/README
 for the current server command and validation limits. Only the current G1 architecture is maintained;
 legacy G1 configurations are not restored or automatically migrated.
 
+For weights-only Stage-1 transfer to eight K64 bridges, use
+`experiment=g1_small_stage2_dense execution=optimized pretrained_ckpt_path=<stage1.ckpt>`.
+This preset zero-initializes only new residual outputs, trains for 200 epochs, and
+retains checkpoints at epochs 100 and 200. See the [depth-transfer contract](src/models/g1/README.md#83-从-stage-1-增加-g1-插入密度).
+
 The latest G1 execution optimizations compact within-block condition pairs, reuse
 per-batch group layouts and per-bridge geometry descriptors, and adapt geometry
 chunks to the image count. Parameter shapes and the baseline path are unchanged.

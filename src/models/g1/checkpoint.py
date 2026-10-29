@@ -43,7 +43,12 @@ def load_pretrained_with_group_expansion(
         checkpoint.get("state_dict"), Mapping
     ):
         raise ValueError("G1 expansion requires a checkpoint containing state_dict")
-    source = checkpoint["state_dict"]
+    return _load_state_with_group_expansion(model, checkpoint["state_dict"])
+
+
+@torch.no_grad()
+def _load_state_with_group_expansion(model: nn.Module, source: Mapping) -> list[GroupExpansion]:
+    """Shared validation for group-only and bridge-plus-group stage transfer."""
     target = model.state_dict()
     missing = sorted(target.keys() - source.keys())
     unexpected = sorted(source.keys() - target.keys())
