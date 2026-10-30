@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from .layers import JointMLP, edge_slices, mlp, recompute, split_apply
+from .streaming import edge_sum, stream_pool
 
 
 class PreparedEnvironment(NamedTuple):
@@ -19,6 +20,8 @@ class EnvironmentUpdate(nn.Module):
         super().__init__()
         self.width = width
         self.optimized = True
+        self.inplace_edge_sum = False
+        self.stream_edge_pooling = False
         self.init = mlp(width, hidden_dim, width)
         self.messages = JointMLP((width, width, width, 32), hidden_dim, width)
         # Independent score/value rows in one GEMM; no parameter sharing between heads.
@@ -33,7 +36,8 @@ class EnvironmentUpdate(nn.Module):
         if anchor_features is None:
             anchor_features = features.index_select(0, anchors)
         anchor = self.messages.project(anchor_features, 1)
-        if self.optimized and edges is not None and not checkpointing:
+        if (self.optimized and edges is not None and not checkpointing
+                and not self.stream_edge_pooling):
             # Cache the invariant relation projection, but keep the original
             # atom + (anchor + state) + relation addition order in every round.
             return PreparedEnvironment(atom, anchor, self.messages.project(chi, 3, bias=True))
@@ -59,13 +63,26 @@ class EnvironmentUpdate(nn.Module):
 
     def forward(self, state, projected, edges, chi, chunk_size, checkpointing, *, head_map=None):
         if self.optimized:
+            if self.stream_edge_pooling:
+                atom_projection, anchor_projection = projected[:2]
+                env_projection = anchor_projection + self.messages.project(state, 2)
+                mass, numerator = stream_pool(
+                    "environment", atom_projection, env_projection, chi, edges.omega,
+                    edges.atom, edges.env, self.messages, self.heads, 3, chunk_size,
+                    self.inplace_edge_sum,
+                )
+                u = numerator / (1 + mass[:, None])
+                q = torch.cat((state, u, torch.log1p(mass)[:, None]), -1)
+                delta = self.update(self.update_norm(q))
+                return state + (mass / (1 + mass))[:, None] * delta
             if head_map is None:
                 head_map = self.messages.head_map(self.heads)
             if isinstance(projected, PreparedEnvironment):
                 env_projection = projected.anchor + self.messages.project(state, 2)
-                hidden = projected.atom.index_select(0, edges.atom)
-                hidden = hidden + env_projection.index_select(0, edges.env)
-                hidden = hidden + projected.relation
+                hidden = edge_sum(
+                    projected.atom, env_projection, projected.relation,
+                    edges.atom, edges.env, self.inplace_edge_sum,
+                )
                 heads = split_apply(head_map, chunk_size, checkpointing, hidden)
                 pooled = self._pool(heads, edges.omega, edges.env, state.shape[0])
             else:
@@ -75,8 +92,12 @@ class EnvironmentUpdate(nn.Module):
                 def pool(relation, atom_projection, env_projection, omega):
                     def edge_heads(part, atom, env):
                         hidden = atom_projection.index_select(0, atom)
-                        hidden = hidden + env_projection.index_select(0, env)
-                        hidden = hidden + self.messages.project(part, 3, bias=True)
+                        if self.inplace_edge_sum:
+                            hidden.add_(env_projection.index_select(0, env))
+                            hidden.add_(self.messages.project(part, 3, bias=True))
+                        else:
+                            hidden = hidden + env_projection.index_select(0, env)
+                            hidden = hidden + self.messages.project(part, 3, bias=True)
                         return head_map(hidden)
 
                     heads = split_apply(

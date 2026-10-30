@@ -13,3 +13,8 @@ edge_chunk_size: 65536
 optimized: true
 # Only the new edge MLP activations are recomputed; backbone precision unchanged.
 activation_checkpointing: true
+# Independent candidates; false retains the previously validated execution path.
+# Enable only with optimized=true. Keep them explicit in numerical/performance A/Bs.
+inplace_edge_sum: false
+checkpoint_relation_inputs: false
+stream_edge_pooling: false

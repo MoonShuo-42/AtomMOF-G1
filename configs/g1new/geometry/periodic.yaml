@@ -3,6 +3,8 @@ cutoff: 0.8
 inner_cutoff: 0.6
 pair_chunk_size: 65536
 image_chunk_size: 262144
+# Exact combined nearest-image/cutoff enumeration; independent execution A/B.
+merge_search: false
 # Exact-work guards per rank/forward, not neighbour truncation. Overflow raises.
 max_search_candidates: 32000000
 max_edges: 2000000

@@ -11,6 +11,7 @@ class RelationEncoder(nn.Module):
         super().__init__()
         self.cutoff = cutoff
         self.optimized = True
+        self.checkpoint_relation_inputs = False
         self.bond_embedding = nn.Embedding(6, 8)
         self.network = mlp(28, 64, 32)
         self.register_buffer("rbf_indices", torch.arange(16), persistent=False)
@@ -32,6 +33,17 @@ class RelationEncoder(nn.Module):
         if self.optimized:
             if geometry_features is None:
                 geometry_features = self.geometry_features(edges)
+            if checkpointing and self.checkpoint_relation_inputs:
+                # Save shared geometry and integer bond indices, not a separate
+                # full T*28 concatenation at every insertion site. Recreate the
+                # same joint Linear input within each checkpointed chunk.
+                def encode(geometry, bond):
+                    inputs = torch.cat((geometry, self.bond_embedding(bond)), -1)
+                    return self.network(inputs)
+
+                return split_apply(
+                    encode, chunk_size, True, geometry_features, edges.bond
+                )
             # Keep the reference's joint 28-channel linear reduction. Splitting
             # it into geometry/bond GEMMs changes FP32/TF32 rounding points.
             inputs = torch.cat((geometry_features, self.bond_embedding(edges.bond)), -1)

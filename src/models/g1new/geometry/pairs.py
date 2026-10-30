@@ -61,6 +61,7 @@ class LocalGeometry(nn.Module):
         min_cell_singular_value=1e-6,
         max_cell_condition=1e6,
         bounds_margin=1e-9,
+        merge_search=False,
     ):
         super().__init__()
         if not (math.isfinite(cutoff) and 0 <= inner_cutoff < cutoff):
@@ -82,6 +83,9 @@ class LocalGeometry(nn.Module):
             or bounds_margin < 0
         ):
             raise ValueError("Invalid cell/search numerical thresholds")
+        if type(merge_search) is not bool:
+            raise TypeError("g1new geometry.merge_search must be bool")
+        self.merge_search = merge_search
         self.cutoff, self.inner_cutoff = cutoff, inner_cutoff
         self.optimized = True
         self.pair_chunk_size, self.image_chunk_size = pair_chunk_size, image_chunk_size
@@ -174,6 +178,65 @@ class LocalGeometry(nn.Module):
             best.sqrt(),
         )
 
+    def _merged_search(self, delta, cells, inverse, partner, anchor, types, chemical, budget):
+        """Enumerate each pair's union box once; retain reference edge/tie order.
+
+        The two scalar-radius boxes are nested, so their union uses no more
+        candidates than the separate cutoff and nearest-image searches. Retain
+        cutoff edges until the exact nearest bond image is known. Count retained
+        edges immediately, before keeping a chunk alive past this iteration.
+        """
+        selected = delta.index_select(0, chemical)
+        frac = torch.bmm(selected[:, None], inverse.index_select(0, chemical)).squeeze(1)
+        initial = -frac.round()
+        upper = torch.linalg.vector_norm(
+            selected + torch.bmm(
+                initial[:, None], cells.index_select(0, chemical)
+            ).squeeze(1), dim=-1,
+        )
+        radius = delta.new_full((len(delta),), self.cutoff)
+        radius.index_copy_(0, chemical, upper.clamp_min(self.cutoff))
+        boxes = self._boxes(delta, inverse, radius, budget)
+        best = delta.new_full((len(delta),), float("inf"))
+        sentinel = torch.iinfo(torch.long).max
+        winner = torch.full((len(delta),), sentinel, dtype=torch.long, device=delta.device)
+        spatial = []
+        for index, pair, shift in self._enumerate(boxes):
+            r = delta.index_select(0, pair) + torch.bmm(
+                shift.to(cells.dtype)[:, None], cells.index_select(0, pair)
+            ).squeeze(1)
+            # Use the same squared-distance reduction as _nearest, including
+            # exact (not tolerance-based) equality and lexicographic ties.
+            d2 = r.square().sum(-1)
+            known = types.index_select(0, pair) > 0
+            partial = best.new_full(best.shape, float("inf")).scatter_reduce_(
+                0, pair, d2.masked_fill(~known, float("inf")),
+                reduce="amin", include_self=True,
+            )
+            candidate = torch.where(known & (d2 == partial[pair]), index, sentinel)
+            first = winner.new_full(winner.shape, sentinel).scatter_reduce_(
+                0, pair, candidate, reduce="amin", include_self=True,
+            )
+            take_best = (partial < best) | ((partial == best) & (first < winner))
+            best = torch.where(take_best, partial, best)
+            winner = torch.where(take_best, first, winner)
+            within = torch.linalg.vector_norm(r, dim=-1) < self.cutoff
+            central = (partner[pair] == anchor[pair]) & (shift == 0).all(-1)
+            take = (within & ~central).nonzero(as_tuple=True)[0]
+            budget.consume(take.numel(), "edges")
+            if take.numel():
+                spatial.append((pair.index_select(0, take), shift.index_select(0, take)))
+        winning = winner.index_select(0, chemical)
+        if bool((winning == sentinel).any()):
+            raise RuntimeError(
+                "g1new nearest-image search failed to cover its initial upper bound"
+            )
+        nearest = torch.zeros_like(delta, dtype=torch.long)
+        nearest.index_copy_(0, chemical, self._decode(winning, chemical, boxes))
+        nearest_d = delta.new_full((len(delta),), float("inf"))
+        nearest_d.index_copy_(0, chemical, best.index_select(0, chemical).sqrt())
+        return nearest, nearest_d, spatial
+
     @torch.no_grad()
     def _search(self, x, cell, mask, elements, bonds, valid):
         if not self.optimized:
@@ -193,8 +256,9 @@ class LocalGeometry(nn.Module):
             raise ValueError("g1new requires bond_types in 0..5")
         flat_bonds = bonds.reshape(-1)
 
-        def append(a, e, n, bond):
-            budget.consume(a.numel(), "edges")
+        def append(a, e, n, bond, *, counted=False):
+            if not counted:
+                budget.consume(a.numel(), "edges")
             if a.numel():
                 for target, value in zip(parts, (a, e, n, bond)):
                     target.append(value)
@@ -219,31 +283,46 @@ class LocalGeometry(nn.Module):
             cells, inverse = cell64.index_select(0, batch), inv.index_select(0, batch)
             types = flat_bonds.index_select(0, partner * atoms + anchor % atoms)
             chemical = (types > 0).nonzero(as_tuple=True)[0]
-            nearest = torch.zeros_like(delta, dtype=torch.long)
-            nearest_d = delta.new_full((len(delta),), float("inf"))
-            if chemical.numel():
-                shifts, distances = self._nearest(
-                    delta.index_select(0, chemical), cells.index_select(0, chemical),
-                    inverse.index_select(0, chemical), budget,
+            if self.merge_search and chemical.numel():
+                nearest, nearest_d, spatial = self._merged_search(
+                    delta, cells, inverse, partner, anchor, types, chemical, budget,
                 )
-                nearest.index_copy_(0, chemical, shifts)
-                nearest_d.index_copy_(0, chemical, distances)
+                for pair, shifts in spatial:
+                    bond = torch.where(
+                        (shifts == nearest.index_select(0, pair)).all(-1),
+                        types.index_select(0, pair), 0,
+                    )
+                    append(
+                        partner.index_select(0, pair), env.index_select(0, pair),
+                        shifts, bond, counted=True,
+                    )
+                del spatial
+            else:
+                nearest = torch.zeros_like(delta, dtype=torch.long)
+                nearest_d = delta.new_full((len(delta),), float("inf"))
+                if chemical.numel():
+                    shifts, distances = self._nearest(
+                        delta.index_select(0, chemical), cells.index_select(0, chemical),
+                        inverse.index_select(0, chemical), budget,
+                    )
+                    nearest.index_copy_(0, chemical, shifts)
+                    nearest_d.index_copy_(0, chemical, distances)
 
-            boxes = self._boxes(delta, inverse, delta.new_full((len(delta),), self.cutoff), budget)
-            for _, pair, shifts in self._enumerate(boxes):
-                a, anchor_image = partner.index_select(0, pair), anchor.index_select(0, pair)
-                r = delta.index_select(0, pair) + torch.bmm(
-                    shifts.to(cells.dtype)[:, None], cells.index_select(0, pair)
-                ).squeeze(1)
-                within = torch.linalg.vector_norm(r, dim=-1) < self.cutoff
-                central = (a == anchor_image) & (shifts == 0).all(-1)
-                take = (within & ~central).nonzero(as_tuple=True)[0]
-                pair, shifts = pair.index_select(0, take), shifts.index_select(0, take)
-                bond = torch.where(
-                    (shifts == nearest.index_select(0, pair)).all(-1),
-                    types.index_select(0, pair), 0,
-                )
-                append(partner.index_select(0, pair), env.index_select(0, pair), shifts, bond)
+                boxes = self._boxes(delta, inverse, delta.new_full((len(delta),), self.cutoff), budget)
+                for _, pair, shifts in self._enumerate(boxes):
+                    a, anchor_image = partner.index_select(0, pair), anchor.index_select(0, pair)
+                    r = delta.index_select(0, pair) + torch.bmm(
+                        shifts.to(cells.dtype)[:, None], cells.index_select(0, pair)
+                    ).squeeze(1)
+                    within = torch.linalg.vector_norm(r, dim=-1) < self.cutoff
+                    central = (a == anchor_image) & (shifts == 0).all(-1)
+                    take = (within & ~central).nonzero(as_tuple=True)[0]
+                    pair, shifts = pair.index_select(0, take), shifts.index_select(0, take)
+                    bond = torch.where(
+                        (shifts == nearest.index_select(0, pair)).all(-1),
+                        types.index_select(0, pair), 0,
+                    )
+                    append(partner.index_select(0, pair), env.index_select(0, pair), shifts, bond)
 
             extra = ((types > 0) & (nearest_d >= self.cutoff)
                      & ~((partner == anchor) & (nearest == 0).all(-1))).nonzero(as_tuple=True)[0]

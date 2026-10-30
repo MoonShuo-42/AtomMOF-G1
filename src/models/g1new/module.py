@@ -26,6 +26,9 @@ class G1NewModule(nn.Module):
         optimized=True,
         condition_encoder=None,
         geometry=None,
+        inplace_edge_sum=False,
+        checkpoint_relation_inputs=False,
+        stream_edge_pooling=False,
     ):
         super().__init__()
         for name, value in dict(
@@ -41,6 +44,14 @@ class G1NewModule(nn.Module):
             raise TypeError("g1new.activation_checkpointing must be bool")
         if type(optimized) is not bool:
             raise TypeError("g1new.optimized must be bool")
+        for name, value in dict(
+            inplace_edge_sum=inplace_edge_sum,
+            checkpoint_relation_inputs=checkpoint_relation_inputs,
+            stream_edge_pooling=stream_edge_pooling,
+        ).items():
+            if type(value) is not bool:
+                raise TypeError(f"g1new.{name} must be bool")
+            setattr(self, name, value)
         self.optimized = optimized
         self.h_dim, self.width, self.rounds = h_dim, width, rounds
         self.edge_chunk_size = edge_chunk_size
@@ -63,6 +74,10 @@ class G1NewModule(nn.Module):
         self.readback = AtomReadback(width, hidden_dim)
         for component in (self.geometry, self.relations, self.environment, self.readback):
             component.optimized = optimized
+        self.relations.checkpoint_relation_inputs = checkpoint_relation_inputs
+        for component in (self.environment, self.readback):
+            component.inplace_edge_sum = inplace_edge_sum
+            component.stream_edge_pooling = stream_edge_pooling
         self.output_projection = nn.Linear(width, h_dim, bias=False)
         nn.init.zeros_(self.output_projection.weight)
 

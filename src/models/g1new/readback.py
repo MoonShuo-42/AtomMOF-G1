@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from .layers import JointMLP, edge_slices, recompute, split_apply
+from .streaming import stream_pool
 
 
 class AtomReadback(nn.Module):
@@ -11,6 +12,8 @@ class AtomReadback(nn.Module):
         super().__init__()
         self.width = width
         self.optimized = True
+        self.inplace_edge_sum = False
+        self.stream_edge_pooling = False
         self.messages = JointMLP((width, width, 32), hidden_dim, width)
         self.heads = nn.Linear(width, 1 + width)
 
@@ -49,13 +52,23 @@ class AtomReadback(nn.Module):
         atom_projection = self.messages.project(features, 0)
         env_projection = self.messages.project(state, 1)
         if self.optimized:
+            if self.stream_edge_pooling:
+                return stream_pool(
+                    "readback", atom_projection, env_projection, chi, edges.omega,
+                    edges.atom, edges.env, self.messages, self.heads, 2, chunk_size,
+                    self.inplace_edge_sum,
+                )
             head_map = self.messages.head_map(self.heads)
             if checkpointing:
                 def readback(relation, atom_projection, env_projection, omega):
                     def edge_heads(part, atom, env):
                         hidden = atom_projection.index_select(0, atom)
-                        hidden = hidden + env_projection.index_select(0, env)
-                        hidden = hidden + self.messages.project(part, 2, bias=True)
+                        if self.inplace_edge_sum:
+                            hidden.add_(env_projection.index_select(0, env))
+                            hidden.add_(self.messages.project(part, 2, bias=True))
+                        else:
+                            hidden = hidden + env_projection.index_select(0, env)
+                            hidden = hidden + self.messages.project(part, 2, bias=True)
                         return head_map(hidden)
 
                     heads = split_apply(
@@ -69,11 +82,13 @@ class AtomReadback(nn.Module):
                     readback, True, chi, atom_projection, env_projection, edges.omega
                 )
             else:
-                hidden = (
-                    atom_projection.index_select(0, edges.atom)
-                    + env_projection.index_select(0, edges.env)
-                    + self.messages.project(chi, 2, bias=True)
-                )
+                hidden = atom_projection.index_select(0, edges.atom)
+                if self.inplace_edge_sum:
+                    hidden.add_(env_projection.index_select(0, edges.env))
+                    hidden.add_(self.messages.project(chi, 2, bias=True))
+                else:
+                    hidden = hidden + env_projection.index_select(0, edges.env)
+                    hidden = hidden + self.messages.project(chi, 2, bias=True)
                 heads = split_apply(head_map, chunk_size, False, hidden)
             return self._pool(heads, edges.omega, edges.atom, features.shape[0])
 

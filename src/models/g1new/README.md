@@ -378,3 +378,95 @@ run directory. Incomplete rank/epoch reports cannot pass as complete epochs.
 The <120 seconds/epoch target is **not yet verified on L40S**. Local CPU tests
 cannot establish end-to-end CUDA speed or peak memory. Stage-2/3 experiment
 defaults remain 32/2, 100 epochs, max atoms 300/unlimited, square budgets 3e6/5e5.
+
+## Independent memory and search candidates
+
+Four additional runtime candidates are opt-in. Their YAML/default constructor
+values are **false**, retaining the previously validated optimized path for old
+checkpoints and existing commands. They require `module.optimized=true`; they do
+not add learned tensors, change parameter order, or change the FP32/high/TF32
+policy. An `optimized=false` reference ignores them.
+
+| Override under `model.flow_model_args.g1new.module` | Effect | Trade-off |
+| --- | --- | --- |
+| `inplace_edge_sum=true` | Accumulate in a newly gathered edge hidden buffer in the original addition order | Fewer temporary buffers; never mutates shared projections, relations or node states |
+| `checkpoint_relation_inputs=true` | Include bond embedding and the joint 28-channel concatenation inside each relation checkpoint | Requires `activation_checkpointing=true`; saves retained inputs but recomputes embedding/concatenation |
+| `stream_edge_pooling=true` | Generate and pool edge messages in chunks, recomputing messages for the backward pass | Saves edge activations; readback uses two forward passes and may be slower |
+| `geometry.merge_search=true` | Combine exact cutoff enumeration and bonded nearest-image enumeration | Fewer duplicate search candidates/host reads; extra nearest reductions can offset savings |
+
+The relation-input candidate keeps the same joint Linear and chunk shape. It
+does **not** split the geometry and bond GEMMs. The in-place candidate writes
+only into a fresh intermediate that no earlier operation needs for backward.
+No shared input, parameter or state is modified.
+
+Streaming keeps the global detached readback maximum, one null item per atom,
+and separate scalar/vector accumulations. It has a custom **first-order**
+backward; `create_graph=True` is explicitly rejected. It is validated for eager
+training and evaluation, not higher-order differentiation or full-graph compile.
+The readback backward replays the original node-level division with autograd;
+moving division outside the feature reduction changes FP32 rounding. This uses
+only node-sized tensors, without restoring a full-edge hidden/heads buffer.
+Its internal recomputation remains active even if the enclosing
+`activation_checkpointing` is false. Its changed reduction accumulation order
+must pass the CUDA numerical gate; formula equivalence is not bitwise identity.
+
+Merged search retains the exact edge order, nearest-image tie-breaking and
+differentiable geometry reconstruction. Candidate budgets count actual union-box
+work; both the candidate and retained-edge guards still fail before unbounded
+allocation. Search results are never truncated to fit a budget.
+
+The benchmark now accepts repeatable `--candidate NAME` arguments for individual
+comparisons, comma-joined names for a combination, or `--candidate all`. Every
+candidate compares against the current optimized path with all four flags off.
+Checkpointing and chunk sizes are matched within the numerical comparison.
+The relation-input candidate (and `all`) enables G1new checkpointing in **both**
+the candidate and its control, so its measured gain does not include the unrelated
+effect of switching checkpointing on. Other candidates leave checkpointing off
+unless `--activation-checkpointing` is supplied.
+
+Run numerical checks first (no dataset or training required):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u scripts/benchmark_g1new_execution.py \
+  --verify-only --verify-device cuda --rounds 2 --repeats 5 \
+  --candidate inplace_edge_sum \
+  --candidate checkpoint_relation_inputs \
+  --candidate stream_edge_pooling \
+  --candidate merge_search \
+  --candidate all
+```
+
+For ordinary-policy repeatability as well as deterministic comparisons, replace
+`--verify-only` with `--diagnose-only`; the two policies run in isolated processes.
+All numerical reports retain the existing CUDA `rtol=0.003, atol=0.0002` gate.
+The candidate fixture deliberately uses multiple edge chunks and compares edge
+order as well as edge identity. Each failure remains a failure; thresholds are
+not increased to accept a candidate.
+
+For two full epochs per candidate plus reusable matching controls:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  python -u scripts/benchmark_g1new_execution.py --rounds 2 --epochs 2 \
+  --candidate inplace_edge_sum \
+  --candidate checkpoint_relation_inputs \
+  --candidate stream_edge_pooling \
+  --candidate merge_search \
+  --candidate all
+```
+
+Each candidate's isolated numerical gate must pass before its training starts.
+`benchmark_plan.json` records the control and checkpoint policy for each run;
+the summary reports time and allocated-memory differences only for matched
+data-order/shape/precision/parameter-count comparisons. No speedup or peak-memory
+reduction is assumed from saved-tensor tests alone.
+
+Training construction overrides are stored in new checkpoints. As before,
+prediction reconstructs these settings from checkpoint hyperparameters; merely
+adding model construction overrides to `predict.py` does not replace them.
+
+A local FP32 saved-tensor probe (16,384 edges, width 64, hidden 128, chunk 1,024)
+measured unique retained storage of 30.7621 -> 2.5800 MiB for environment pooling
+and 30.5977 -> 2.4468 MiB for readback. These values describe saved activations in
+isolated modules, **not** whole-model CUDA peaks or an epoch speedup. Streaming
+still needs full relation/input-gradient arrays, and performs extra recomputation.

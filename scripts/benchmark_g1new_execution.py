@@ -5,6 +5,11 @@ Default: four sites, two internal rounds, two complete epochs on eight GPUs.
 Use --include-reference for a same-code, same-data old/new implementation pair.
 The numerical gate uses deterministic algorithms in an isolated child process;
 training retains its original execution policy and the same FP32/high/TF32.
+Use --candidate NAME (repeatable) for individual optimization A/B runs, or
+--candidate inplace_edge_sum,merge_search / --candidate all for combinations.
+Candidates are compared with the existing optimized implementation using the
+same checkpointing policy. These gates do not certify normal CUDA repeatability;
+--diagnose-only checks both execution policies in separate processes.
 """
 
 import argparse
@@ -25,6 +30,33 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+OPTIMIZATIONS = ("inplace_edge_sum", "checkpoint_relation_inputs",
+                 "stream_edge_pooling", "merge_search")
+
+
+def parse_candidate(value):
+    """A repeated argument means separate runs; commas mean one combined run."""
+    names = OPTIMIZATIONS if value == "all" else tuple(value.replace("+", ",").split(","))
+    if not names or any(name not in OPTIMIZATIONS for name in names):
+        raise argparse.ArgumentTypeError(
+            "Expected all or comma-separated names from " + ", ".join(OPTIMIZATIONS)
+        )
+    return tuple(name for name in OPTIMIZATIONS if name in names)
+
+
+def candidate_name(candidate):
+    return "candidate_" + "_".join(candidate)
+
+
+def candidate_checkpointing(candidate, requested=False):
+    # Input recomputation is inert without activation checkpointing. Never
+    # silently compare a recomputed candidate with a non-recomputed control.
+    return requested or "checkpoint_relation_inputs" in candidate
+
+
+def runtime_options(candidate=()):
+    return {name: name in candidate for name in OPTIMIZATIONS}
 
 
 def compare_tensors(name, reference, actual, rtol=0.003, atol=0.0002):
@@ -164,7 +196,8 @@ def tensor_fingerprint(tensors):
     return digest.hexdigest()
 
 
-def verify(directory, rounds, device, diagnose=False, repeats=1):
+def verify(directory, rounds, device, diagnose=False, repeats=1, *, candidate=(),
+           activation_checkpointing=False):
     """Nonzero residuals, all four sites, live geometry and all changed weights.
 
     Conditions are supplied identically to isolate the modified local branch;
@@ -177,6 +210,10 @@ def verify(directory, rounds, device, diagnose=False, repeats=1):
 
     if repeats < 1:
         raise ValueError("repeats must be positive")
+    candidate = tuple(candidate)
+    activation_checkpointing = candidate_checkpointing(candidate, activation_checkpointing)
+    if any(name not in OPTIMIZATIONS for name in candidate):
+        raise ValueError("Unknown candidate optimization")
     torch.manual_seed(271)
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.allow_tf32 = True
@@ -185,16 +222,24 @@ def verify(directory, rounds, device, diagnose=False, repeats=1):
     if device == "cpu":
         torch.set_num_threads(1)
     models = []
-    for optimized in (False, True):
+    for index, optimized in enumerate((False, True)):
+        # Candidate A/B isolates only the requested runtime flags, including
+        # matching checkpointing and chunk sizes on its current-optimized control.
+        optimized = bool(candidate) or optimized
+        options = runtime_options(candidate if index else ())
         config = dict(
             _target_="src.models.g1new.G1NewModule", optimized=optimized,
-            rounds=rounds, activation_checkpointing=False,
-            edge_chunk_size=65536 if optimized else 8192,
+            rounds=rounds, activation_checkpointing=activation_checkpointing,
+            # The synthetic fixture has ~2.4k edges: force multiple chunks in
+            # candidate gates so streaming/recomputation boundaries are exercised.
+            edge_chunk_size=512 if candidate else (65536 if optimized else 8192),
             geometry=dict(
                 _target_="src.models.g1new.geometry.LocalGeometry",
                 pair_chunk_size=65536 if optimized else 4096,
                 image_chunk_size=262144 if optimized else 65536,
+                merge_search=options.pop("merge_search"),
             ),
+            **options,
         )
         models.append(G1NewBridge(h_dim=256, depth=24, module=config).to(device).train())
     with torch.no_grad():
@@ -254,7 +299,7 @@ def verify(directory, rounds, device, diagnose=False, repeats=1):
     reference, reference_edges = evaluate(models[0])
     # A reference that fails against itself cannot certify the optimized path.
     cases = [("reference_repeat", {}), ("optimized", {})]
-    if diagnose:
+    if diagnose and not candidate and not activation_checkpointing:
         cases = [*cases,
                  ("heads_reassociated", dict(heads=True)),
                  ("bonds_preprojected", dict(bonds=True)),
@@ -275,7 +320,9 @@ def verify(directory, rounds, device, diagnose=False, repeats=1):
                 compare_tensors(name, value, actual[name]) for name, value in first.items()
             ]
             self_passed = None if self_rows is None else (
-                sorted(first_edges) == sorted(edge_table) and all(x["passed"] for x in self_rows)
+                (first_edges == edge_table if candidate else
+                 sorted(first_edges) == sorted(edge_table))
+                and all(x["passed"] for x in self_rows)
             )
             report = dict(rounds=rounds, case=case, repeat=trial + 1, device=device,
                           rtol=0.003, atol=0.0002,
@@ -290,6 +337,11 @@ def verify(directory, rounds, device, diagnose=False, repeats=1):
                           fixture_sha256=fixture_hash, initial_state_sha256=state_hash,
                           torch_version=torch.__version__, cuda_version=torch.version.cuda,
                           gpu_name=torch.cuda.get_device_name() if device == "cuda" else None,
+                          candidate=list(candidate), candidate_options=runtime_options(candidate),
+                          control="current_optimized" if candidate else "reference",
+                          activation_checkpointing=activation_checkpointing,
+                          model_training=model.training,
+                          edge_chunk_size=next(iter(model.bridges.values())).edge_chunk_size,
                           shape=[B, N], edge_count=len(edge_table),
                           identical_edge_order=reference_edges == edge_table,
                           identical_edge_sets=sorted(reference_edges) == sorted(edge_table),
@@ -297,6 +349,7 @@ def verify(directory, rounds, device, diagnose=False, repeats=1):
                           tensors=[compare_tensors(name, value, actual[name])
                                    for name, value in reference.items()])
             report["passed"] = (report["identical_edge_sets"]
+                                and (not candidate or report["identical_edge_order"])
                                 and all(x["passed"] for x in report["tensors"]))
             suffix = "" if case == "optimized" else "_" + case
             if trial:
@@ -331,7 +384,11 @@ def verify(directory, rounds, device, diagnose=False, repeats=1):
         torch.cuda.empty_cache()
 
 
-def command(directory, rounds, reference, epochs, lmdb_dir, offline):
+def command(directory, rounds, reference, epochs, lmdb_dir, offline, *, candidate=(),
+            activation_checkpointing=False):
+    if reference and candidate:
+        raise ValueError("Candidate optimizations require optimized=true")
+    activation_checkpointing = candidate_checkpointing(candidate, activation_checkpointing)
     prefix = "model.flow_model_args.g1new.module."
     return [
         sys.executable, "-u", "src/train.py", "experiment=g1new_small_stage1",
@@ -351,12 +408,14 @@ def command(directory, rounds, reference, epochs, lmdb_dir, offline):
         "model.flow_model_args.g1.enabled=false", "model.flow_model_args.g1new.enabled=true",
         "model.flow_model_args.g1new.insert_after=[6,12,18,24]",
         "model.flow_model_args.activation_checkpointing=false",
-        prefix + "activation_checkpointing=false",
+        prefix + f"activation_checkpointing={str(activation_checkpointing).lower()}",
         prefix + "condition_encoder.activation_checkpointing=false",
         prefix + f"rounds={rounds}", prefix + f"optimized={str(not reference).lower()}",
         prefix + f"edge_chunk_size={8192 if reference else 65536}",
         prefix + f"geometry.pair_chunk_size={4096 if reference else 65536}",
         prefix + f"geometry.image_chunk_size={65536 if reference else 262144}",
+        *["++" + prefix + ("geometry." if name == "merge_search" else "")
+          + f"{name}={str(enabled).lower()}" for name, enabled in runtime_options(candidate).items()],
         "model.training_args.lr_scheduler=af3", "model.training_args.max_lr=0.0001",
         "model.training_args.lr_warmup_no_steps=10000",
         "model.validation_args.sample_every_n_epochs=10", "model.validation_args.num_workers=1",
@@ -406,6 +465,8 @@ def run(cmd, directory):
 
 def summarize(root, expected_epochs):
     rows, fingerprints = [], {}
+    plan_path = root / "benchmark_plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8")) if plan_path.exists() else {}
     policy = ("precision", "float32_matmul_precision", "cuda_matmul_allow_tf32",
               "cudnn_allow_tf32", "parameter_count", "accumulate_grad_batches")
     for path in sorted(root.glob("rounds*_*/performance")):
@@ -428,6 +489,10 @@ def summarize(root, expected_epochs):
                        allocated_gib=max(r["peak_allocated_bytes"] for r in ranks) / 2**30,
                        reserved_gib=max(r["peak_reserved_bytes"] for r in ranks) / 2**30)
             row["below_120s"] = row["seconds"] < 120
+            if path.parent.name in plan:
+                mode = plan[path.parent.name]
+                row.update(control=mode["control"], candidate=mode["candidate"],
+                           activation_checkpointing=mode["activation_checkpointing"])
             rows.append(row)
             fingerprints[(row["run"], epoch)] = [
                 [r[k] for k in (*policy, "total_batches", "batches_sha256", "shapes_sha256")]
@@ -435,16 +500,26 @@ def summarize(root, expected_epochs):
             ]
     text = ["Training segment only; includes first 20 batches, excludes validation/save.",
             "Max over eight ranks. These are unprofiled full epochs, not extrapolations.",
+            "A deterministic gate does not certify normal-CUDA self-repeat variation; use --diagnose-only.",
             "| run | epoch | batches/rank | seconds | allocated GiB | reserved GiB | <120s |",
             "|---|---:|---|---:|---:|---:|---|"]
     for r in rows:
         text.append(f"| {r['run']} | {r['epoch']} | {r['batches']} | {r['seconds']:.2f} | "
                     f"{r['allocated_gib']:.2f} | {r['reserved_gib']:.2f} | {r['below_120s']} |")
-        ref = r["run"].replace("_optimized", "_reference")
+        ref = r.get("control") or r["run"].replace("_optimized", "_reference")
         key = (ref, r["epoch"] - 1)
-        if r["run"].endswith("_optimized") and key in fingerprints:
+        if (r.get("control") or r["run"].endswith("_optimized")) and key in fingerprints:
             if fingerprints[key] != fingerprints[(r["run"], r["epoch"] - 1)]:
                 raise RuntimeError("Reference/optimized data order or precision differs; invalid A/B")
+            if r.get("control"):
+                control = next(x for x in rows if x["run"] == ref and x["epoch"] == r["epoch"])
+                if r["activation_checkpointing"] != control["activation_checkpointing"]:
+                    raise RuntimeError("Candidate/control checkpointing policies differ; invalid A/B")
+                r["time_change_percent"] = 100 * (r["seconds"] / control["seconds"] - 1)
+                r["allocated_change_gib"] = r["allocated_gib"] - control["allocated_gib"]
+                text.append(f"  vs {ref}: time {r['time_change_percent']:+.2f}%, "
+                            f"allocated {r['allocated_change_gib']:+.2f} GiB "
+                            f"(checkpointing={r['activation_checkpointing']}).")
     for name in sorted({r["run"] for r in rows}):
         values = [r["seconds"] for r in rows if r["run"] == name]
         text.append(f"{name}: mean={statistics.mean(values):.2f}s, complete epochs={len(values)}")
@@ -483,6 +558,8 @@ def diagnose_profiles(root, args):
                    "--diagnostic-profile", profile, "--repeats", str(args.repeats),
                    "--verify-device", args.verify_device, "--rounds", str(rounds),
                    "--output", str(directory)]
+            if getattr(args, "activation_checkpointing", False):
+                cmd.append("--activation-checkpointing")
             print("\n" + shlex.join(cmd), flush=True)
             if args.dry_run:
                 continue
@@ -496,7 +573,8 @@ def diagnose_profiles(root, args):
                              f"see {directory.name}/diagnostic_error.json")
                 continue
             values = json.loads(path.read_text(encoding="utf-8"))
-            run["complete"] = len(values) == 6 * args.repeats
+            case_count = 2 if getattr(args, "activation_checkpointing", False) else 6
+            run["complete"] = len(values) == case_count * args.repeats
             for case in dict.fromkeys(row["case"] for row in values):
                 selected = [r for r in values if r["case"] == case]
                 record = dict(profile=profile, rounds=rounds, case=case, repeats=len(selected),
@@ -534,11 +612,137 @@ def diagnose_profiles(root, args):
         raise RuntimeError("Diagnostic profiles completed with failures; inspect summary.log and reports")
 
 
+def diagnose_candidates(root, args):
+    """Report production repeatability separately from each deterministic gate."""
+    runs, rows, fixtures = [], [], {}
+    selections = list(dict.fromkeys(args.candidate))
+    for candidate in selections:
+        name = candidate_name(candidate)
+        for profile in ("training", "deterministic"):
+            for rounds in dict.fromkeys(args.rounds):
+                directory = root / f"{profile}_rounds{rounds}_{name}"
+                cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "--diagnose-only",
+                       "--diagnostic-profile", profile, "--candidate", ",".join(candidate),
+                       "--repeats", str(args.repeats), "--verify-device", args.verify_device,
+                       "--rounds", str(rounds), "--output", str(directory)]
+                if args.activation_checkpointing:
+                    cmd.append("--activation-checkpointing")
+                print("\n" + shlex.join(cmd), flush=True)
+                if args.dry_run:
+                    continue
+                result = subprocess.run(cmd, cwd=ROOT, check=False)
+                result_dir = directory / name
+                summary = result_dir / f"diagnostic_summary_rounds{rounds}.json"
+                values = json.loads(summary.read_text(encoding="utf-8")) if summary.exists() else []
+                runs.append(dict(candidate=name, profile=profile, rounds=rounds,
+                                 returncode=result.returncode,
+                                 complete=len(values) == 2 * args.repeats))
+                rows.extend(dict(candidate=name, profile=profile, rounds=rounds, **row)
+                            for row in values)
+                evidence = result_dir / f"numerical_rounds{rounds}.json"
+                if evidence.exists():
+                    report = json.loads(evidence.read_text(encoding="utf-8"))
+                    fixtures[(name, profile, rounds)] = [report[key] for key in (
+                        "fixture_sha256", "initial_state_sha256", "matmul_precision", "matmul_tf32",
+                        "cudnn_tf32", "rtol", "atol", "activation_checkpointing", "edge_chunk_size"
+                    )]
+    if args.dry_run:
+        return
+    identical = all(
+        fixtures.get((candidate_name(c), "training", n)) is not None
+        and fixtures.get((candidate_name(c), "training", n))
+        == fixtures.get((candidate_name(c), "deterministic", n))
+        for c in selections for n in dict.fromkeys(args.rounds)
+    )
+    # Flags change execution only: compare fixture/state fingerprints across
+    # candidates too, even when their checkpointing policies legitimately differ.
+    same_inputs = all(len({tuple(v[:2]) for (name, profile, n), v in fixtures.items() if n == rounds}) == 1
+                      for rounds in dict.fromkeys(args.rounds))
+    lines = ["Diagnostic only: no training/performance measurements.",
+             "Normal CUDA repeatability and the deterministic gate are reported separately.",
+             "Same FP32/high/TF32 and unchanged elementwise tolerances; no failure is suppressed.",
+             "| candidate | profile | rounds | case | repeat | failed tensors | failed elements | self passed |",
+             "|---|---|---:|---|---:|---:|---:|---|"]
+    lines.extend(f"| {r['candidate']} | {r['profile']} | {r['rounds']} | {r['case']} | "
+                 f"{r['repeat']} | {r['failed_tensors']} | {r['failed_elements']} | "
+                 f"{r['self_repeat_passed']} |" for r in rows)
+    lines += [f"Identical fixtures/precision across profiles: {identical}",
+              f"Identical inputs/weights across candidates: {same_inputs}"]
+    (root / "diagnostic_profiles.json").write_text(json.dumps(dict(
+        runs=runs, identical_fixtures_and_precision=identical,
+        identical_inputs_and_weights_across_candidates=same_inputs, cases=rows
+    ), indent=2), encoding="utf-8")
+    (root / "summary.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("\n".join(lines), flush=True)
+    if not identical or not same_inputs or any(r["returncode"] or not r["complete"] for r in runs):
+        raise RuntimeError("Candidate diagnostic profiles completed with failures; inspect reports")
+
+
+def benchmark_candidates(root, args):
+    """Gate each candidate first, then run matching controls and its full epochs."""
+    plan, completed = {}, set()
+
+    def train_mode(rounds, name, candidate=(), checkpointing=False, reference=False, control=None):
+        run_name = f"rounds{rounds}_{name}"
+        if run_name in completed:
+            return
+        run_dir = root / run_name
+        plan[run_name] = dict(candidate=list(candidate), activation_checkpointing=checkpointing,
+                              reference=reference, control=control)
+        (root / "benchmark_plan.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
+        cmd = command(run_dir, rounds, reference, args.epochs, args.lmdb_dir, args.offline,
+                      candidate=candidate, activation_checkpointing=checkpointing)
+        if args.dry_run:
+            print(shlex.join(cmd), flush=True)
+        else:
+            run(cmd, run_dir)
+        completed.add(run_name)
+
+    for rounds in dict.fromkeys(args.rounds):
+        if args.include_reference:
+            # The existing reference is a separate comparison, not the control
+            # for candidates whose checkpoint policy might differ.
+            gate = [sys.executable, "-u", str(Path(__file__).resolve()), "--verify-only",
+                    "--verify-device", "cuda", "--rounds", str(rounds), "--repeats", str(args.repeats),
+                    "--output", str(root / f"verification_rounds{rounds}_legacy")]
+            if args.activation_checkpointing:
+                gate.append("--activation-checkpointing")
+            if not args.dry_run:
+                subprocess.run(gate, cwd=ROOT, check=True,
+                               env=dict(os.environ, CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"))
+            train_mode(rounds, "reference", checkpointing=args.activation_checkpointing, reference=True)
+        for candidate in dict.fromkeys(args.candidate):
+            name = candidate_name(candidate)
+            checkpointing = candidate_checkpointing(candidate, args.activation_checkpointing)
+            gate = [sys.executable, "-u", str(Path(__file__).resolve()), "--verify-only",
+                    "--verify-device", "cuda", "--candidate", ",".join(candidate),
+                    "--rounds", str(rounds), "--repeats", str(args.repeats),
+                    "--output", str(root / f"verification_rounds{rounds}_{name}")]
+            if args.activation_checkpointing:
+                gate.append("--activation-checkpointing")
+            print("\n" + shlex.join(gate), flush=True)
+            if not args.dry_run:
+                subprocess.run(gate, cwd=ROOT, check=True,
+                               env=dict(os.environ, CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"))
+            control_name = "optimized_checkpointed" if checkpointing else "optimized"
+            reference = f"rounds{rounds}_reference" if (args.include_reference
+                        and checkpointing == args.activation_checkpointing) else None
+            train_mode(rounds, control_name, checkpointing=checkpointing, control=reference)
+            train_mode(rounds, name, candidate, checkpointing,
+                       control=f"rounds{rounds}_{control_name}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rounds", type=int, nargs="+", default=[2], choices=(1, 2, 3))
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--include-reference", action="store_true")
+    parser.add_argument("--candidate", type=parse_candidate, action="append", default=[],
+                        metavar="NAME[,NAME...]",
+                        help="Repeat for separate A/Bs; comma-join for a combination; all enables all four")
+    parser.add_argument("--activation-checkpointing", action="store_true",
+                        help="Use matching G1new checkpointing for gate/control/candidate; "
+                             "checkpoint_relation_inputs also enables it automatically")
     parser.add_argument("--offline", action="store_true", help="W&B offline; training is unchanged")
     gate_mode = parser.add_mutually_exclusive_group()
     gate_mode.add_argument("--verify-only", action="store_true",
@@ -580,7 +784,10 @@ def main():
     }, indent=2), encoding="utf-8")
     try:
         if args.diagnose_only and args.diagnostic_profile == "both":
-            diagnose_profiles(root, args)
+            if args.candidate:
+                diagnose_candidates(root, args)
+            else:
+                diagnose_profiles(root, args)
             return
         if args.verify_only or args.diagnose_only:
             if not args.dry_run:
@@ -589,8 +796,20 @@ def main():
                 # This process exits before timed training is launched.
                 with diagnostic_policy(profile):
                     for rounds in dict.fromkeys(args.rounds):
-                        verify(root, rounds, args.verify_device, diagnose=args.diagnose_only,
-                               repeats=args.repeats)
+                        if args.candidate:
+                            for candidate in dict.fromkeys(args.candidate):
+                                directory = root / candidate_name(candidate)
+                                directory.mkdir(exist_ok=True)
+                                verify(directory, rounds, args.verify_device, diagnose=args.diagnose_only,
+                                       repeats=args.repeats, candidate=candidate,
+                                       activation_checkpointing=args.activation_checkpointing)
+                        else:
+                            verify(root, rounds, args.verify_device, diagnose=args.diagnose_only,
+                                   repeats=args.repeats,
+                                   activation_checkpointing=args.activation_checkpointing)
+            return
+        if args.candidate:
+            benchmark_candidates(root, args)
             return
         for rounds in dict.fromkeys(args.rounds):
             if not args.dry_run:
@@ -598,16 +817,20 @@ def main():
                 # the training child. The strict gate uses the same precision
                 # and tolerance, but a repeatable reduction policy. Its CUDA
                 # context/allocator is released before timed DDP training.
-                subprocess.run([
+                gate = [
                     sys.executable, "-u", str(Path(__file__).resolve()),
                     "--verify-only", "--verify-device", "cuda", "--rounds", str(rounds),
                     "--repeats", str(args.repeats),
                     "--output", str(root / f"verification_rounds{rounds}"),
-                ], cwd=ROOT, env=dict(os.environ, CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"),
-                   check=True)
+                ]
+                if args.activation_checkpointing:
+                    gate.append("--activation-checkpointing")
+                subprocess.run(gate, cwd=ROOT,
+                               env=dict(os.environ, CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"), check=True)
             for reference in ([True, False] if args.include_reference else [False]):
                 run_dir = root / f"rounds{rounds}_{'reference' if reference else 'optimized'}"
-                cmd = command(run_dir, rounds, reference, args.epochs, args.lmdb_dir, args.offline)
+                cmd = command(run_dir, rounds, reference, args.epochs, args.lmdb_dir, args.offline,
+                              activation_checkpointing=args.activation_checkpointing)
                 if args.dry_run:
                     print(shlex.join(cmd), flush=True)
                 else:
