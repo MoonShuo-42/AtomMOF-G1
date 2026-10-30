@@ -150,10 +150,13 @@ on a rank exception rather than silently train a different geometry.
   fixed. Shared relations and small node projections remain inputs. No stochastic
   operations occur in these regions. Checkpointing recomputes work in backward;
   the speed benchmark below explicitly keeps it disabled.
-* Environment/readback reduce all edge contributions once. Readback uses one
-  global segmented log-sum-exp; the null item is counted once per atom. There is
-  no per-chunk softmax. The previous streaming implementation remains available
-  for reference comparisons.
+* Environment/readback globally reduce scalar weights and vector messages
+  separately, preserving the reference reduction shapes and avoiding a second
+  `T*65` concatenated edge tensor. Readback uses one global segmented log-sum-exp;
+  its denominator starts with the null contribution **before** adding edge
+  weights, matching the reference's one-chunk order. The null item is counted
+  once per atom; there is no per-chunk softmax. The previous streaming
+  implementation remains available for reference comparisons.
 
 The new `model.flow_model_args.g1new.module.optimized` boolean defaults to `true`
 and changes only the local implementation. It is independent of the backbone's
@@ -287,7 +290,8 @@ self-repeat and the optimized comparison to pass under the original policy.
 
 Each profile compares a reference repeat, the current optimized path, three individual
 reassociations (affine heads, bond preprojection, environment addition), and
-their combination reproducing the withdrawn implementation. These ablations
+their combination. The historical `legacy_all` label restores those three
+reassociations on current pooling, not every layout/operator of `11d7480`. These ablations
 apply only to disposable diagnostic model copies. Precision policy and the
 original tolerance are identical for every comparison. Reports include failed
 element counts, worst-element values/allowed errors, edge order, and GPU/Torch
@@ -302,6 +306,28 @@ script always packages completed reports, including on numerical failure, and
 records unsupported-operator exceptions in `diagnostic_error.json`. A failed
 profile retains a nonzero exit status; deterministic success alone does not
 override a training-policy failure. Do not bypass the gate to collect timings.
+
+The five-repeat L40S report for `17019b1` separated repeat variation from stable
+implementation differences. With the ordinary policy, the reference repeat
+failed 25--51 elements and the optimized path failed 25--51. With deterministic
+algorithms, all reference/self-repeat differences were exactly zero, but the
+optimized path consistently failed six elements: one lattice gradient and five
+elements of `bridges.24.output_projection.weight`. The largest normalized error
+ratios in these tensors were 1.056 and 1.262 against the unchanged threshold.
+No nonfinite values or changed edges were observed. The three withdrawn affine
+reorders remain disabled; their deterministic failures were larger.
+
+The current pooling fix restores the null-first denominator and separate
+scalar/vector reductions. A CPU one-chunk readback regression now requires
+bitwise equal forward results against the retained reference, with gradients
+also checked, both with and without activation checkpointing. This removes a
+reproduced rounding-order difference; it does **not** establish that all six
+CUDA failures are fixed. Recheck on L40S without widening tolerances:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u scripts/benchmark_g1new_execution.py \
+  --diagnose-only --diagnostic-profile deterministic --rounds 2 --repeats 5
+```
 
 For the server performance target, use the B32/accumulation-2 control, four sites
 and two internal rounds. All activation checkpointing is explicitly disabled.

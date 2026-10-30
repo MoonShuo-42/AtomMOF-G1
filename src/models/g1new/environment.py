@@ -48,8 +48,14 @@ class EnvironmentUpdate(nn.Module):
 
     def _pool(self, heads, omega, env, count):
         p = omega * torch.sigmoid(heads[:, 0])
-        messages = torch.cat((p[:, None], p[:, None] * heads[:, 1:]), dim=-1)
-        return heads.new_zeros((count, self.width + 1)).index_add(0, env, messages)
+        # Keep the reference's scalar/vector reduction shapes. Packing both
+        # into T*65 changes CUDA reduction layout and allocates another large
+        # edge tensor. Two global reductions still avoid per-chunk scattering.
+        mass = heads.new_zeros(count).index_add(0, env, p)
+        numerator = heads.new_zeros((count, self.width)).index_add(
+            0, env, p[:, None] * heads[:, 1:]
+        )
+        return mass, numerator
 
     def forward(self, state, projected, edges, chi, chunk_size, checkpointing, *, head_map=None):
         if self.optimized:
@@ -78,13 +84,13 @@ class EnvironmentUpdate(nn.Module):
                     )
                     return self._pool(heads, omega, edges.env, state.shape[0])
 
-                # Checkpoint through the weighted aggregation, returning M*65,
+                # Checkpoint through the weighted aggregation, returning M + M*64,
                 # not T*65 heads/values or T*128 projected hidden activations.
                 pooled = recompute(
                     pool, checkpointing, chi, atom_projection, env_projection, edges.omega
                 )
-            # One global reduction, including the null item only once per environment.
-            mass, numerator = pooled[:, 0], pooled[:, 1:]
+            # Global scalar/vector reductions, one null item per environment.
+            mass, numerator = pooled
             u = numerator / (1 + mass[:, None])
             q = torch.cat((state, u, torch.log1p(mass)[:, None]), -1)
             delta = self.update(self.update_norm(q))

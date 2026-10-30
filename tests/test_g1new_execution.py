@@ -151,6 +151,34 @@ def synthetic_edges(count, atoms=32, anchors=16, dtype=torch.float32):
 
 
 @pytest.mark.parametrize("checkpointing", [False, True])
+def test_readback_single_chunk_preserves_null_first_reference_order(checkpointing):
+    from src.models.g1new.readback import AtomReadback
+
+    torch.manual_seed(842)
+    actual = AtomReadback()
+    reference = deepcopy(actual)
+    reference.optimized = False
+    edges = synthetic_edges(1031)
+    # Receiver 32 has no edges; null-only receivers must still return exact zero.
+    features = torch.randn(33, 64)
+    state = torch.randn(16, 64)
+    chi = torch.randn(1031, 32)
+    inputs = [[v.clone().requires_grad_() for v in (features, state, chi)] for _ in range(2)]
+    outputs = [model(x, s, edges, c, chunk, checkpointing)
+               for model, (x, s, c), chunk in zip((actual, reference), inputs, (65536, 8192))]
+    # Both fit in one chunk. The old edge-first denominator differed even on CPU.
+    torch.testing.assert_close(*outputs, rtol=0, atol=0)
+    assert torch.count_nonzero(outputs[0][-1]) == 0
+    weight = torch.randn_like(outputs[0])
+    for output in outputs:
+        (output * weight).sum().backward()
+    for a, b in zip(*inputs):
+        torch.testing.assert_close(a.grad, b.grad, rtol=1e-6, atol=1e-7)
+    for (name, a), (_, b) in zip(actual.named_parameters(), reference.named_parameters()):
+        torch.testing.assert_close(a.grad, b.grad, msg=name, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize("checkpointing", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_all_six_bond_projections_match_dense_encoder(checkpointing, dtype):
     torch.manual_seed(631)

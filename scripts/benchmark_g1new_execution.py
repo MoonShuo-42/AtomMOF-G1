@@ -59,10 +59,11 @@ def compare_tensors(name, reference, actual, rtol=0.003, atol=0.0002):
 
 
 def diagnostic_reassociation(model, *, heads=False, bonds=False, environment=False):
-    """Restore 11d7480 operations on a disposable probe, never a training model.
+    """Restore selected affine reorders on a disposable probe, never training.
 
     Test one factor at a time without changing tensor dtype, TF32 or tolerances.
-    The combined case reconstructs all three reassociations from the failed run.
+    The combined case restores all three reassociations, keeping current pooling.
+    It does not reconstruct every operator/layout in the historical commit.
     """
     from types import MethodType
     import torch
@@ -107,7 +108,7 @@ def diagnostic_reassociation(model, *, heads=False, bonds=False, environment=Fal
             head_map = self.messages.head_map(self.heads)
         scores = split_apply(head_map, chunk_size, False, hidden)
         pooled = self._pool(scores, edges.omega, edges.env, state.shape[0])
-        mass, numerator = pooled[:, 0], pooled[:, 1:]
+        mass, numerator = pooled
         u = numerator / (1 + mass[:, None])
         q = torch.cat((state, u, torch.log1p(mass)[:, None]), -1)
         return state + (mass / (1 + mass))[:, None] * self.update(self.update_norm(q))

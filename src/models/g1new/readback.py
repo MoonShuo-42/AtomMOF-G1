@@ -36,11 +36,14 @@ class AtomReadback(nn.Module):
                 0, atom, logits.detach(), reduce="amax", include_self=True
             )
         weights = (logits - maximum.index_select(0, atom)).exp()
-        messages = torch.cat((weights[:, None], weights[:, None] * heads[:, 1:]), -1)
-        pooled = heads.new_zeros((count, self.width + 1)).index_add(0, atom, messages)
-        # A single global log-sum-exp: the null logit is zero, value is zero.
-        denominator = (-maximum).exp() + pooled[:, 0]
-        return pooled[:, 1:] / denominator[:, None]
+        # Match the reference's null-first denominator and separate scalar/
+        # vector reductions. Adding the null AFTER reducing all edges changes
+        # rounding even in the one-chunk case. Avoid a second T*65 allocation.
+        denominator = (-maximum).exp().index_add(0, atom, weights)
+        numerator = heads.new_zeros((count, self.width)).index_add(
+            0, atom, weights[:, None] * heads[:, 1:]
+        )
+        return numerator / denominator[:, None]
 
     def forward(self, features, state, edges, chi, chunk_size, checkpointing):
         atom_projection = self.messages.project(features, 0)
