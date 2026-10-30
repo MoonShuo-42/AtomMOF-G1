@@ -237,3 +237,70 @@ def test_three_adam_updates_keep_parameter_and_optimizer_states(checkpointing):
             for key in a:
                 torch.testing.assert_close(a[key], b[key], msg=name + "." + key,
                                            rtol=1e-7, atol=1e-8)
+
+
+def test_numerical_report_does_not_replace_elementwise_gate_with_global_l2():
+    from scripts.benchmark_g1new_execution import compare_tensors
+
+    row = compare_tensors("cancellation", torch.tensor([1000., 0.]),
+                          torch.tensor([1000., 0.0003]))
+    assert row["relative_l2"] < 0.003
+    assert not row["passed"] and row["failed_elements"] == 1
+    assert row["worst"]["flat_index"] == 1
+    assert row["worst"]["allowed_error"] == pytest.approx(0.0002)
+    assert row["max_tolerance_ratio"] == pytest.approx(1.5)
+
+
+@pytest.mark.parametrize("actual", [[1.001, 0.0001], [1.01, 0.], [float("nan"), 0.],
+                                    [float("inf"), 0.]])
+def test_numerical_report_preserves_tolerance_and_rejects_nonfinite(actual):
+    import json
+    from scripts.benchmark_g1new_execution import compare_tensors
+
+    reference, value = torch.tensor([1., 0.]), torch.tensor(actual)
+    row = compare_tensors("test", reference, value)
+    expected = bool(torch.allclose(value, reference, rtol=0.003, atol=0.0002)
+                    and torch.isfinite(value).all())
+    assert row["passed"] == expected
+    json.dumps(row, allow_nan=False)
+
+
+@pytest.mark.parametrize("changes", [dict(heads=True), dict(bonds=True), dict(environment=True),
+                                     dict(heads=True, bonds=True, environment=True)])
+def test_diagnostic_factors_preserve_equations_parameters_and_precision(changes):
+    from scripts.benchmark_g1new_execution import diagnostic_reassociation
+
+    torch.manual_seed(643)
+    config = new_config(checkpoint=False, chunk=7)
+    config.pop("enabled")
+    config["insert_after"] = [6, 12, 18, 24]
+    expected = G1NewBridge(h_dim=16, depth=24, **config).double()
+    perturb(expected)
+    actual = deepcopy(expected)
+    policy = (torch.get_float32_matmul_precision(), torch.backends.cuda.matmul.allow_tf32,
+              torch.backends.cudnn.allow_tf32)
+    diagnostic_reassociation(actual, **changes)
+    assert policy == (torch.get_float32_matmul_precision(), torch.backends.cuda.matmul.allow_tf32,
+                      torch.backends.cudnn.allow_tf32)
+    for name, parameter in expected.state_dict().items():
+        assert torch.equal(parameter, actual.state_dict()[name])
+    H, t, feats, x, lattice = branch_inputs(torch.float64)
+    weight = torch.randn_like(H)
+    outputs = []
+    for model in (expected, actual):
+        context = model.prepare(feats, x, lattice)
+        hidden = H
+        for position in model.insert_after:
+            hidden = model(position, hidden, t, context)
+        outputs.append(hidden)
+        (hidden * weight).sum().backward()
+    torch.testing.assert_close(*outputs, rtol=1e-8, atol=1e-9)
+    for (name, p), (_, q) in zip(expected.named_parameters(), actual.named_parameters()):
+        torch.testing.assert_close(p.grad, q.grad, msg=name, rtol=1e-7, atol=1e-8)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires actual CUDA FP32/high/TF32")
+def test_cuda_numerical_gate_under_training_precision(tmp_path):
+    from scripts.benchmark_g1new_execution import verify
+
+    verify(tmp_path, 2, "cuda")

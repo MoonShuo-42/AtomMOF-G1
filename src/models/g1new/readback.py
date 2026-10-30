@@ -46,7 +46,7 @@ class AtomReadback(nn.Module):
         atom_projection = self.messages.project(features, 0)
         env_projection = self.messages.project(state, 1)
         if self.optimized:
-            head_map = self.messages.fused_heads(self.heads)
+            head_map = self.messages.head_map(self.heads)
             if checkpointing:
                 def readback(relation, atom_projection, env_projection, omega):
                     def edge_heads(part, atom, env):

@@ -1,9 +1,17 @@
 """Independent edge participation and two shared-weight environment updates."""
 
+from typing import NamedTuple
+
 import torch
 from torch import nn
 
 from .layers import JointMLP, edge_slices, mlp, recompute, split_apply
+
+
+class PreparedEnvironment(NamedTuple):
+    atom: torch.Tensor
+    anchor: torch.Tensor
+    relation: torch.Tensor
 
 
 class EnvironmentUpdate(nn.Module):
@@ -26,12 +34,9 @@ class EnvironmentUpdate(nn.Module):
             anchor_features = features.index_select(0, anchors)
         anchor = self.messages.project(anchor_features, 1)
         if self.optimized and edges is not None and not checkpointing:
-            # These contributions do not depend on the evolving environment state.
-            # Gather/project ONCE, with one scatter backward per source tensor.
-            return (
-                atom.index_select(0, edges.atom) + anchor.index_select(0, edges.env)
-                + self.messages.project(chi, 3, bias=True)
-            )
+            # Cache the invariant relation projection, but keep the original
+            # atom + (anchor + state) + relation addition order in every round.
+            return PreparedEnvironment(atom, anchor, self.messages.project(chi, 3, bias=True))
         return atom, anchor
 
     def _chunk(self, atom_projection, env_projection, chi, atom, env, omega):
@@ -49,9 +54,12 @@ class EnvironmentUpdate(nn.Module):
     def forward(self, state, projected, edges, chi, chunk_size, checkpointing, *, head_map=None):
         if self.optimized:
             if head_map is None:
-                head_map = self.messages.fused_heads(self.heads)
-            if isinstance(projected, torch.Tensor):
-                hidden = projected + self.messages.project(state, 2).index_select(0, edges.env)
+                head_map = self.messages.head_map(self.heads)
+            if isinstance(projected, PreparedEnvironment):
+                env_projection = projected.anchor + self.messages.project(state, 2)
+                hidden = projected.atom.index_select(0, edges.atom)
+                hidden = hidden + env_projection.index_select(0, edges.env)
+                hidden = hidden + projected.relation
                 heads = split_apply(head_map, chunk_size, checkpointing, hidden)
                 pooled = self._pool(heads, edges.omega, edges.env, state.shape[0])
             else:

@@ -123,25 +123,25 @@ on a rank exception rather than silently train a different geometry.
   inference cache.
 * Unlearned RBF/direction/same-block edge features are shared across sites. Bond
   embeddings and relation MLPs still have independent parameters at every site.
-  Project each of the six bond embeddings through its part of the relation
-  linear once per site, then gather the projected rows. Geometry and bond terms
-  meet before the original SiLU. This removes per-edge 28-channel concatenation
-  and repeated 8-to-64 bond projection; all embedding and MLP gradients remain.
+  Geometry and bond embeddings pass through the original joint 28-channel
+  linear. The first optimization's six-row bond preprojection is withdrawn
+  while investigating CUDA gradient differences; its split GEMMs introduced
+  different rounding points under the existing FP32/high/TF32 policy.
 * Geometry compacts valid indices once, reuses integer layouts and validates bond
   classes once on the same valid support. Larger pair/image chunks reduce CUDA
   launches and host reads. Float64 search decisions, exact chemical nearest-image
   ties, cutoff, invalid-cell behavior and fail-fast budgets are unchanged.
-* Gather static atom/anchor/relation projections once per site and reuse them
-  across internal rounds when checkpointing is disabled. Anchor features are
-  also reused by initialization/projection, and the large static edge projection
-  is released before readback. Chunked edge maps use `split` rather than
+* Compute atom/anchor node projections and the invariant relation projection
+  once per site when checkpointing is disabled. Reuse them across rounds, while
+  preserving the reference addition order: atom + (anchor + state) + relation.
+  Anchor features are also reused by initialization/projection, and the cached
+  projections are released before readback. Chunked edge maps use `split` rather than
   independent slices, avoiding repeated full-edge-size slice-gradient allocation.
   A single/empty chunk returns directly without a redundant concatenation/copy.
-* The last message linear and its following score/value linear are algebraically
-  composed per forward. Both original parameter tensors/biases receive gradients;
-  the SiLU stays in its original position. There is no persistent fused-weight
-  cache, replaced parameter, weight tying, detach or optimizer-state migration.
-  Each site's environment head composition is reused across its internal rounds.
+* The last message linear and following score/value linear run separately in
+  their original order. Their algebraic weight composition is withdrawn pending
+  CUDA diagnosis. Parameter tensors, biases and the SiLU are unchanged; no
+  parameter replacement, weight tying, detach or optimizer-state migration.
 * Sparse packed anchors/edges, bounded pair/image/edge chunks. Optional
   non-reentrant checkpointing covers edge projection, nonlinear heads, weighted
   reduction and readback normalization, returning small per-environment/atom
@@ -243,23 +243,40 @@ failures. The implementation changes are confined to G1-New: no optimized
 backbone, legacy G1, shared execution, loss, optimizer or entry-point edits.
 The review additionally checks all six bond classes, the backing storage of
 saved checkpoint tensors (not just the shapes of small views), and three AdamW
-updates including optimizer moments. No fused tensors survive into the next
+updates including optimizer moments. No activation caches survive into the next
 forward/optimizer step. The server numerical gate exercises all bond classes.
 
-A CPU synthetic probe of **one site**, two rounds and 12,000 edges (supplied
-conditions/geometry; no search) measured unique saved activation storage:
+The CUDA report for commit `11d7480` (two rounds) had identical edge sets and
+forward maximum absolute error 3.67e-5, but 9 of 158 tensor comparisons failed
+the elementwise gradient tolerance (rtol=0.003, atol=0.0002). No training epochs
+ran after that failure. Small whole-tensor relative L2 errors do not override
+an elementwise failure. This evidence does not isolate which rearrangement
+caused the differences or establish that they are harmless to training.
 
-| G1-New checkpointing | First optimization | Reviewed implementation |
-| --- | ---: | ---: |
-| disabled | 64.00 MiB | 63.59 MiB |
-| enabled | 40.47 MiB | 4.46 MiB |
+The current implementation restores affine boundaries, the joint relation
+linear, and the environment addition order. Search/index reuse, shared raw
+geometry features, split-based chunking and global pooling remain. CUDA must
+be checked again; CPU parity does not establish CUDA parity or GPU speed.
 
-These are saved forward activations, excluding parameters/inputs. They are
-**not** GPU peak allocated/reserved measurements or full-model memory claims.
-With checkpointing disabled, the same probe reduced concatenation calls from
-17 to 12 and matrix multiplication calls (`mm` + `addmm`, forward/backward)
-from 90 to 87. CUDA dispatch, wall time and the 120-second goal still need the
-actual 8-card benchmark; no epoch speedup is inferred from these CPU counts.
+Run the single-GPU diagnosis first (no training epochs):
+
+```bash
+cd /data/ai4science/AtomMOF-G1 || exit 1
+export PROJECT_ROOT="$PWD"
+CUDA_VISIBLE_DEVICES=0 python -u scripts/benchmark_g1new_execution.py \
+  --diagnose-only --rounds 2
+```
+
+It compares a reference repeat, the current optimized path, three individual
+reassociations (affine heads, bond preprojection, environment addition), and
+their combination reproducing the withdrawn implementation. These ablations
+apply only to disposable diagnostic model copies. Precision policy and the
+original tolerance are identical for every comparison. Reports include failed
+element counts, worst-element values/allowed errors, edge order, and GPU/Torch
+metadata. The reference repeat and current optimized path must pass; failures
+of intentionally restored legacy ablations are recorded without preventing
+the other comparisons. The script always packages completed reports, including
+on numerical failure. Do not bypass the gate to collect training timings.
 
 For the server performance target, use the B32/accumulation-2 control, four sites
 and two internal rounds. All activation checkpointing is explicitly disabled.

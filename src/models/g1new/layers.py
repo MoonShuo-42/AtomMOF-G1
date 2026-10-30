@@ -33,19 +33,16 @@ class JointMLP(nn.Module):
     def finish(self, summed):
         return self.last(F.silu(summed))
 
-    def fused_heads(self, heads):
-        """Compose consecutive affine maps, retaining BOTH original parameters.
+    def head_map(self, heads):
+        """Keep the reference's two affine operations and their rounding points.
 
-        There is no activation between last and heads. Compute the small weight
-        product once per call, not the intermediate 64-channel tensor per edge.
-        Autograd differentiates through this product; nothing is detached/cached
-        across forwards and the nonlinear SiLU remains in its original location.
+        The CUDA gradient gate failed with reassociation enabled. Restore the
+        original order while isolating its contributors. Reuse the execution
+        map, not a learned-weight product.
         """
-        weight = heads.weight @ self.last.weight
-        bias = F.linear(self.last.bias, heads.weight, heads.bias)
 
         def apply(hidden):
-            return F.linear(F.silu(hidden), weight, bias)
+            return heads(self.finish(hidden))
 
         return apply
 

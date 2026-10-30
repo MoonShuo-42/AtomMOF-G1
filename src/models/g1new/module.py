@@ -102,10 +102,10 @@ class G1NewModule(nn.Module):
                 features, edges.anchors, edges, chi,
                 checkpointing=checkpointing, anchor_features=anchor_features,
             )
-            # These two small composed affine tensors do not depend on the
-            # evolving state. Build once per site/forward, never persist them.
+            # Reuse a callable with the reference's affine operation order.
+            # Do not pre-multiply learned weights under the TF32 policy.
             head_map = (
-                self.environment.messages.fused_heads(self.environment.heads)
+                self.environment.messages.head_map(self.environment.heads)
                 if self.optimized else None
             )
             for _ in range(self.rounds):

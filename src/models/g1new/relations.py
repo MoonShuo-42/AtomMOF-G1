@@ -2,7 +2,6 @@
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from .layers import edge_slices, mlp, recompute, split_apply
 
@@ -33,18 +32,10 @@ class RelationEncoder(nn.Module):
         if self.optimized:
             if geometry_features is None:
                 geometry_features = self.geometry_features(edges)
-            # Project the SIX bond embeddings once, instead of applying that
-            # part of the first linear to every edge's 8-channel embedding.
-            # The original embedding/MLP parameters and their gradients remain.
-            first = self.network[0]
-            bond_projection = F.linear(self.bond_embedding.weight, first.weight[:, 20:])
-
-            def encode(geometry, bond):
-                hidden = F.linear(geometry, first.weight[:, :20], first.bias)
-                hidden = hidden + F.embedding(bond, bond_projection)
-                return self.network[2](self.network[1](hidden))
-
-            return split_apply(encode, chunk_size, checkpointing, geometry_features, edges.bond)
+            # Keep the reference's joint 28-channel linear reduction. Splitting
+            # it into geometry/bond GEMMs changes FP32/TF32 rounding points.
+            inputs = torch.cat((geometry_features, self.bond_embedding(edges.bond)), -1)
+            return split_apply(self.network, chunk_size, checkpointing, inputs)
         return torch.cat(
             [
                 recompute(
