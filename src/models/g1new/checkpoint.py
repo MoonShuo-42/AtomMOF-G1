@@ -17,7 +17,6 @@ def load_g1new_pretrained(model, checkpoint_path):
     prefix = "structure_module.flow_model."
     new_prefix = prefix + "g1new_bridge."
     old_prefix = prefix + "g1_bridges."
-    condition_prefix = new_prefix + "module.condition_encoder."
     target = model.state_dict()
     if not any(key.startswith(new_prefix) for key in target):
         raise ValueError("pretrained_g1new_transfer requires an enabled G1-New target")
@@ -58,13 +57,16 @@ def load_g1new_pretrained(model, checkpoint_path):
                 raise ValueError("Legacy G1 shared condition aliases disagree")
             condition[suffix] = value
     if any(key.startswith(old_prefix) for key in source):
-        expected = {
-            key[len(condition_prefix) :] for key in target if key.startswith(condition_prefix)
+        condition_targets = {
+            key: key.split(".condition_encoder.", 1)[1]
+            for key in target
+            if key.startswith(new_prefix) and ".condition_encoder." in key
         }
+        expected = {suffix for suffix in condition_targets.values()}
         if condition.keys() != expected:
             raise ValueError("Legacy G1 condition encoder does not match the G1-New encoder")
-        for suffix, value in condition.items():
-            checked_copy(condition_prefix + suffix, value)
+        for key, suffix in condition_targets.items():
+            checked_copy(key, condition[suffix])
     model.load_state_dict(replacement, strict=True)
     return dict(
         backbone_tensors=len(backbone),

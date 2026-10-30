@@ -63,7 +63,7 @@ class G1NewModule(nn.Module):
     def encode_condition(self, feats: Mapping):
         return self.condition_encoder(feats)
 
-    def forward(self, H, t, feats, edges, condition):
+    def forward(self, H, t, feats, edges, condition, *, time_features=None):
         mask = feats["atom_pad_mask"].bool()
         if H.shape != (*mask.shape, self.h_dim) or t.shape != (H.shape[0],):
             raise ValueError("g1new expects H=(B,N,h_dim) and t=(B,)")
@@ -77,7 +77,11 @@ class G1NewModule(nn.Module):
             c = condition.masked_fill(~active[..., None], 0)
             a = self.atom_projection(self.atom_norm(safe_H))
             c = self.condition_projection(c)
-            time = self.time_embedding(t)[:, None].expand(-1, H.shape[1], -1)
+            if time_features is None:
+                time_features = self.time_embedding(t)
+            if time_features.shape != (H.shape[0], self.time_embedding.dim):
+                raise ValueError("g1new time_features must match the expanded batch")
+            time = time_features[:, None].expand(-1, H.shape[1], -1)
             features = self.atom_features(torch.cat((a, c, time), -1))
             features = features.masked_fill(~active[..., None], 0).flatten(0, 1)
             checkpointing = self.activation_checkpointing and self.training

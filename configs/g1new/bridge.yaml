@@ -6,6 +6,7 @@ defaults:
 _target_: builtins.dict
 _recursive_: false
 enabled: false
-insert_after: 12
+# Number of modules is the length of this sorted, unique list.
+insert_after: [6, 12, 18, 24]
 module:
   h_dim: ${model.token_s}

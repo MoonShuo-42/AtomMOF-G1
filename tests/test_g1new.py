@@ -150,7 +150,9 @@ from src.data.execution_features import prepare_execution_layouts
         inspect.getsource(f) for f in (flow_args, feats, inputs, perturb, loss, new_config)
     )
     script += r"""
-model = FlowModule(**flow_args(), g1new=new_config())
+config = new_config()
+config['insert_after'] = [6, 12, 18, 24]
+model = FlowModule(**flow_args(), g1new=config)
 perturb(model)
 configure_execution(model, dict(prepared_layouts=True, fused_pair_features=True))
 data = inputs()
@@ -459,13 +461,14 @@ def test_hydra_config_and_parameter_registration():
     model = instantiate(cfg.model)
     flow = model.structure_module.flow_model
     assert flow.g1new_enabled and not flow.g1_enabled and flow.g1_bridges is None
-    module = flow.g1new_bridge.module
+    group = flow.g1new_bridge
+    module = group.first_bridge
+    assert group.insert_after == (6, 12, 18, 24)
     assert module.width == 64 and module.rounds == 2
     assert module.condition_encoder.hidden_dim == 128
     assert len(module.condition_encoder.blocks) == 1
-    assert sum(p.numel() for p in flow.parameters()) == 38376320 + sum(
-        p.numel() for p in module.parameters()
-    )
+    assert sum(p.numel() for p in flow.parameters()) == 39_479_632
+    assert sum(p.numel() for p in group.parameters()) == 1_103_312
     assert sum(p.numel() for p in module.parameters()) == 556340
 
 
@@ -563,7 +566,8 @@ def test_legacy_condition_transfer_and_rejection(tmp_path):
         load_g1new_pretrained(target, path)
 
 
-def test_real_lightning_train_save_resume_and_sampling(tmp_path):
+@pytest.mark.parametrize("positions", [12, [6, 12, 18, 24]])
+def test_real_lightning_train_save_resume_and_sampling(tmp_path, positions):
     from test_g1_integration import TinyDataset
     from torch.utils.data import DataLoader
 
@@ -571,6 +575,7 @@ def test_real_lightning_train_save_resume_and_sampling(tmp_path):
 
     args = model_args(False)
     args["flow_model_args"]["g1new"] = new_config()
+    args["flow_model_args"]["g1new"]["insert_after"] = positions
     args["flow_process_args"]["prior_sampler"] = PriorSampler(
         [CartCoordsSampler(), LatticeSampler()]
     )
@@ -628,7 +633,9 @@ def _ddp_worker(rank, path):
         timeout=timedelta(seconds=90),
     )
     try:
-        model = FlowModule(**flow_args(), g1new=new_config()).train()
+        config = new_config()
+        config["insert_after"] = [6, 12, 18, 24]
+        model = FlowModule(**flow_args(), g1new=config).train()
         perturb(model)
         wrapped = DistributedDataParallel(model, find_unused_parameters=False)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
@@ -642,7 +649,7 @@ def _ddp_worker(rank, path):
                 p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()
             )
             optimizer.step()
-        value = model.g1new_bridge.module.output_projection.weight.detach().clone()
+        value = model.g1new_bridge.first_bridge.output_projection.weight.detach().clone()
         other = value.clone()
         dist.broadcast(other, 0)
         torch.testing.assert_close(value, other, rtol=0, atol=0)
