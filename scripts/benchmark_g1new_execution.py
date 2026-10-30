@@ -3,6 +3,8 @@
 No backbone, precision, batch, geometry cutoff or architecture ablations.
 Default: four sites, two internal rounds, two complete epochs on eight GPUs.
 Use --include-reference for a same-code, same-data old/new implementation pair.
+The numerical gate uses deterministic algorithms in an isolated child process;
+training retains its original execution policy and the same FP32/high/TF32.
 """
 
 import argparse
@@ -539,13 +541,14 @@ def main():
     parser.add_argument("--include-reference", action="store_true")
     parser.add_argument("--offline", action="store_true", help="W&B offline; training is unchanged")
     gate_mode = parser.add_mutually_exclusive_group()
-    gate_mode.add_argument("--verify-only", action="store_true")
+    gate_mode.add_argument("--verify-only", action="store_true",
+                           help="Deterministic reference/optimized gate; never train")
     gate_mode.add_argument("--diagnose-only", action="store_true",
                            help="Repeat the reference and isolate three operation reorders; never train")
     parser.add_argument("--diagnostic-profile", choices=("both", "training", "deterministic"),
                         default="both", help="Only for --diagnose-only; both uses fresh child processes")
     parser.add_argument("--repeats", type=int, default=5,
-                        help="Repeated comparisons per case for --diagnose-only (default 5)")
+                        help="Repeated comparisons per numerical gate/diagnostic case (default 5)")
     parser.add_argument("--verify-device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -579,24 +582,29 @@ def main():
         if args.diagnose_only and args.diagnostic_profile == "both":
             diagnose_profiles(root, args)
             return
+        if args.verify_only or args.diagnose_only:
+            if not args.dry_run:
+                profile = "deterministic" if args.verify_only else args.diagnostic_profile
+                # Enter once before CUDA initialization, also for --rounds 1 2 3.
+                # This process exits before timed training is launched.
+                with diagnostic_policy(profile):
+                    for rounds in dict.fromkeys(args.rounds):
+                        verify(root, rounds, args.verify_device, diagnose=args.diagnose_only,
+                               repeats=args.repeats)
+            return
         for rounds in dict.fromkeys(args.rounds):
             if not args.dry_run:
-                if args.diagnose_only:
-                    with diagnostic_policy(args.diagnostic_profile):
-                        verify(root, rounds, args.verify_device, diagnose=True, repeats=args.repeats)
-                elif args.verify_only:
-                    verify(root, rounds, args.verify_device)
-                else:
-                    # Exit the verification process before training: its CUDA
-                    # context and allocator must not occupy GPU 0 during timing.
-                    subprocess.run([
-                        sys.executable, "-u", str(Path(__file__).resolve()),
-                        "--verify-only", "--verify-device", "cuda", "--rounds", str(rounds),
-                        "--output", str(root / f"verification_rounds{rounds}"),
-                    ], cwd=ROOT, env=dict(os.environ, CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"),
-                       check=True)
-            if args.verify_only or args.diagnose_only:
-                continue
+                # Do not set deterministic flags/workspace in this parent or
+                # the training child. The strict gate uses the same precision
+                # and tolerance, but a repeatable reduction policy. Its CUDA
+                # context/allocator is released before timed DDP training.
+                subprocess.run([
+                    sys.executable, "-u", str(Path(__file__).resolve()),
+                    "--verify-only", "--verify-device", "cuda", "--rounds", str(rounds),
+                    "--repeats", str(args.repeats),
+                    "--output", str(root / f"verification_rounds{rounds}"),
+                ], cwd=ROOT, env=dict(os.environ, CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"),
+                   check=True)
             for reference in ([True, False] if args.include_reference else [False]):
                 run_dir = root / f"rounds{rounds}_{'reference' if reference else 'optimized'}"
                 cmd = command(run_dir, rounds, reference, args.epochs, args.lmdb_dir, args.offline)

@@ -329,9 +329,84 @@ def test_diagnostic_factors_preserve_equations_parameters_and_precision(changes)
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires actual CUDA FP32/high/TF32")
 def test_cuda_numerical_gate_under_training_precision(tmp_path):
-    from scripts.benchmark_g1new_execution import verify
+    _check_gate_subprocess(tmp_path, "cuda", [2])
 
-    verify(tmp_path, 2, "cuda")
+
+def _check_gate_subprocess(tmp_path, device, rounds):
+    import json
+    import subprocess
+    import sys
+    from scripts.benchmark_g1new_execution import ROOT
+
+    output = tmp_path / "gate"
+    subprocess.run([
+        sys.executable, "-B", str(ROOT / "scripts/benchmark_g1new_execution.py"),
+        "--verify-only", "--verify-device", device, "--rounds", *map(str, rounds),
+        "--repeats", "2", "--output", str(output),
+    ], cwd=ROOT, check=True, capture_output=True, text=True, timeout=180)
+    for n in rounds:
+        report = json.loads((output / f"numerical_rounds{n}.json").read_text())
+        repeat = json.loads((output / f"numerical_rounds{n}_repeat02.json").read_text())
+        assert report["passed"] and repeat["passed"] and repeat["self_repeat_passed"]
+        assert report["deterministic_algorithms"] and not report["deterministic_warn_only"]
+        assert report["cublas_workspace_config"] == ":4096:8"
+        assert report["matmul_precision"] == "high"
+        assert report["matmul_tf32"] and report["cudnn_tf32"]
+        assert report["rtol"] == 0.003 and report["atol"] == 0.0002
+    assert (output / "reports.tar.gz").is_file()
+
+
+def test_cpu_gate_cli_checks_multiple_rounds_in_one_process(tmp_path):
+    _check_gate_subprocess(tmp_path, "cpu", [1, 2])
+
+
+@pytest.mark.parametrize("gate_passes", [False, True])
+def test_training_requires_gate_and_preserves_parent_policy(tmp_path, monkeypatch, gate_passes):
+    import os
+    from types import SimpleNamespace
+    from scripts import benchmark_g1new_execution as runner
+
+    output = tmp_path / "benchmark"
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    original_flags = (torch.are_deterministic_algorithms_enabled(),
+                      torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark)
+    monkeypatch.setattr(runner.sys, "argv", ["benchmark", "--rounds", "2", "--epochs", "2",
+                                          "--repeats", "2", "--output", str(output)])
+    events = []
+
+    def fake_subprocess(cmd, **kwargs):
+        if cmd[0] == "git":
+            return SimpleNamespace(stdout=b"", returncode=0)
+        assert "--verify-only" in cmd
+        assert cmd[cmd.index("--repeats") + 1] == "2"
+        assert kwargs["check"]
+        events.append("gate")
+        if not gate_passes:
+            raise runner.subprocess.CalledProcessError(1, cmd)
+        return SimpleNamespace(returncode=0)
+
+    def fake_train(cmd, directory):
+        assert events == ["gate"]
+        assert "++trainer.precision=32-true" in cmd
+        assert "trainer.accumulate_grad_batches=2" in cmd
+        assert "data.dynamic.max_batch_size=32" in cmd
+        assert original_flags == (torch.are_deterministic_algorithms_enabled(),
+                                  torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark)
+        assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":16:8"
+        events.append("train")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_subprocess)
+    monkeypatch.setattr(runner, "run", fake_train)
+    monkeypatch.setattr(runner, "summarize", lambda *args: None)
+    if gate_passes:
+        runner.main()
+        assert events == ["gate", "train"]
+    else:
+        with pytest.raises(runner.subprocess.CalledProcessError):
+            runner.main()
+        assert events == ["gate"]
+        assert (output / "diagnostic_error.json").is_file()
+    assert (output / "reports.tar.gz").is_file()
 
 
 @pytest.mark.parametrize("profile", ["training", "deterministic"])

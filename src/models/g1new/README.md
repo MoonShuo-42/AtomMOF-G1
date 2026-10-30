@@ -285,8 +285,13 @@ execution policy and deterministic algorithms. The latter sets
 tolerances; it is a diagnostic execution policy, not a production speed setting.
 An unavailable deterministic operator raises and is recorded rather than
 silently using a nondeterministic fallback. No model/trainer/config changes are
-made by this diagnosis; the normal training gate still requires a reference
-self-repeat and the optimized comparison to pass under the original policy.
+made by this diagnosis. Based on the measured reference-repeat instability, the
+performance script's numerical gate now uses the deterministic policy in a
+fresh subprocess. Both reference repeats and optimized comparisons must pass;
+only then does a separate training process run with the original execution
+policy. Precision and elementwise tolerances are unchanged. This isolates
+operator differences from run-to-run variation rather than subtracting noise
+counts or accepting any failing deterministic comparison.
 
 Each profile compares a reference repeat, the current optimized path, three individual
 reassociations (affine heads, bond preprojection, environment addition), and
@@ -304,8 +309,10 @@ of intentionally restored legacy ablations are recorded without preventing
 the other comparisons. The second profile still runs if the first fails. The
 script always packages completed reports, including on numerical failure, and
 records unsupported-operator exceptions in `diagnostic_error.json`. A failed
-profile retains a nonzero exit status; deterministic success alone does not
-override a training-policy failure. Do not bypass the gate to collect timings.
+profile retains a nonzero exit status in `--diagnose-only`; an ordinary-policy
+diagnostic failure is still recorded as such. It is not the same criterion as
+the repeatable numerical gate described above. Do not bypass that gate to
+collect timings. Passing it does not establish identical training trajectories.
 
 The five-repeat L40S report for `17019b1` separated repeat variation from stable
 implementation differences. With the ordinary policy, the reference repeat
@@ -320,9 +327,19 @@ reorders remain disabled; their deterministic failures were larger.
 The current pooling fix restores the null-first denominator and separate
 scalar/vector reductions. A CPU one-chunk readback regression now requires
 bitwise equal forward results against the retained reference, with gradients
-also checked, both with and without activation checkpointing. This removes a
-reproduced rounding-order difference; it does **not** establish that all six
-CUDA failures are fixed. Recheck on L40S without widening tolerances:
+also checked, both with and without activation checkpointing.
+
+The L40S report `diagnose_g1new_numerics_20261030_162832`, commit `163270e`,
+verified that the six failures were eliminated for this fixture. All five
+deterministic reference/optimized comparisons passed (158 tensors, 791,038
+elements per comparison), with identical initial weights, inputs, edges and
+precision/tolerances to the previous report. Forward outputs and the fourth
+bridge's output-projection gradients were bitwise equal; the lattice-gradient
+maximum absolute difference was 1.67e-5. Other gradients may differ within the
+unchanged tolerance. The disabled head/bond/environment reassociations still
+failed 370/44/46 elements; their combination failed 387. They remain disabled.
+This small B2/N48, 2,420-edge fixture establishes neither all-shape equivalence
+nor the full-epoch performance target. To reproduce the diagnostic:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -u scripts/benchmark_g1new_execution.py \
@@ -331,9 +348,12 @@ CUDA_VISIBLE_DEVICES=0 python -u scripts/benchmark_g1new_execution.py \
 
 For the server performance target, use the B32/accumulation-2 control, four sites
 and two internal rounds. All activation checkpointing is explicitly disabled.
-The script first checks four-site outputs/input/parameter gradients under the
-actual CUDA FP32/high/TF32 policy, including nonzero output projections; a
-failure stops training and preserves the diagnostic JSON. This is a numerical
+The script first checks four-site outputs/input/parameter gradients with the
+same CUDA FP32/high/TF32 precision in an isolated deterministic subprocess,
+including nonzero output projections and five repeats by default. A failure
+stops training and preserves the diagnostic JSON. The verification process
+exits before timed training; its determinism/workspace settings and CUDA
+allocations do not carry over to training. This is a numerical
 equivalence gate with stated tolerances, not a guarantee of identical training
 trajectories. CPU double/float regression tests provide tighter checks.
 
