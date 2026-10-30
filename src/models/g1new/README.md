@@ -264,19 +264,44 @@ Run the single-GPU diagnosis first (no training epochs):
 cd /data/ai4science/AtomMOF-G1 || exit 1
 export PROJECT_ROOT="$PWD"
 CUDA_VISIBLE_DEVICES=0 python -u scripts/benchmark_g1new_execution.py \
-  --diagnose-only --rounds 2
+  --diagnose-only --rounds 2 --repeats 5
 ```
 
-It compares a reference repeat, the current optimized path, three individual
+The `0da58e8` L40S report (PyTorch 2.6.0+cu126) found 35 failed elements even in
+the reference repeat; the optimized path had 41. All six cases had identical
+edge order/sets and finite values. Individually restoring affine head
+composition raised the count to 378; restoring all three changes gave 386.
+Bond preprojection and environment reassociation gave 32 and 51. These are
+single-probe results: they support investigating head composition but do not
+establish a noise bound or harmlessness of any optimization.
+
+Diagnosis now runs two fresh subprocess profiles: the existing training
+execution policy and deterministic algorithms. The latter sets
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` before CUDA initialization and enables strict
+`torch.use_deterministic_algorithms`. It preserves FP32/high/TF32 and the same
+tolerances; it is a diagnostic execution policy, not a production speed setting.
+An unavailable deterministic operator raises and is recorded rather than
+silently using a nondeterministic fallback. No model/trainer/config changes are
+made by this diagnosis; the normal training gate still requires a reference
+self-repeat and the optimized comparison to pass under the original policy.
+
+Each profile compares a reference repeat, the current optimized path, three individual
 reassociations (affine heads, bond preprojection, environment addition), and
 their combination reproducing the withdrawn implementation. These ablations
 apply only to disposable diagnostic model copies. Precision policy and the
 original tolerance are identical for every comparison. Reports include failed
 element counts, worst-element values/allowed errors, edge order, and GPU/Torch
-metadata. The reference repeat and current optimized path must pass; failures
+metadata. Each case runs five times by default, recording comparisons against
+the reference and (after the first evaluation) against its own first run. Input
+and initial-state fingerprints must match across profiles; model state is
+checked for mutation. `summary.log` reports ranges without subtracting measured
+noise or widening tolerances. The reference repeat and current optimized path must pass; failures
 of intentionally restored legacy ablations are recorded without preventing
-the other comparisons. The script always packages completed reports, including
-on numerical failure. Do not bypass the gate to collect training timings.
+the other comparisons. The second profile still runs if the first fails. The
+script always packages completed reports, including on numerical failure, and
+records unsupported-operator exceptions in `diagnostic_error.json`. A failed
+profile retains a nonzero exit status; deterministic success alone does not
+override a training-policy failure. Do not bypass the gate to collect timings.
 
 For the server performance target, use the B32/accumulation-2 control, four sites
 and two internal rounds. All activation checkpointing is explicitly disabled.

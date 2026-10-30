@@ -304,3 +304,86 @@ def test_cuda_numerical_gate_under_training_precision(tmp_path):
     from scripts.benchmark_g1new_execution import verify
 
     verify(tmp_path, 2, "cuda")
+
+
+@pytest.mark.parametrize("profile", ["training", "deterministic"])
+def test_diagnostic_policy_restores_flags_even_on_error(profile, monkeypatch):
+    import os
+    from scripts.benchmark_g1new_execution import diagnostic_policy
+
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    flags = (torch.are_deterministic_algorithms_enabled(),
+             torch.is_deterministic_algorithms_warn_only_enabled(),
+             torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic)
+    precision = (torch.get_float32_matmul_precision(), torch.backends.cuda.matmul.allow_tf32,
+                 torch.backends.cudnn.allow_tf32)
+    with pytest.raises(RuntimeError, match="test exit"):
+        with diagnostic_policy(profile):
+            if profile == "deterministic":
+                assert torch.are_deterministic_algorithms_enabled()
+                assert not torch.is_deterministic_algorithms_warn_only_enabled()
+                assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+            assert precision == (torch.get_float32_matmul_precision(),
+                                 torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+            raise RuntimeError("test exit")
+    assert flags == (torch.are_deterministic_algorithms_enabled(),
+                     torch.is_deterministic_algorithms_warn_only_enabled(),
+                     torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic)
+    assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":16:8"
+
+
+def test_repeated_probes_record_real_self_comparisons_and_unchanged_fixture(tmp_path):
+    import json
+    from scripts.benchmark_g1new_execution import verify
+
+    verify(tmp_path, 2, "cpu", diagnose=True, repeats=2)
+    rows = json.loads((tmp_path / "diagnostic_summary_rounds2.json").read_text())
+    assert len(rows) == 12
+    assert all(r["passed"] for r in rows)
+    first = json.loads((tmp_path / "numerical_rounds2.json").read_text())
+    second = json.loads((tmp_path / "numerical_rounds2_repeat02.json").read_text())
+    assert first["self_repeat_passed"] is None  # Do not claim equality by comparing a tensor to itself.
+    assert second["self_repeat_passed"]
+    assert all(r["max_abs"] == 0 for r in second["self_repeat_tensors"])
+    assert first["fixture_sha256"] == second["fixture_sha256"]
+    assert first["initial_state_sha256"] == second["initial_state_sha256"]
+    assert first["rtol"] == second["rtol"] == 0.003
+    assert first["atol"] == second["atol"] == 0.0002
+
+
+def test_diagnostic_profiles_continue_after_first_failure(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from pathlib import Path
+    from scripts import benchmark_g1new_execution as runner
+
+    visited = []
+    def fake_run(cmd, **kwargs):
+        profile = cmd[cmd.index("--diagnostic-profile") + 1]
+        visited.append(profile)
+        directory = Path(cmd[cmd.index("--output") + 1])
+        directory.mkdir()
+        bad = profile == "training"
+        values = [dict(case=case, repeat=trial + 1, passed=not bad,
+                       failed_tensors=int(bad), failed_elements=int(bad),
+                       self_failed_elements=int(bad))
+                  for case in ("reference_repeat", "optimized", "heads_reassociated",
+                               "bonds_preprojected", "environment_reassociated", "legacy_all")
+                  for trial in range(2)]
+        (directory / "diagnostic_summary_rounds2.json").write_text(json.dumps(values))
+        (directory / "numerical_rounds2.json").write_text(json.dumps(dict(
+            fixture_sha256="same-inputs", initial_state_sha256="same-weights",
+            matmul_precision="high", matmul_tf32=True, cudnn_tf32=True, rtol=0.003, atol=0.0002
+        )))
+        return SimpleNamespace(returncode=int(bad))
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    args = SimpleNamespace(rounds=[2], repeats=2, verify_device="cpu", dry_run=False)
+    with pytest.raises(RuntimeError, match="profiles completed with failures"):
+        runner.diagnose_profiles(tmp_path, args)
+    assert visited == ["training", "deterministic"]
+    result = json.loads((tmp_path / "diagnostic_profiles.json").read_text())
+    assert result["identical_fixtures_and_precision"]
+    assert all(r["complete"] for r in result["runs"])
+    assert [r["returncode"] for r in result["runs"]] == [1, 0]

@@ -16,6 +16,8 @@ import statistics
 import subprocess
 import sys
 import tarfile
+import traceback
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -121,7 +123,45 @@ def diagnostic_reassociation(model, *, heads=False, bonds=False, environment=Fal
             site.environment.forward = MethodType(reordered_update, site.environment)
 
 
-def verify(directory, rounds, device, diagnose=False):
+@contextmanager
+def diagnostic_policy(profile):
+    """Change reproducibility, never dtype/TF32, in a diagnostic subprocess only."""
+    if profile not in ("training", "deterministic"):
+        raise ValueError("Unknown diagnostic profile")
+    import torch
+
+    workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    benchmark, cudnn_deterministic = torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic
+    if profile == "deterministic" and torch.cuda.is_initialized():
+        raise RuntimeError("Start a fresh diagnostic subprocess before enabling CUDA determinism")
+    try:
+        if profile == "deterministic":
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+            torch.use_deterministic_algorithms(True, warn_only=False)
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+        yield
+    finally:
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+        torch.backends.cudnn.benchmark = benchmark
+        torch.backends.cudnn.deterministic = cudnn_deterministic
+        if workspace is None:
+            os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+        else:
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = workspace
+
+
+def tensor_fingerprint(tensors):
+    digest = hashlib.sha256()
+    for name, value in sorted(tensors.items()):
+        digest.update(f"{name}:{value.dtype}:{tuple(value.shape)}\n".encode())
+        digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def verify(directory, rounds, device, diagnose=False, repeats=1):
     """Nonzero residuals, all four sites, live geometry and all changed weights.
 
     Conditions are supplied identically to isolate the modified local branch;
@@ -132,6 +172,8 @@ def verify(directory, rounds, device, diagnose=False):
     import torch
     from src.models.g1new.bridge import G1NewBridge
 
+    if repeats < 1:
+        raise ValueError("repeats must be positive")
     torch.manual_seed(271)
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.allow_tf32 = True
@@ -177,6 +219,12 @@ def verify(directory, rounds, device, diagnose=False):
         torch.randn(B, N, 128, device=device),
     ]
     weight = torch.randn_like(source[0])
+    fixture = dict(feats)
+    fixture.update({f"input_{i}": value for i, value in enumerate(source)})
+    fixture["loss_weight"] = weight
+    fixture_hash = tensor_fingerprint(fixture)
+    state_hash = tensor_fingerprint(models[0].state_dict())
+
     def evaluate(model):
         model.zero_grad(set_to_none=True)
         H, t, x, lattice, c = values = [v.clone().requires_grad_() for v in source]
@@ -201,9 +249,10 @@ def verify(directory, rounds, device, diagnose=False):
         return {key: value.detach().cpu().clone() for key, value in tensors.items()}, edge_table
 
     reference, reference_edges = evaluate(models[0])
-    cases = [("optimized", {})]
+    # A reference that fails against itself cannot certify the optimized path.
+    cases = [("reference_repeat", {}), ("optimized", {})]
     if diagnose:
-        cases = [("reference_repeat", {}), *cases,
+        cases = [*cases,
                  ("heads_reassociated", dict(heads=True)),
                  ("bonds_preprojected", dict(bonds=True)),
                  ("environment_reassociated", dict(environment=True)),
@@ -215,34 +264,64 @@ def verify(directory, rounds, device, diagnose=False):
         model = models[0] if case == "reference_repeat" else deepcopy(models[1])
         if changes:
             diagnostic_reassociation(model, **changes)
-        actual, edge_table = evaluate(model)
-        report = dict(rounds=rounds, case=case, device=device, rtol=0.003, atol=0.0002,
-                      matmul_precision=torch.get_float32_matmul_precision(),
-                      matmul_tf32=torch.backends.cuda.matmul.allow_tf32,
-                      cudnn_tf32=torch.backends.cudnn.allow_tf32,
-                      torch_version=torch.__version__, cuda_version=torch.version.cuda,
-                      gpu_name=torch.cuda.get_device_name() if device == "cuda" else None,
-                      shape=[B, N], edge_count=len(edge_table),
-                      identical_edge_order=reference_edges == edge_table,
-                      identical_edge_sets=sorted(reference_edges) == sorted(edge_table),
-                      tensors=[compare_tensors(name, value, actual[name])
-                               for name, value in reference.items()])
-        report["passed"] = report["identical_edge_sets"] and all(x["passed"] for x in report["tensors"])
-        suffix = "" if case == "optimized" else "_" + case
-        (directory / f"numerical_rounds{rounds}{suffix}.json").write_text(
-            json.dumps(report, indent=2, allow_nan=False), encoding="utf-8"
-        )
-        failures = [x["name"] for x in report["tensors"] if not x["passed"]]
-        print(f"Numerical check rounds={rounds}, case={case}: "
-              f"passed={report['passed']}, failures={failures}", flush=True)
-        outcomes.append(dict(case=case, passed=report["passed"], failed_tensors=len(failures),
-                             failed_elements=sum(x["failed_elements"] for x in report["tensors"])))
-        del model, actual
+        first, first_edges = (reference, reference_edges) if case == "reference_repeat" else (None, None)
+        for trial in range(repeats):
+            actual, edge_table = evaluate(model)
+            # A self-comparison is only meaningful after an independent evaluation.
+            self_rows = None if first is None else [
+                compare_tensors(name, value, actual[name]) for name, value in first.items()
+            ]
+            self_passed = None if self_rows is None else (
+                sorted(first_edges) == sorted(edge_table) and all(x["passed"] for x in self_rows)
+            )
+            report = dict(rounds=rounds, case=case, repeat=trial + 1, device=device,
+                          rtol=0.003, atol=0.0002,
+                          matmul_precision=torch.get_float32_matmul_precision(),
+                          matmul_tf32=torch.backends.cuda.matmul.allow_tf32,
+                          cudnn_tf32=torch.backends.cudnn.allow_tf32,
+                          deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
+                          deterministic_warn_only=torch.is_deterministic_algorithms_warn_only_enabled(),
+                          cudnn_benchmark=torch.backends.cudnn.benchmark,
+                          cudnn_deterministic=torch.backends.cudnn.deterministic,
+                          cublas_workspace_config=os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+                          fixture_sha256=fixture_hash, initial_state_sha256=state_hash,
+                          torch_version=torch.__version__, cuda_version=torch.version.cuda,
+                          gpu_name=torch.cuda.get_device_name() if device == "cuda" else None,
+                          shape=[B, N], edge_count=len(edge_table),
+                          identical_edge_order=reference_edges == edge_table,
+                          identical_edge_sets=sorted(reference_edges) == sorted(edge_table),
+                          self_repeat_passed=self_passed, self_repeat_tensors=self_rows,
+                          tensors=[compare_tensors(name, value, actual[name])
+                                   for name, value in reference.items()])
+            report["passed"] = (report["identical_edge_sets"]
+                                and all(x["passed"] for x in report["tensors"]))
+            suffix = "" if case == "optimized" else "_" + case
+            if trial:
+                suffix += f"_repeat{trial + 1:02d}"
+            (directory / f"numerical_rounds{rounds}{suffix}.json").write_text(
+                json.dumps(report, indent=2, allow_nan=False), encoding="utf-8"
+            )
+            failures = [x["name"] for x in report["tensors"] if not x["passed"]]
+            count = sum(x["failed_elements"] for x in report["tensors"])
+            print(f"Numerical check rounds={rounds}, case={case}, repeat={trial + 1}: "
+                  f"passed={report['passed']}, failed_elements={count}, "
+                  f"self_repeat_passed={self_passed}, failures={failures}", flush=True)
+            outcomes.append(dict(case=case, repeat=trial + 1, passed=report["passed"],
+                                 failed_tensors=len(failures), failed_elements=count,
+                                 self_repeat_passed=self_passed,
+                                 self_failed_elements=None if self_rows is None else
+                                 sum(x["failed_elements"] for x in self_rows)))
+            if first is None:
+                first, first_edges = actual, edge_table
+        if tensor_fingerprint(model.state_dict()) != state_hash:
+            raise RuntimeError("Numerical probe changed model parameters or buffers")
+        del model, actual, first
     if diagnose:
         (directory / f"diagnostic_summary_rounds{rounds}.json").write_text(
             json.dumps(outcomes, indent=2), encoding="utf-8"
         )
-    if any(not row["passed"] for row in outcomes if row["case"] in ("optimized", "reference_repeat")):
+    if any(not row["passed"] or row["self_repeat_passed"] is False
+           for row in outcomes if row["case"] in ("optimized", "reference_repeat")):
         raise RuntimeError("Numerical gate failed; inspect numerical_rounds*.json before training")
     del models, reference
     if device == "cuda":
@@ -386,6 +465,72 @@ def package(root):
     print(f"Download: {root / 'reports.tar.gz'}", flush=True)
 
 
+def diagnose_profiles(root, args):
+    """Independent processes: deterministic diagnostics cannot affect training."""
+    runs, rows, fixtures = [], [], {}
+    lines = ["Diagnostic only: no training epochs or performance measurements.",
+             "Same FP32/high/TF32 and elementwise tolerance in both profiles.",
+             "Counts below are ranges across repeated evaluations, not relaxed gates.",
+             "| profile | rounds | case | repeats | failed tensors | failed elements | self failures |",
+             "|---|---:|---|---:|---|---|---|"]
+    for profile in ("training", "deterministic"):
+        for rounds in dict.fromkeys(args.rounds):
+            directory = root / f"{profile}_rounds{rounds}"
+            cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "--diagnose-only",
+                   "--diagnostic-profile", profile, "--repeats", str(args.repeats),
+                   "--verify-device", args.verify_device, "--rounds", str(rounds),
+                   "--output", str(directory)]
+            print("\n" + shlex.join(cmd), flush=True)
+            if args.dry_run:
+                continue
+            result = subprocess.run(cmd, cwd=ROOT, check=False)
+            run = dict(profile=profile, rounds=rounds, returncode=result.returncode)
+            runs.append(run)
+            path = directory / f"diagnostic_summary_rounds{rounds}.json"
+            if not path.exists():
+                run["complete"] = False
+                lines.append(f"{profile}, rounds={rounds}: interrupted/error before complete results; "
+                             f"see {directory.name}/diagnostic_error.json")
+                continue
+            values = json.loads(path.read_text(encoding="utf-8"))
+            run["complete"] = len(values) == 6 * args.repeats
+            for case in dict.fromkeys(row["case"] for row in values):
+                selected = [r for r in values if r["case"] == case]
+                record = dict(profile=profile, rounds=rounds, case=case, repeats=len(selected),
+                              all_passed=all(r["passed"] for r in selected),
+                              failed_tensors=[r["failed_tensors"] for r in selected],
+                              failed_elements=[r["failed_elements"] for r in selected],
+                              self_failed_elements=[r["self_failed_elements"] for r in selected
+                                                    if r["self_failed_elements"] is not None])
+                rows.append(record)
+                def span(name):
+                    v = record[name]
+                    return f"{min(v)}..{max(v)}" if v else "not measured"
+                lines.append(f"| {profile} | {rounds} | {case} | {len(selected)} | "
+                             f"{span('failed_tensors')} | {span('failed_elements')} | "
+                             f"{span('self_failed_elements')} |")
+            evidence = json.loads((directory / f"numerical_rounds{rounds}.json").read_text(
+                encoding="utf-8"
+            ))
+            fixtures[(profile, rounds)] = (
+                evidence["fixture_sha256"], evidence["initial_state_sha256"],
+                evidence["matmul_precision"], evidence["matmul_tf32"], evidence["cudnn_tf32"],
+                evidence["rtol"], evidence["atol"],
+            )
+    if args.dry_run:
+        return
+    identical = all(fixtures.get(("training", n)) is not None
+                    and fixtures.get(("training", n)) == fixtures.get(("deterministic", n))
+                    for n in dict.fromkeys(args.rounds))
+    lines.append(f"Identical inputs/initial weights/precision/tolerances across profiles: {identical}")
+    report = dict(runs=runs, identical_fixtures_and_precision=identical, cases=rows)
+    (root / "diagnostic_profiles.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    (root / "summary.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("\n".join(lines), flush=True)
+    if not identical or any(r["returncode"] != 0 or not r["complete"] for r in runs):
+        raise RuntimeError("Diagnostic profiles completed with failures; inspect summary.log and reports")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rounds", type=int, nargs="+", default=[2], choices=(1, 2, 3))
@@ -396,6 +541,10 @@ def main():
     gate_mode.add_argument("--verify-only", action="store_true")
     gate_mode.add_argument("--diagnose-only", action="store_true",
                            help="Repeat the reference and isolate three operation reorders; never train")
+    parser.add_argument("--diagnostic-profile", choices=("both", "training", "deterministic"),
+                        default="both", help="Only for --diagnose-only; both uses fresh child processes")
+    parser.add_argument("--repeats", type=int, default=5,
+                        help="Repeated comparisons per case for --diagnose-only (default 5)")
     parser.add_argument("--verify-device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -403,6 +552,10 @@ def main():
     args = parser.parse_args()
     if args.epochs < 1:
         parser.error("--epochs must be positive")
+    if args.repeats < 2:
+        parser.error("--repeats must be at least two to measure self-repeat variation")
+    if not args.diagnose_only and args.diagnostic_profile != "both":
+        parser.error("--diagnostic-profile requires --diagnose-only; it cannot change training")
     if args.verify_device == "cpu" and not (args.verify_only or args.diagnose_only or args.dry_run):
         parser.error("Server training requires the CUDA numerical gate")
     prefix = "diagnose_g1new_numerics_" if args.diagnose_only else "bench_g1new_execution_b32_a2_8gpu_"
@@ -422,10 +575,16 @@ def main():
         p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources
     }, indent=2), encoding="utf-8")
     try:
+        if args.diagnose_only and args.diagnostic_profile == "both":
+            diagnose_profiles(root, args)
+            return
         for rounds in dict.fromkeys(args.rounds):
             if not args.dry_run:
-                if args.verify_only or args.diagnose_only:
-                    verify(root, rounds, args.verify_device, diagnose=args.diagnose_only)
+                if args.diagnose_only:
+                    with diagnostic_policy(args.diagnostic_profile):
+                        verify(root, rounds, args.verify_device, diagnose=True, repeats=args.repeats)
+                elif args.verify_only:
+                    verify(root, rounds, args.verify_device)
                 else:
                     # Exit the verification process before training: its CUDA
                     # context and allocator must not occupy GPU 0 during timing.
@@ -444,6 +603,11 @@ def main():
                     print(shlex.join(cmd), flush=True)
                 else:
                     run(cmd, run_dir)
+    except Exception as exc:
+        (root / "diagnostic_error.json").write_text(json.dumps(dict(
+            exception_type=type(exc).__name__, message=str(exc), traceback=traceback.format_exc()
+        ), indent=2), encoding="utf-8")
+        raise
     finally:
         # Package partial evidence even after an interrupt/failure. Incomplete
         # epochs/ranks cannot enter the latency table as a completed epoch.
