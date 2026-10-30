@@ -13,6 +13,7 @@ same checkpointing policy. These gates do not certify normal CUDA repeatability;
 """
 
 import argparse
+import codecs
 import hashlib
 import json
 import math
@@ -425,6 +426,18 @@ def command(directory, rounds, reference, epochs, lmdb_dir, offline, *, candidat
     ]
 
 
+def relay_output(source, log, output):
+    """Preserve progress-bar carriage returns and decode split UTF-8 safely."""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while chunk := source.read1(65536):
+        log.write(chunk)
+        log.flush()
+        output.write(decoder.decode(chunk))
+        output.flush()
+    output.write(decoder.decode(b"", final=True))
+    output.flush()
+
+
 def run(cmd, directory):
     directory.mkdir()
     (directory / "command.json").write_text(json.dumps(cmd, indent=2), encoding="utf-8")
@@ -432,15 +445,15 @@ def run(cmd, directory):
     env = dict(os.environ, PROJECT_ROOT=str(ROOT), HYDRA_FULL_ERROR="1",
                CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7")
     # A process group allows Ctrl-C to stop this experiment's DDP children too.
-    with (directory / "train.log").open("w", encoding="utf-8") as log:
+    with (directory / "train.log").open("wb") as log:
         child = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                 stderr=subprocess.STDOUT,
                                  start_new_session=os.name != "nt")
         try:
-            for line in child.stdout:
-                print(line, end="", flush=True)
-                log.write(line)
-                log.flush()
+            # Text-mode universal newline handling turns tqdm's '\r' into
+            # '\n'. Read available bytes instead so refreshes stay on one line,
+            # even when this script's stdout is piped through tee.
+            relay_output(child.stdout, log, sys.stdout)
             code = child.wait()
         except BaseException:
             if child.poll() is None:
