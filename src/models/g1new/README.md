@@ -121,11 +121,59 @@ on a rank exception rather than silently train a different geometry.
   features and environment states are not cached across sites. Dynamic geometry
   is rebuilt for every Flow sampling step. Static conditions can use the existing
   inference cache.
-* Sparse packed anchors/edges, bounded pair/image/edge chunks. Edge MLPs use
-  non-reentrant activation checkpointing by default to avoid retaining every
-  chunk's hidden activations. No stochastic operations occur in these regions.
-* Readback uses online segmented log-sum-exp with rescaling of previous chunks;
-  the null item is counted once per atom. There is no per-chunk softmax.
+* Unlearned RBF/direction/same-block edge features are shared across sites. Bond
+  embeddings and relation MLPs still have independent parameters at every site.
+  Project each of the six bond embeddings through its part of the relation
+  linear once per site, then gather the projected rows. Geometry and bond terms
+  meet before the original SiLU. This removes per-edge 28-channel concatenation
+  and repeated 8-to-64 bond projection; all embedding and MLP gradients remain.
+* Geometry compacts valid indices once, reuses integer layouts and validates bond
+  classes once on the same valid support. Larger pair/image chunks reduce CUDA
+  launches and host reads. Float64 search decisions, exact chemical nearest-image
+  ties, cutoff, invalid-cell behavior and fail-fast budgets are unchanged.
+* Gather static atom/anchor/relation projections once per site and reuse them
+  across internal rounds when checkpointing is disabled. Anchor features are
+  also reused by initialization/projection, and the large static edge projection
+  is released before readback. Chunked edge maps use `split` rather than
+  independent slices, avoiding repeated full-edge-size slice-gradient allocation.
+  A single/empty chunk returns directly without a redundant concatenation/copy.
+* The last message linear and its following score/value linear are algebraically
+  composed per forward. Both original parameter tensors/biases receive gradients;
+  the SiLU stays in its original position. There is no persistent fused-weight
+  cache, replaced parameter, weight tying, detach or optimizer-state migration.
+  Each site's environment head composition is reused across its internal rounds.
+* Sparse packed anchors/edges, bounded pair/image/edge chunks. Optional
+  non-reentrant checkpointing covers edge projection, nonlinear heads, weighted
+  reduction and readback normalization, returning small per-environment/atom
+  tensors. Saving only the edge-MLP checkpoint inputs would still retain huge
+  edge-sized hidden tensors; this regression in the first optimization has been
+  fixed. Shared relations and small node projections remain inputs. No stochastic
+  operations occur in these regions. Checkpointing recomputes work in backward;
+  the speed benchmark below explicitly keeps it disabled.
+* Environment/readback reduce all edge contributions once. Readback uses one
+  global segmented log-sum-exp; the null item is counted once per atom. There is
+  no per-chunk softmax. The previous streaming implementation remains available
+  for reference comparisons.
+
+The new `model.flow_model_args.g1new.module.optimized` boolean defaults to `true`
+and changes only the local implementation. It is independent of the backbone's
+`execution=optimized` profile. It does **not** change modules, rounds, dimensions,
+precision, trainable tensors, parameter names, initialization or checkpoint
+shapes. Same-architecture pre-optimization checkpoints still load strictly.
+The default edge/pair/image chunks are now 65536/65536/262144. To reproduce the
+previous G1-New execution path, set:
+
+```bash
+model.flow_model_args.g1new.module.optimized=false \
+model.flow_model_args.g1new.module.edge_chunk_size=8192 \
+model.flow_model_args.g1new.module.geometry.pair_chunk_size=4096 \
+model.flow_model_args.g1new.module.geometry.image_chunk_size=65536
+```
+
+Chunks bound individual map/search workspace, not the total saved training
+activations. Peak GPU memory still requires measurement, especially with
+activation checkpointing disabled. Larger chunks do not change the edge set or
+the existing total candidate/edge limits.
 
 Split GEMMs and reduction order can produce ordinary floating-point differences;
 they are formula/gradient equivalent, not a promise of bitwise CUDA identity.
@@ -187,34 +235,58 @@ rank having no environments. This is not an 8-GPU performance or peak-memory
 measurement. Sharing eliminates repeated work, but end-to-end GPU improvements
 and memory fit still need measurement with the intended dynamic batches.
 
-Validation on 2026-10-30: 48 G1-New/scheduling cases and 184 existing baseline,
-G1 and execution regression cases passed (232 total). The diff contains no
-changes to the optimized backbone, shared execution code, loss, optimizer,
-training/prediction entry points or baseline/trainer/execution configurations.
+`tests/test_g1new_execution.py` additionally compares reference and optimized
+outputs and all input/parameter gradients in FP32/FP64, rounds 1/2/3 and with/
+without checkpointing. It checks shared four-site geometry-feature gradients,
+edge identity across chunk sizes, invalid-sample bond validation and budget
+failures. The implementation changes are confined to G1-New: no optimized
+backbone, legacy G1, shared execution, loss, optimizer or entry-point edits.
+The review additionally checks all six bond classes, the backing storage of
+saved checkpoint tensors (not just the shapes of small views), and three AdamW
+updates including optimizer moments. No fused tensors survive into the next
+forward/optimizer step. The server numerical gate exercises all bond classes.
 
-For a first server training trial (run in the existing AtomMOF environment):
+A CPU synthetic probe of **one site**, two rounds and 12,000 edges (supplied
+conditions/geometry; no search) measured unique saved activation storage:
+
+| G1-New checkpointing | First optimization | Reviewed implementation |
+| --- | ---: | ---: |
+| disabled | 64.00 MiB | 63.59 MiB |
+| enabled | 40.47 MiB | 4.46 MiB |
+
+These are saved forward activations, excluding parameters/inputs. They are
+**not** GPU peak allocated/reserved measurements or full-model memory claims.
+With checkpointing disabled, the same probe reduced concatenation calls from
+17 to 12 and matrix multiplication calls (`mm` + `addmm`, forward/backward)
+from 90 to 87. CUDA dispatch, wall time and the 120-second goal still need the
+actual 8-card benchmark; no epoch speedup is inferred from these CPU counts.
+
+For the server performance target, use the B32/accumulation-2 control, four sites
+and two internal rounds. All activation checkpointing is explicitly disabled.
+The script first checks four-site outputs/input/parameter gradients under the
+actual CUDA FP32/high/TF32 policy, including nonzero output projections; a
+failure stops training and preserves the diagnostic JSON. This is a numerical
+equivalence gate with stated tolerances, not a guarantee of identical training
+trajectories. CPU double/float regression tests provide tighter checks.
 
 ```bash
 cd /data/ai4science/AtomMOF-G1 || exit 1
 export PROJECT_ROOT="$PWD"
-RUN_DIR="$PROJECT_ROOT/logs/bench_bwdb_g1new_small_stage1_2epoch_8gpu_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$RUN_DIR" || exit 1
-git rev-parse HEAD > "$RUN_DIR/git_commit.txt"
-git diff > "$RUN_DIR/tracked_changes.patch"
-set -o pipefail
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -u src/train.py \
-  experiment=g1new_small_stage1 execution=optimized \
-  data.lmdb_dir=/data/ai4science/AtomMOF/AtomMOF-main/data/bwdb \
-  trainer.max_epochs=2 logger=null extras.enforce_tags=false \
-  task_name=bench_bwdb_g1new_small_stage1_2epoch \
-  hydra.run.dir="$RUN_DIR" \
-  +callbacks.execution_benchmark._target_=src.callbacks.execution_benchmark.ExecutionBenchmark \
-  +callbacks.execution_benchmark.warmup_batches=20 \
-  2>&1 | tee "$RUN_DIR/train.log"
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  python -u scripts/benchmark_g1new_execution.py --rounds 2 --epochs 2
+# Optional matched old/new execution comparison, rounds 1 then 2:
+# python -u scripts/benchmark_g1new_execution.py --rounds 1 2 --epochs 2 --include-reference
 ```
 
-This stage-1 trial uses batch cap 64, accumulation 1, max atoms 200, square budget
-3e6 and FP32, matching the optimized baseline training settings. GPU memory fit
-and performance have to be measured. Stage-2/3 configs use 32/2, 100 epochs,
-max atoms 300/unlimited and square budgets 3e6/5e5; set the intended prior
-checkpoint explicitly. No training data or server jobs are launched by tests.
+The trial overrides the stage-1 experiment's 64/1 default to **32/2**, keeps
+max atoms 200, square budget 3e6, full training data, val=1000 and seed=42.
+It records each full training epoch (including warmup batches, excluding
+validation/checkpoint writing), maximum allocated/reserved memory across all
+eight ranks, precision, parameter count and batch-order hashes. `summary.log`,
+`summary.json` and `reports.tar.gz` are written automatically under the printed
+run directory. Incomplete rank/epoch reports cannot pass as complete epochs.
+`--offline` changes only W&B connectivity. `--dry-run` prints the commands.
+
+The <120 seconds/epoch target is **not yet verified on L40S**. Local CPU tests
+cannot establish end-to-end CUDA speed or peak memory. Stage-2/3 experiment
+defaults remain 32/2, 100 epochs, max atoms 300/unlimited, square budgets 3e6/5e5.

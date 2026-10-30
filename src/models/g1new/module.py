@@ -21,8 +21,9 @@ class G1NewModule(nn.Module):
         width=64,
         hidden_dim=128,
         rounds=2,
-        edge_chunk_size=8192,
+        edge_chunk_size=65536,
         activation_checkpointing=True,
+        optimized=True,
         condition_encoder=None,
         geometry=None,
     ):
@@ -38,6 +39,9 @@ class G1NewModule(nn.Module):
                 raise ValueError(f"{name} must be a positive integer")
         if type(activation_checkpointing) is not bool:
             raise TypeError("g1new.activation_checkpointing must be bool")
+        if type(optimized) is not bool:
+            raise TypeError("g1new.optimized must be bool")
+        self.optimized = optimized
         self.h_dim, self.width, self.rounds = h_dim, width, rounds
         self.edge_chunk_size = edge_chunk_size
         self.activation_checkpointing = activation_checkpointing
@@ -57,13 +61,15 @@ class G1NewModule(nn.Module):
         self.environment = EnvironmentUpdate(width, hidden_dim)
         self.relations = RelationEncoder(self.geometry.cutoff)
         self.readback = AtomReadback(width, hidden_dim)
+        for component in (self.geometry, self.relations, self.environment, self.readback):
+            component.optimized = optimized
         self.output_projection = nn.Linear(width, h_dim, bias=False)
         nn.init.zeros_(self.output_projection.weight)
 
     def encode_condition(self, feats: Mapping):
         return self.condition_encoder(feats)
 
-    def forward(self, H, t, feats, edges, condition, *, time_features=None):
+    def forward(self, H, t, feats, edges, condition, *, time_features=None, relation_features=None):
         mask = feats["atom_pad_mask"].bool()
         if H.shape != (*mask.shape, self.h_dim) or t.shape != (H.shape[0],):
             raise ValueError("g1new expects H=(B,N,h_dim) and t=(B,)")
@@ -84,14 +90,32 @@ class G1NewModule(nn.Module):
             time = time_features[:, None].expand(-1, H.shape[1], -1)
             features = self.atom_features(torch.cat((a, c, time), -1))
             features = features.masked_fill(~active[..., None], 0).flatten(0, 1)
-            checkpointing = self.activation_checkpointing and self.training
-            chi = self.relations(edges, self.edge_chunk_size, checkpointing)
-            state = self.environment.init(features[edges.anchors])
-            projected = self.environment.prepare(features, edges.anchors)
+            checkpointing = (
+                self.activation_checkpointing and self.training and torch.is_grad_enabled()
+            )
+            chi = self.relations(
+                edges, self.edge_chunk_size, checkpointing, geometry_features=relation_features
+            )
+            anchor_features = features.index_select(0, edges.anchors)
+            state = self.environment.init(anchor_features)
+            projected = self.environment.prepare(
+                features, edges.anchors, edges, chi,
+                checkpointing=checkpointing, anchor_features=anchor_features,
+            )
+            # These two small composed affine tensors do not depend on the
+            # evolving state. Build once per site/forward, never persist them.
+            head_map = (
+                self.environment.messages.fused_heads(self.environment.heads)
+                if self.optimized else None
+            )
             for _ in range(self.rounds):
                 state = self.environment(
-                    state, projected, edges, chi, self.edge_chunk_size, checkpointing
+                    state, projected, edges, chi, self.edge_chunk_size, checkpointing,
+                    head_map=head_map,
                 )
+            # The large static edge projection is not saved by addition's
+            # backward. Drop the Python reference before readback's workspace.
+            del projected, head_map
             result = self.readback(
                 features, state, edges, chi, self.edge_chunk_size, checkpointing
             )

@@ -8,6 +8,8 @@ h_dim: 256
 width: 64
 hidden_dim: 128
 rounds: 2
-edge_chunk_size: 8192
+edge_chunk_size: 65536
+# Runtime-only G1-New implementation; learned tensors and formulas are unchanged.
+optimized: true
 # Only the new edge MLP activations are recomputed; backbone precision unchanged.
 activation_checkpointing: true

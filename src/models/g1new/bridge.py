@@ -23,6 +23,7 @@ class G1NewContext:
     condition: Tensor
     times: Tensor | None = None
     time_features: Tensor | None = None
+    relation_features: Tensor | None = None
 
 
 class G1NewBridge(nn.Module):
@@ -144,7 +145,11 @@ class G1NewBridge(nn.Module):
         # x_t/l_t remain fixed across insertions within one network evaluation.
         # Keep the live graph: geometry gradients from ALL sites accumulate.
         edges = self.first_bridge.geometry(x_t, l_t, expanded)
-        return G1NewContext(expanded, edges, condition)
+        relation_features = (
+            self.first_bridge.relations.geometry_features(edges)
+            if self.first_bridge.optimized else None
+        )
+        return G1NewContext(expanded, edges, condition, relation_features=relation_features)
 
     def forward(self, layer, hidden, times, context):
         key = str(layer)
@@ -162,4 +167,5 @@ class G1NewBridge(nn.Module):
             context.edges,
             context.condition,
             time_features=context.time_features,
+            relation_features=context.relation_features,
         )

@@ -54,8 +54,8 @@ class LocalGeometry(nn.Module):
         self,
         cutoff=0.8,
         inner_cutoff=0.6,
-        pair_chunk_size=4096,
-        image_chunk_size=65536,
+        pair_chunk_size=65536,
+        image_chunk_size=262144,
         max_search_candidates=32000000,
         max_edges=2000000,
         min_cell_singular_value=1e-6,
@@ -83,6 +83,7 @@ class LocalGeometry(nn.Module):
         ):
             raise ValueError("Invalid cell/search numerical thresholds")
         self.cutoff, self.inner_cutoff = cutoff, inner_cutoff
+        self.optimized = True
         self.pair_chunk_size, self.image_chunk_size = pair_chunk_size, image_chunk_size
         self.max_search_candidates, self.max_edges = max_search_candidates, max_edges
         self.min_cell_singular_value, self.max_cell_condition = (
@@ -108,11 +109,16 @@ class LocalGeometry(nn.Module):
             & (hi.abs() < 2**52).all()
             & torch.isfinite(counts).all()
         )
-        if not bool(representable):
+        if self.optimized:
+            # One bounded host read instead of independent synchronizations for
+            # each predicate and the candidate count. Decisions remain float64.
+            safe, total = torch.stack((representable.to(counts.dtype), counts.sum())).tolist()
+        else:
+            safe, total = bool(representable), float(counts.sum())
+        if not safe:
             raise SearchBudgetExceeded(
                 "g1new periodic integer bounds are not safely representable"
             )
-        total = float(counts.sum())
         budget.consume(total, "searches")  # check BEFORE float-to-int conversion/allocation
         counts = counts.long()
         return lo.long(), widths.long(), counts.cumsum(0), int(total)
@@ -170,6 +176,89 @@ class LocalGeometry(nn.Module):
 
     @torch.no_grad()
     def _search(self, x, cell, mask, elements, bonds, valid):
+        if not self.optimized:
+            return self._search_reference(x, cell, mask, elements, bonds, valid)
+        _, atoms = mask.shape
+        heavy = mask & (elements != 1)
+        anchors = heavy.flatten().nonzero(as_tuple=True)[0]
+        budget = _Budget(self.max_search_candidates, self.max_edges)
+        x64, cell64 = x.reshape(-1, 3).double(), cell.double()
+        inv = torch.linalg.inv(cell64)
+        parts = [[], [], [], []]
+
+        # Same support as the reference checks, once per forward. Padding,
+        # invalid samples and hydrogen anchors do not introduce new errors.
+        supported = valid[:, None, None] & mask[:, :, None] & heavy[:, None, :]
+        if bool((((bonds < 0) | (bonds > 5)) & supported).any()):
+            raise ValueError("g1new requires bond_types in 0..5")
+        flat_bonds = bonds.reshape(-1)
+
+        def append(a, e, n, bond):
+            budget.consume(a.numel(), "edges")
+            if a.numel():
+                for target, value in zip(parts, (a, e, n, bond)):
+                    target.append(value)
+
+        for start in range(0, anchors.numel() * atoms, self.pair_chunk_size):
+            ids = torch.arange(
+                start, min(start + self.pair_chunk_size, anchors.numel() * atoms), device=x.device
+            )
+            env, local = ids // atoms, ids % atoms
+            batch = anchors.index_select(0, env) // atoms
+            keep = (valid[batch] & mask[batch, local]).nonzero(as_tuple=True)[0]
+            if not keep.numel():
+                continue
+            # Compact once and reuse the integer layout; boolean indexing each
+            # component separately would repeat nonzero/host synchronization.
+            ids = ids.index_select(0, keep)
+            env, local = ids // atoms, ids % atoms
+            anchor = anchors.index_select(0, env)
+            batch = anchor // atoms
+            partner = batch * atoms + local
+            delta = x64.index_select(0, partner) - x64.index_select(0, anchor)
+            cells, inverse = cell64.index_select(0, batch), inv.index_select(0, batch)
+            types = flat_bonds.index_select(0, partner * atoms + anchor % atoms)
+            chemical = (types > 0).nonzero(as_tuple=True)[0]
+            nearest = torch.zeros_like(delta, dtype=torch.long)
+            nearest_d = delta.new_full((len(delta),), float("inf"))
+            if chemical.numel():
+                shifts, distances = self._nearest(
+                    delta.index_select(0, chemical), cells.index_select(0, chemical),
+                    inverse.index_select(0, chemical), budget,
+                )
+                nearest.index_copy_(0, chemical, shifts)
+                nearest_d.index_copy_(0, chemical, distances)
+
+            boxes = self._boxes(delta, inverse, delta.new_full((len(delta),), self.cutoff), budget)
+            for _, pair, shifts in self._enumerate(boxes):
+                a, anchor_image = partner.index_select(0, pair), anchor.index_select(0, pair)
+                r = delta.index_select(0, pair) + torch.bmm(
+                    shifts.to(cells.dtype)[:, None], cells.index_select(0, pair)
+                ).squeeze(1)
+                within = torch.linalg.vector_norm(r, dim=-1) < self.cutoff
+                central = (a == anchor_image) & (shifts == 0).all(-1)
+                take = (within & ~central).nonzero(as_tuple=True)[0]
+                pair, shifts = pair.index_select(0, take), shifts.index_select(0, take)
+                bond = torch.where(
+                    (shifts == nearest.index_select(0, pair)).all(-1),
+                    types.index_select(0, pair), 0,
+                )
+                append(partner.index_select(0, pair), env.index_select(0, pair), shifts, bond)
+
+            extra = ((types > 0) & (nearest_d >= self.cutoff)
+                     & ~((partner == anchor) & (nearest == 0).all(-1))).nonzero(as_tuple=True)[0]
+            append(
+                partner.index_select(0, extra), env.index_select(0, extra),
+                nearest.index_select(0, extra), types.index_select(0, extra),
+            )
+        empty = torch.empty(0, dtype=torch.long, device=x.device)
+        result = [torch.cat(p) if p else empty for p in parts]
+        if not parts[2]:
+            result[2] = empty.reshape(0, 1).expand(0, 3)
+        return (anchors, *result)
+
+    @torch.no_grad()
+    def _search_reference(self, x, cell, mask, elements, bonds, valid):
         batch, atoms = mask.shape
         anchors = (mask & (elements != 1)).flatten().nonzero(as_tuple=True)[0]
         budget = _Budget(self.max_search_candidates, self.max_edges)
